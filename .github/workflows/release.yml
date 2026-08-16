@@ -58,7 +58,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*
+            dist/*.whl
+            dist/*.tar.gz
+            dist/install.sh
+            dist/install.ps1
+            dist/release.json
+            dist/SHA256SUMS
 
   installer-smoke:
     needs: publish
