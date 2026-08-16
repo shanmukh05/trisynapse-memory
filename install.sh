@@ -15,21 +15,21 @@ case "$DETECTED_OS" in
   *) fail "macOS and Linux are supported by install.sh; use install.ps1 on Windows" ;;
 esac
 case "$DETECTED_ARCH" in
-  x86_64|amd64|arm64|aarch64) say "Detected $DETECTED_OS / $DETECTED_ARCH." ;;
-  *) fail "unsupported CPU architecture: $DETECTED_ARCH" ;;
+  x86_64|amd64|arm64|aarch64) say "Detected ${DETECTED_OS} / ${DETECTED_ARCH}." ;;
+  *) fail "unsupported CPU architecture: ${DETECTED_ARCH}" ;;
 esac
 
 if command -v uv >/dev/null 2>&1; then
   UV="$(command -v uv)"
 else
-  say "Installing uv…"
+  say "Installing uv..."
   curl -LsSf https://astral.sh/uv/install.sh | sh
   UV="${UV_INSTALL_DIR:-$HOME/.local/bin}/uv"
   [ -x "$UV" ] || UV="$HOME/.cargo/bin/uv"
   [ -x "$UV" ] || fail "uv installed but was not found; add ~/.local/bin to PATH and rerun"
 fi
 
-say "Installing or upgrading $PACKAGE…"
+say "Installing or upgrading ${PACKAGE}..."
 "$UV" tool install --upgrade "$PACKAGE"
 mkdir -p "$METADATA_DIR"
 chmod 700 "$METADATA_DIR"
@@ -45,8 +45,8 @@ chmod 600 "$METADATA_DIR/install.env"
 
 UV_BIN_DIR="$("$UV" tool dir --bin 2>/dev/null || printf '%s' "$HOME/.local/bin")"
 case ":$PATH:" in
-  *":$UV_BIN_DIR:"*) ;;
-  *) say "Add $UV_BIN_DIR to PATH, then open a new terminal." ;;
+  *":${UV_BIN_DIR}:"*) ;;
+  *) say "Add ${UV_BIN_DIR} to PATH, then open a new terminal." ;;
 esac
 
 if command -v trisynapse-memory >/dev/null 2>&1; then
