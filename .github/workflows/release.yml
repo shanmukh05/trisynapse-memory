@@ -47,8 +47,24 @@ jobs:
       - run: uv run python scripts/version.py check --tag "${{ github.ref_name }}"
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @trisynapse/studio build
-      - run: uv build
-      - run: uv publish --trusted-publishing always
+      - name: Reuse an existing immutable PyPI release when rerunning a tag
+        id: pypi_release
+        shell: bash
+        run: |
+          version="$(python scripts/version.py current)"
+          if python scripts/download_pypi_release.py "$version" dist; then
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -ne 3 ]; then
+              exit "$status"
+            fi
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.pypi_release.outputs.reused != 'true'
+        run: uv build
+      - if: steps.pypi_release.outputs.reused != 'true'
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple
       - name: Prepare release assets
         run: |
           cp install.sh install.ps1 dist/
