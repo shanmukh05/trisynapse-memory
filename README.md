@@ -3,7 +3,7 @@
     <img
       src="https://raw.githubusercontent.com/shanmukh05/trisynapse-memory/main/public/assets/logo.png"
       alt="Trisynapse Memory logo"
-      width="440"
+      width="280"
     />
   </a>
 
