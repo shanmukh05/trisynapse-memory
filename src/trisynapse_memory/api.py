@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -290,30 +290,74 @@ def create_app(
     if studio and studio_assets.is_dir():
         app.mount("/studio-assets", StaticFiles(directory=studio_assets), name="studio-assets")
 
+    studio_index = studio_assets / "index.html"
+
+    def studio_unavailable() -> HTMLResponse:
+        return HTMLResponse(
+            content="""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trisynapse Memory Studio</title>
+    <style>
+      :root { color-scheme: light; font-family: ui-sans-serif, system-ui, sans-serif; }
+      body { margin: 0; background: #f7f7f5; color: #2f3437; }
+      main { max-width: 42rem; margin: 12vh auto; padding: 2rem; }
+      section { background: #fff; border: 1px solid #e3e2e0; border-radius: 12px; padding: 2rem; }
+      h1 { margin-top: 0; font-size: 1.55rem; }
+      p { line-height: 1.6; }
+      code { background: #f1f1ef; border-radius: 4px; padding: .15rem .35rem; }
+      a { color: #2f6f9f; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>Trisynapse Memory Studio</h1>
+        <p>The API is running, but the Studio web assets are not installed.</p>
+        <p>For a source checkout, run <code>pnpm --filter @trisynapse/studio build</code>
+        and restart the server. For an installed release, reinstall
+        <code>trisynapse-memory[all]</code>.</p>
+        <p><a href="/api/v1/health">API health</a> · <a href="/docs">OpenAPI documentation</a></p>
+      </section>
+    </main>
+  </body>
+</html>
+""",
+            status_code=200,
+        )
+
     @app.get("/", response_model=None)
-    def root_info() -> dict[str, Any] | RedirectResponse:
-        if studio and (studio_assets / "index.html").is_file():
-            return RedirectResponse("/studio/", status_code=307)
+    def root_info() -> dict[str, Any] | HTMLResponse | RedirectResponse:
+        if studio:
+            if studio_index.is_file():
+                return RedirectResponse("/studio/", status_code=307)
+            return studio_unavailable()
         return {
             "name": "trisynapse-memory",
             "version": MemoryEngine.VERSION,
-            "studio": "enabled" if studio else "disabled",
+            "studio": "disabled",
             "api": "/api/v1/health",
             "openapi": "/openapi.json",
         }
 
     @app.get("/studio", response_model=None)
-    def studio_redirect() -> RedirectResponse:
-        if not studio or not (studio_assets / "index.html").is_file():
+    def studio_redirect() -> HTMLResponse | RedirectResponse:
+        if not studio:
             raise HTTPException(status_code=404, detail="Studio is not enabled")
+        if not studio_index.is_file():
+            return studio_unavailable()
         return RedirectResponse("/studio/", status_code=307)
 
     @app.get("/studio/{studio_path:path}", response_model=None)
-    def studio_app(studio_path: str = "") -> FileResponse:
+    def studio_app(studio_path: str = "") -> FileResponse | HTMLResponse:
         del studio_path
-        if not studio or not (studio_assets / "index.html").is_file():
+        if not studio:
             raise HTTPException(status_code=404, detail="Studio is not enabled")
-        return FileResponse(studio_assets / "index.html")
+        if not studio_index.is_file():
+            return studio_unavailable()
+        return FileResponse(studio_index)
 
     @app.get("/api/v1/health")
     def health() -> dict[str, Any]:
