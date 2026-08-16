@@ -3,8 +3,11 @@ from __future__ import annotations
 from importlib.metadata import version as package_version
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+
+import pytest
 
 from trisynapse_memory import MemoryEngine, __version__
 
@@ -41,6 +44,7 @@ def test_version_check_rejects_a_mismatched_tag() -> None:
     assert "does not match expected tag" in result.stderr
 
 
+@pytest.mark.skipif(os.name == "nt", reason="install.sh targets macOS and Linux")
 def test_posix_installer_is_ascii_and_expands_package_safely(tmp_path: Path) -> None:
     installer = ROOT / "install.sh"
     assert installer.read_bytes().isascii()
@@ -79,7 +83,7 @@ esac
         }
     )
     result = subprocess.run(
-        ["/bin/sh", str(installer)],
+        [shutil.which("sh") or "/bin/sh", str(installer)],
         cwd=ROOT,
         env=environment,
         check=False,
