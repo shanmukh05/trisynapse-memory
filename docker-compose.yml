@@ -1,0 +1,13 @@
+services:
+  memory:
+    build: .
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - trisynapse-memory:/data
+    environment:
+      TRISYNAPSE_MEMORY_API_KEY: ${TRISYNAPSE_MEMORY_API_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  trisynapse-memory:

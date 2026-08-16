@@ -1,0 +1,15 @@
+.venv
+.env
+.env.*
+!.env.example
+__pycache__
+.pytest_cache
+.ruff_cache
+data
+notebooks
+design_docs/archive
+*.egg-info
+dist
+build
+packages/js-sdk/node_modules
+packages/js-sdk/dist

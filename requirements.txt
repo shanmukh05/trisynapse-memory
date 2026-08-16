@@ -1,0 +1,3 @@
+# Runtime dependencies for the trisynapse_memory package.
+-e .
+

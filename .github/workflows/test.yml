@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: pip install -e '.[dev,all]'
+      - run: python scripts/version.py check
+      - run: ruff check src tests scripts
+      - run: pytest -q
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e '.[server]'
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm --filter @trisynapse/memory check
+      - run: pnpm --filter @trisynapse/studio check
+      - run: pnpm --filter @trisynapse/studio test
+      - run: pnpm --filter @trisynapse/studio build
+      - run: pnpm --filter @trisynapse/studio exec playwright install --with-deps chromium
+      - run: pnpm --filter @trisynapse/studio test:e2e
