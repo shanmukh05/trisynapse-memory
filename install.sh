@@ -30,7 +30,15 @@ else
 fi
 
 say "Installing or upgrading ${PACKAGE}..."
-"$UV" tool install --upgrade "$PACKAGE"
+INSTALL_ATTEMPT=1
+until "$UV" tool install --upgrade "$PACKAGE"; do
+  if [ "$INSTALL_ATTEMPT" -ge 5 ]; then
+    fail "package did not become available after ${INSTALL_ATTEMPT} attempts: ${PACKAGE}"
+  fi
+  say "Package is not available yet; retrying in 6 seconds..."
+  INSTALL_ATTEMPT=$((INSTALL_ATTEMPT + 1))
+  sleep 6
+done
 mkdir -p "$METADATA_DIR"
 chmod 700 "$METADATA_DIR"
 {

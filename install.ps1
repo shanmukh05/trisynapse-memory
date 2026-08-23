@@ -17,7 +17,21 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 
 $Uv = (Get-Command uv -ErrorAction Stop).Source
 Write-Host "Installing or upgrading $Package..."
-& $Uv tool install --upgrade $Package
+$Installed = $false
+for ($Attempt = 1; $Attempt -le 5; $Attempt++) {
+    & $Uv tool install --upgrade $Package
+    if ($LASTEXITCODE -eq 0) {
+        $Installed = $true
+        break
+    }
+    if ($Attempt -lt 5) {
+        Write-Host "Package is not available yet; retrying in 6 seconds..."
+        Start-Sleep -Seconds 6
+    }
+}
+if (-not $Installed) {
+    throw "Package did not become available after 5 attempts: $Package"
+}
 New-Item -ItemType Directory -Force -Path $MetadataDir | Out-Null
 @(
     "installed_at=$([DateTime]::UtcNow.ToString('o'))"

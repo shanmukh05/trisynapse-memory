@@ -129,6 +129,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Wait for the published Python package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package_url="https://pypi.org/pypi/trisynapse-memory/${version}/json"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if curl --fail --silent --show-error "$package_url" >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 10 ]; then
+              echo "PyPI package did not become available: trisynapse-memory==${version}" >&2
+              exit 1
+            fi
+            sleep 6
+          done
       - if: runner.os != 'Windows'
         run: sh install.sh
       - if: runner.os == 'Windows'
