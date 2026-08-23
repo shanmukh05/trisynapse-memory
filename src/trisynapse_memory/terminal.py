@@ -561,7 +561,11 @@ class MemoryTerminal(App[None]):
 
         if event.tabbed_content.id != "inspector":
             return
-        self._refresh_inspector_pane(event.pane.id)
+        # TabActivated may be delivered before Textual has made the selected
+        # pane visible. Defer the RichLog update until that refresh completes;
+        # otherwise the first render can be dropped on slower event loops
+        # (notably the Windows release runner).
+        self.call_after_refresh(self._refresh_inspector_pane, event.pane.id)
 
     def _refresh_inspector_pane(self, pane_id: str | None) -> None:
         try:

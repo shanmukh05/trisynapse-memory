@@ -426,9 +426,8 @@ def test_interactive_terminal_tabs_and_ctrl_c(tmp_path) -> None:
             )
             inspector = terminal.query_one("TabbedContent")
             inspector.active = "trace-tab"
-            await pilot.pause()
-            trace_rows = "".join(
-                line.text for line in terminal.query_one("#trace-log", RichLog).lines
+            trace_rows = await _wait_for_log_text(
+                pilot, terminal, "#trace-log", recent.id
             )
             assert retained.source_id in source_rows
             assert recent.id in trace_rows
@@ -493,13 +492,28 @@ def test_terminal_tab_activation_does_not_wait_for_panel_worker(tmp_path) -> Non
         async with terminal.run_test(size=(100, 35)) as pilot:
             inspector = terminal.query_one("TabbedContent")
             inspector.active = "trace-tab"
-            await pilot.pause()
-            trace_rows = "".join(
-                line.text for line in terminal.query_one("#trace-log", RichLog).lines
+            trace_rows = await _wait_for_log_text(
+                pilot, terminal, "#trace-log", recent.id
             )
             assert recent.id in trace_rows
 
     asyncio.run(exercise())
+
+
+async def _wait_for_log_text(
+    pilot, terminal: MemoryTerminal, selector: str, expected: str
+) -> str:
+    """Wait briefly for a Textual RichLog update across platform event loops."""
+
+    rendered = ""
+    for _ in range(20):
+        rendered = "".join(
+            line.text for line in terminal.query_one(selector, RichLog).lines
+        )
+        if expected in rendered:
+            return rendered
+        await pilot.pause(0.01)
+    return rendered
 
 
 def test_ingestion_path_recommendations_follow_typed_characters(tmp_path, monkeypatch) -> None:
