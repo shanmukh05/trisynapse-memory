@@ -20,3 +20,4 @@ var/
 design_docs/
 data/
 # docs/local/
+.cursor/
