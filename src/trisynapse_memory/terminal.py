@@ -538,6 +538,47 @@ class MemoryTerminal(App[None]):
     def on_input_changed(self, event: Input.Changed) -> None:
         self.query_one("#recommendations", Static).update(self._recommendations(event.value))
 
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        """Render the selected inspector pane without waiting for a worker.
+
+        Textual may activate a hidden pane before the mount-time panel worker has
+        returned, especially on Windows. Reading the small, bounded inspector
+        page here makes tab selection deterministic while the periodic worker
+        continues to refresh panes that are not being interacted with.
+        """
+
+        if event.tabbed_content.id != "inspector":
+            return
+        self._refresh_inspector_pane(event.pane.id)
+
+    def _refresh_inspector_pane(self, pane_id: str | None) -> None:
+        try:
+            if pane_id == "sources-tab":
+                self._render_sources(
+                    self.engine.list_sources(
+                        namespace=self.namespace,
+                        include_removed=True,
+                        limit=20,
+                    )
+                )
+            elif pane_id == "trace-tab":
+                trace = self.engine.list(
+                    namespace=self.namespace,
+                    limit=20,
+                    include_retracted=True,
+                )
+                self._render_trace(trace.items)
+            elif pane_id == "jobs-tab":
+                self._render_jobs(self.engine.list_jobs(limit=20))
+            elif pane_id == "config-tab":
+                self._update_config_view()
+        except Exception:
+            # The periodic refresh will retry. Tab selection itself should stay
+            # usable if another operation temporarily holds the local store.
+            return
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
         if not value:

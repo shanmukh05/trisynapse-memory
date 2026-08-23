@@ -484,6 +484,24 @@ def test_interactive_terminal_tabs_and_ctrl_c(tmp_path) -> None:
     asyncio.run(exercise())
 
 
+def test_terminal_tab_activation_does_not_wait_for_panel_worker(tmp_path) -> None:
+    async def exercise() -> None:
+        terminal = MemoryTerminal(tmp_path / "terminal-tab-store", MemoryNamespace())
+        recent = terminal.engine.add("A deterministic Trace tab target")
+        terminal._refresh_panels = lambda: None  # type: ignore[method-assign]
+
+        async with terminal.run_test(size=(100, 35)) as pilot:
+            inspector = terminal.query_one("TabbedContent")
+            inspector.active = "trace-tab"
+            await pilot.pause()
+            trace_rows = "".join(
+                line.text for line in terminal.query_one("#trace-log", RichLog).lines
+            )
+            assert recent.id in trace_rows
+
+    asyncio.run(exercise())
+
+
 def test_ingestion_path_recommendations_follow_typed_characters(tmp_path, monkeypatch) -> None:
     (tmp_path / "source-code").mkdir()
     (tmp_path / "source-notes.md").write_text("notes", encoding="utf-8")
