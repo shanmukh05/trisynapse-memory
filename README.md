@@ -3,42 +3,56 @@
     <img
       src="https://raw.githubusercontent.com/shanmukh05/trisynapse-memory/main/public/assets/logo.png"
       alt="Trisynapse Memory logo"
-      width="280"
+      width="300"
     />
   </a>
 
   <h1>Trisynapse Memory</h1>
 
   <p><strong>Store traces. Recall meaning.</strong></p>
+  <p>Evidence-first memory for AI agents: ingest many kinds of data, retrieve the useful parts, and answer with citations.</p>
 
   <p>
     <a href="https://github.com/shanmukh05/trisynapse-memory/actions/workflows/test.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/shanmukh05/trisynapse-memory/test.yml?branch=main&amp;style=flat-square&amp;label=tests" /></a>
     <a href="https://pypi.org/project/trisynapse-memory/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/trisynapse-memory?style=flat-square&amp;logo=pypi&amp;logoColor=white&amp;color=3775A9" /></a>
+    <a href="https://www.npmjs.com/package/@trisynapse/trisynapse-memory"><img alt="npm version" src="https://img.shields.io/npm/v/%40trisynapse%2Ftrisynapse-memory?style=flat-square&amp;logo=npm&amp;logoColor=white&amp;color=CB3837" /></a>
     <a href="https://pypi.org/project/trisynapse-memory/"><img alt="Supported Python versions" src="https://img.shields.io/pypi/pyversions/trisynapse-memory?style=flat-square&amp;logo=python&amp;logoColor=white" /></a>
     <a href="LICENSE"><img alt="Apache 2.0 license" src="https://img.shields.io/github/license/shanmukh05/trisynapse-memory?style=flat-square" /></a>
     <img alt="Project status: alpha" src="https://img.shields.io/badge/status-alpha-CB912F?style=flat-square" />
   </p>
 
   <p>
-    <a href="#install">Install</a> ·
-    <a href="#start-in-the-terminal">CLI</a> ·
-    <a href="#python-in-five-minutes">Python</a> ·
-    <a href="#rest-api-and-memory-studio">REST &amp; Studio</a> ·
-    <a href="#javascript-and-typescript-sdk">TypeScript</a> ·
-    <a href="docs/architecture.md">Architecture</a> ·
+    <a href="#quickstart">Quickstart</a> ·
+    <a href="#choose-how-you-use-it">Interfaces</a> ·
+    <a href="#how-memory-works">Architecture</a> ·
     <a href="docs/api.md">API</a> ·
-    <a href="docs/operations.md">Operations</a>
+    <a href="docs/operations.md">Operations</a> ·
+    <a href="#release-notes">Releases</a>
   </p>
 </div>
 
 ---
 
-Trisynapse Memory is a local-first memory layer for AI agents. It keeps original evidence in a verifiable **Trace**, builds replaceable **Recall** views for fast retrieval, and answers from the evidence with citations.
+Trisynapse Memory is a local-first memory engine for assistants, agents, and applications. It preserves source evidence in an ordered **Trace**, builds searchable **Recall** views, and drills back to the evidence before returning an answer.
+
+Use it when your application needs to remember conversations, documents, code, web pages, tables, images, or structured records—and you need to see where an answer came from.
+
+### Why Trisynapse?
+
+| Capability | What it means |
+|---|---|
+| **Source-aware** | Keeps pages, sections, rows, cells, files, symbols, line ranges, speakers, and timestamps. |
+| **Grounded** | Answers from Trace evidence and returns citations—or abstains when confidence is too low. |
+| **Inspectable** | Saves retrieval stages, candidates, decisions, timings, and model provenance as query runs. |
+| **Local-first** | Runs with local embeddings and no completion API key by default. Add a provider only when you need generation or image understanding. |
+| **One engine** | Python, CLI, REST, Studio, and TypeScript share the same store and namespace model. |
 
 > [!IMPORTANT]
-> **Project status: pre-1.0 alpha.** The Python engine, unified source ingestion, REST API, TypeScript client, Memory Studio, full terminal, durable jobs, provider adapters, and benchmark runners are implemented. APIs may still change before the first stable release.
+> Trisynapse Memory is a pre-1.0 alpha. Its core surfaces are implemented, but APIs and store schemas may still change between minor releases.
 
-## Install
+## Quickstart
+
+### 1. Install
 
 macOS or Linux:
 
@@ -52,208 +66,117 @@ Windows PowerShell:
 irm https://github.com/shanmukh05/trisynapse-memory/releases/latest/download/install.ps1 | iex
 ```
 
-The installer uses `uv`, installs the PyPI package with all user-facing source loaders, adds the single `trisynapse-memory` command, records install metadata, and runs `check`. Re-run it to upgrade.
-
 Or install from PyPI:
 
 ```bash
 pip install 'trisynapse-memory[all]'
 ```
 
-Python 3.11+ is required. Uninstall with `uv tool uninstall trisynapse-memory` or the matching `pip uninstall` command.
+Python 3.11 or newer is required. The first semantic search may download the default local embedding model. Re-run the installer to upgrade; uninstall with `uv tool uninstall trisynapse-memory`.
 
-## Start in the terminal
+### 2. Store and recall something
 
 ```bash
 trisynapse-memory init
+trisynapse-memory add observation "Maya prefers three-bullet weekly updates."
+trisynapse-memory query "How should I update Maya?"
+```
+
+No completion API key is required for this path. Without one, Trisynapse returns an extractive answer grounded in the retrieved evidence.
+
+### 3. Open the interactive terminal
+
+```bash
 trisynapse-memory
 ```
 
-With no arguments in a terminal, the interactive app opens. Ask a question as plain text, or use commands such as `/ingest`, `/sources`, `/search`, `/history`, `/forget`, `/remove`, `/jobs`, `/model`, and `/check`.
+Ask a question as plain text or enter `/` to browse commands. Suggestions narrow as you type; press **Tab** or **Right Arrow** to accept one. Useful commands include `/ingest`, `/sources`, `/history`, `/model`, `/remove`, and `/check`.
 
-Start typing `/` to see live command recommendations. The list narrows with every character, while a ghost completion appears in the prompt. Press **Tab** or **Right Arrow** to accept it. Commands that need an argument also recommend matching local paths or recent memory IDs.
-
-Scriptable commands remain available:
+Ingest several source types together:
 
 ```bash
-trisynapse-memory --project-id demo ingest ./docs ./src/service.py https://example.com/guide
-trisynapse-memory --project-id demo sources list
-trisynapse-memory --project-id demo query "How does the service work?"
-trisynapse-memory --json check
+trisynapse-memory --project-id demo ingest \
+  ./handbook.pdf ./src https://example.com/guide
+
+trisynapse-memory --project-id demo query \
+  "What does the handbook say about releases?"
 ```
 
-Global flags include `--json`, `--quiet`, `--no-color`, `--yes`, `--path`, namespace flags, and `--version`. Put global flags before the command. JSON mode never prints the logo or progress text.
+Each source succeeds or fails independently. The run remains available for inspection and failed-item retries.
 
-## Python in five minutes
+## Choose how you use it
+
+| Surface | Start here | Best for |
+|---|---|---|
+| **Interactive terminal** | `trisynapse-memory` | Exploring memory, ingesting sources, and grounded questions |
+| **Scriptable CLI** | `trisynapse-memory --help` | Automation, jobs, backups, validation, and benchmarks |
+| **Python** | `MemoryEngine.from_env(...)` | In-process agents and applications |
+| **REST + Studio** | `trisynapse-memory serve --studio` | A shared service and visual inspection |
+| **TypeScript** | `npm install @trisynapse/trisynapse-memory` | Node.js or web backends calling the REST service |
+
+### Python
 
 ```python
 from trisynapse_memory import MemoryEngine, MemoryNamespace, SourceInput
 
 namespace = MemoryNamespace(user_id="maya", project_id="assistant")
-memory = MemoryEngine.from_env("~/.trisynapse-memory/store", namespace=namespace)
+memory = MemoryEngine.from_env(namespace=namespace)
 
-memory.add("Maya prefers short weekly updates.", episode_id="chat:1")
+try:
+    memory.add("Maya prefers short weekly updates.", episode_id="chat:1")
 
-run = memory.ingest_many([
-    SourceInput(kind="file", path="./handbook.pdf"),
-    SourceInput(kind="directory", path="./src", source_key="app-source"),
-    SourceInput(kind="url", url="https://example.com/release-process"),
-])
+    memory.ingest_many([
+        SourceInput(kind="file", path="./handbook.pdf"),
+        SourceInput(kind="directory", path="./src"),
+        SourceInput(kind="url", url="https://example.com/guide"),
+    ])
 
-for item in run.results:
-    print(item.index, item.status, item.source_id, item.error)
-
-answer = memory.query("How should I write the weekly update?")
-print(answer.answer)
-for citation in answer.citations:
-    print(citation.delta_id, citation.locator)
+    answer = memory.query("How should I write Maya's update?")
+    print(answer.answer)
+    for citation in answer.citations:
+        print(citation.delta_id, citation.locator)
+finally:
+    memory.close()
 ```
 
-Mixed imports are independent: a bad item is reported as failed while valid items commit. Repeating the same `source_key + content_hash` is a no-op. Updating a source creates a new version and retracts the previous version only after the new one succeeds.
+Use `add()` and `add_batch()` for text that is already normalized. Use `ingest()` and `ingest_many()` for files, directories, URLs, repositories, archives, images, and mixed batches.
 
-`add_batch()` still means “append already-normalized text observations.” Use `ingest_many()` for mixed files, URLs, repositories, archives, and images.
-
-## Sources
-
-The source pipeline accepts:
-
-- text, Markdown, HTML, PDF, JSON, JSONL, YAML, and CSV;
-- DOCX, PPTX, and XLSX with paragraph, slide, sheet, row, and cell-aware locations;
-- PNG, JPEG, and WebP through the configured vision-capable completion model;
-- code files, directories, safe ZIP/TAR archives, notebooks, and public HTTPS Git repositories;
-- one public web page per URL.
-
-Code is split around symbols with Tree-sitter when supported, with bounded line chunks as the fallback. Citations retain paths, languages, symbol names/types, line ranges, imports, hashes, and Git commit metadata. Repository imports honor `.gitignore` and `.trisynapseignore`; dependencies, builds, caches, secret files, binaries, and symlinks are skipped and reported.
-
-Accepted originals are deduplicated by SHA-256 under the memory store and included in backups. Store permissions are restricted, but **the source store is not encrypted**.
-
-Image ingestion does not silently switch to OCR. It fails clearly if no completion provider is configured or the selected model rejects images.
-
-## Forget versus remove
-
-```python
-memory.forget(delta_id=item.id, reason="no longer relevant")
-memory.remove(delta_ids=[item.id], reason="approved privacy deletion")
-memory.remove_source(source_id, reason="delete upload and derived memory")
-```
-
-- `forget()` appends a logical retraction. The old content remains available to authorized audit/history operations.
-- `remove()` physically redacts only the selected deltas, writes `[REMOVED]`, rebuilds the verifiable chain, clears derived caches, and records a `removal_audit` row.
-- `remove_source()` removes the retained original when it is no longer shared and redacts every delta derived from that source.
-
-There is intentionally no public `purge` alias. Historical `[PURGED]` rows from older stores remain unchanged and continue to verify.
-
-## One engine, four surfaces
-
-| Surface | Start | Best for |
-|---|---|---|
-| Python | `MemoryEngine.from_env(...)` | In-process applications |
-| Terminal/CLI | `trisynapse-memory` | Interactive use, scripts, and operations |
-| REST + Studio | `trisynapse-memory serve --studio` | Shared local service and inspection |
-| JavaScript/TypeScript | `@trisynapse/memory` | Node.js and web application backends |
-
-All surfaces call the same Trace & Recall engine. A source ingested through REST is visible from Python, the terminal, Studio, and TypeScript when they use the same store and namespace.
-
-## REST API and Memory Studio
-
-Install the server extra, initialize the store, and start the service:
+### REST and Memory Studio
 
 ```bash
-pip install 'trisynapse-memory[server,sources]'
 trisynapse-memory init
 trisynapse-memory serve --studio
 ```
 
-The default service address is `http://127.0.0.1:8765`. The root opens Memory Studio at [`/studio/`](http://127.0.0.1:8765/studio/), while OpenAPI is available at [`/openapi.json`](http://127.0.0.1:8765/openapi.json). The service binds to loopback unless `--host` is changed.
+Open [http://127.0.0.1:8765/studio/](http://127.0.0.1:8765/studio/). The API token is stored at `~/.trisynapse-memory/store/.api-key`; keep it private.
 
-Studio has five focused areas:
+Studio gives you five focused views:
 
-- **Sources** is a searchable card inbox with mixed batch ingestion, safe previews, retained-original downloads, versions, and derived memory.
-- **Queries** streams each retrieval stage into a clickable workflow and keeps the same workflow in namespace-scoped history.
-- **Memory Viewer** switches between knowledge, source-lineage, and chronological Trace graphs.
-- **Configuration** manages completion, embeddings, and revisioned retrieval defaults.
-- **Connection** selects the server, bearer token, and active namespace without storing the token in memory SQLite.
+- **Sources** — browse, preview, ingest, retry, download, and remove sources.
+- **Queries** — watch retrieval run step by step and reopen past workflows.
+- **Memory Viewer** — explore knowledge, lineage, and chronological Trace graphs.
+- **Configuration** — choose completion, embedding, and retrieval settings.
+- **Connection** — select the server, token, and active namespace.
 
-`init` creates the administrator bearer token at `<store>/.api-key`. Health is public; memory operations require the token when authentication is enabled:
+Health and OpenAPI are available at:
 
-```bash
-export TRISYNAPSE_MEMORY_API_KEY="$(cat ~/.trisynapse-memory/store/.api-key)"
-
-curl http://127.0.0.1:8765/api/v1/health
-
-curl -X POST http://127.0.0.1:8765/api/v1/memory/observations \
-  -H "Authorization: Bearer $TRISYNAPSE_MEMORY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Maya prefers three-bullet updates.",
-    "episode_id": "chat:updates",
-    "namespace": {"user_id": "maya", "project_id": "demo"}
-  }'
-
-curl -X POST http://127.0.0.1:8765/api/v1/query \
-  -H "Authorization: Bearer $TRISYNAPSE_MEMORY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "How should Maya receive updates?",
-    "namespace": {"user_id": "maya", "project_id": "demo"}
-  }'
+```text
+GET http://127.0.0.1:8765/api/v1/health
+    http://127.0.0.1:8765/openapi.json
 ```
 
-### Ingest sources through REST
+See [API and interfaces](docs/api.md) for request contracts, asynchronous ingestion, SSE query runs, source previews, and graph endpoints.
 
-Bulk source ingestion is asynchronous. The first response is `202 Accepted` with a durable run ID:
+### JavaScript and TypeScript
 
-```bash
-curl -X POST http://127.0.0.1:8765/api/v1/sources/ingest \
-  -H "Authorization: Bearer $TRISYNAPSE_MEMORY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "namespace": {"user_id": "maya", "project_id": "demo"},
-    "sources": [
-      {"kind": "url", "url": "https://example.com/handbook"},
-      {"kind": "text", "source_key": "release-rule", "text": "Name an owner in every release note."}
-    ]
-  }'
-```
-
-Follow and manage the run using its returned ID:
+The TypeScript package is a dependency-free Fetch client for the REST service.
 
 ```bash
-curl -H "Authorization: Bearer $TRISYNAPSE_MEMORY_API_KEY" \
-  http://127.0.0.1:8765/api/v1/ingestion-runs/RUN_ID
-
-curl -X POST -H "Authorization: Bearer $TRISYNAPSE_MEMORY_API_KEY" \
-  http://127.0.0.1:8765/api/v1/ingestion-runs/RUN_ID/retry
-```
-
-Important REST routes:
-
-| Area | Routes |
-|---|---|
-| Add and retrieve | `POST /memory/observations`, `POST /search`, `POST /query`, `GET /memories` |
-| Query workflows | `POST/GET /query-runs`, `GET /query-runs/{id}/events`, confirmed history removal |
-| Sources | `POST /sources/ingest`, filtered `GET /sources`, preview/content routes |
-| Runs | `GET /ingestion-runs`, `GET /ingestion-runs/{id}`, retry |
-| Memory graph | `GET /memory-graph`, node-neighborhood expansion |
-| Lifecycle | corrections, `forget`, `POST /memory/remove`, `POST /sources/{id}/remove` |
-| Models and retrieval | provider catalogs, `GET/PUT /model-configuration`, `GET/PUT /retrieval-configuration` |
-| Operations | health, metrics, jobs, export, backups, benchmarks, and integration events |
-
-All routes above are under `/api/v1`. Uploaded bytes are sent as `content_base64`. REST deliberately rejects arbitrary server filesystem paths. Defaults include 25 MiB per uploaded file, 250 MiB per run, 100 descriptors, safe archive limits, URL timeouts, redirect limits, and private-network blocking.
-
-Use `trisynapse-memory serve --no-auth` only for trusted local development. See [API and Interfaces](docs/api.md) for complete request contracts and [Operations](docs/operations.md) for deployment guidance.
-
-## JavaScript and TypeScript SDK
-
-The dependency-free Fetch client lives in [`packages/js-sdk`](packages/js-sdk) and its package name is `@trisynapse/memory`. It requires Node.js 18+ or another runtime with a compatible Fetch API.
-
-```bash
-npm install @trisynapse/memory
-# or: pnpm add @trisynapse/memory
+npm install @trisynapse/trisynapse-memory
 ```
 
 ```ts
-import { TrisynapseMemory } from "@trisynapse/memory";
+import { TrisynapseMemory } from "@trisynapse/trisynapse-memory";
 
 const memory = new TrisynapseMemory({
   baseUrl: "http://127.0.0.1:8765",
@@ -261,99 +184,82 @@ const memory = new TrisynapseMemory({
   namespace: { project_id: "demo", user_id: "maya" },
 });
 
-await memory.add("Maya prefers short weekly updates.", {
-  episodeId: "chat:updates",
-});
+await memory.add("Maya prefers short weekly updates.");
+const answer = await memory.query("How should I update Maya?");
 
-const run = await memory.ingest([
-  { kind: "url", url: "https://example.com/guide" },
-  {
-    kind: "file",
-    filename: "release-notes.md",
-    content_base64: markdownBase64,
-    source_key: "release-notes",
-  },
-]);
-
-let current = run;
-while (current.status === "pending" || current.status === "running") {
-  await new Promise(resolve => setTimeout(resolve, 500));
-  current = await memory.getIngestionRun(run.id);
-}
-
-const answer = await memory.query("What does the guide require?");
 console.log(answer.answer);
-for (const citation of answer.citations) {
-  console.log(citation.delta_id, citation.locator);
-}
+console.log(answer.citations);
 ```
 
-The client covers:
+The client also covers mixed ingestion, source previews, query runs, memory graphs, lifecycle operations, model selection, retrieval configuration, and connection checks.
 
-- `add()`, `addBatch()`, and the compatibility `addFile()`;
-- `ingest()`, `listSources()`, `getSource()`, and `removeSource()`;
-- `getIngestionRun()` and `retryIngestion()`;
-- `search()`, `query()`, `list()`, `get()`, and `history()`;
-- `correct()`, `forget()`, and physical `remove()`;
-- profiles, feedback, health, typed deltas, citations, retrieval traces, sources, and run results.
-- provider/model discovery, configuration, explicit connection tests, and embedding-rebuild status.
-
-Lifecycle example:
-
-```ts
-await memory.correct(memoryId, "Maya prefers at most three bullets.");
-await memory.forget(memoryId, "Preference expired");
-await memory.remove([sensitiveMemoryId], "Approved privacy deletion");
-await memory.removeSource(sourceId, "Delete the upload and derived memory");
-```
-
-The SDK contains no alternate memory algorithm; it is a typed client for the canonical Python REST service.
-
-## The memory idea
+## How memory works
 
 ```mermaid
-flowchart TD
-    S["Sources and conversations"] --> P["Safe preprocessing + privacy filter"]
-    P --> T["Trace: original, ordered evidence"]
-    T --> R["Recall: replaceable indexes and summaries"]
-    Q["Question"] --> R
-    R --> D["Drill back to Trace"]
-    D --> A["Answer or abstain with citations"]
+flowchart LR
+    S["Sources"] --> F["Formation<br/>load and structure"]
+    F --> T["Trace<br/>ordered evidence"]
+    T --> R["Recall<br/>searchable views"]
+    Q["Question"] --> P["Retrieval<br/>plan and route"]
+    R --> P
+    P --> G["Ground in Trace"]
+    G --> A["Answer or abstain<br/>with citations"]
 ```
 
-Each Trace delta stores the hash of the previous delta plus its own content. Hashing does not hide the data. It answers a different question: “Was old evidence edited, deleted, reordered, or inserted outside the supported lifecycle?” Recall products can be rebuilt, so they never become the final evidence for an answer.
+1. **Formation** loads a source and keeps its useful structure.
+2. **Trace** stores the resulting evidence in order with provenance and lifecycle state.
+3. **Recall** builds replaceable indexes, graph connections, episode views, and compiled claims.
+4. **Retrieval** searches several routes, fuses candidates, and drills back to Trace.
+5. **Grounding** creates an answer with citations or abstains.
 
-Read [Architecture](docs/architecture.md) first, then [API and Interfaces](docs/api.md), [Operations](docs/operations.md), and the [Production release runbook](docs/release-and-production.md).
+Trace is an application data store, not a cryptographic ledger. `validate` checks SQLite consistency, sequence continuity, evidence references, and retained source blobs. Recall data can be rebuilt; cited evidence always comes from Trace.
 
-Release versions are synchronized from `pyproject.toml` with one command:
+[Read the architecture guide →](docs/architecture.md)
 
-```bash
-uv run python scripts/version.py set 0.2.0
-uv run python scripts/version.py check --tag v0.2.0
-```
+## Sources and retrieval
 
-## Models, providers, and benchmarks
+<details>
+<summary><strong>Supported source types</strong></summary>
 
-Model choices are saved per memory store. API keys stay in environment variables and are never written to SQLite. Running `/model` opens the searchable terminal selector:
+| Category | Sources |
+|---|---|
+| Documents | Text, Markdown, HTML, PDF, DOCX, and PPTX |
+| Structured data | JSON, JSONL, YAML, CSV, and XLSX |
+| Code | Files, directories, repositories, notebooks, ZIP, and TAR archives |
+| Media | PNG, JPEG, and WebP with a vision-capable completion model |
+| Network | One public web page or public HTTPS Git repository per source |
+
+Code keeps repository paths, languages, symbols, imports, line ranges, file identity, and Git provenance. Repositories honor `.gitignore` and `.trisynapseignore`. Tables keep sheets, rows, and cells; documents keep pages and sections; conversations keep speakers and timestamps.
+
+Accepted originals are retained in content-addressed storage and included in backups. The store is permission-restricted but **not encrypted at rest**.
+
+</details>
+
+<details>
+<summary><strong>Retrieval routes and query history</strong></summary>
+
+Trisynapse can route a question through lexical, semantic, temporal, graph, code, table, image, document, and conversation retrieval. It fuses and reranks candidates under per-source and total context budgets before grounding.
+
+Every query run can retain executed steps, route candidates, scores, decisions, durations, citations, retrieval configuration, prompt provenance, and provider/model provenance. It never stores API keys, authorization headers, embeddings, hidden model reasoning, or full system prompts.
+
+</details>
+
+## Models are optional
+
+The default setup uses local SentenceTransformers embeddings and no completion provider. Add completion when you want generated answers, richer extraction and Recall, or image understanding.
 
 ```bash
 export ANTHROPIC_API_KEY="your-key"
-trisynapse-memory
-# Enter /model completion
-```
-
-Scriptable equivalents are available:
-
-```bash
-trisynapse-memory models providers
-trisynapse-memory models list --role completion --provider anthropic
 trisynapse-memory models set completion anthropic claude-sonnet-4-5
 trisynapse-memory models test --role completion
 ```
 
-Completion providers are OpenAI, OpenRouter, Gemini, Anthropic, DeepInfra, DeepSeek, Kimi, and custom OpenAI-compatible endpoints. Embeddings can use local SentenceTransformers, OpenAI, OpenRouter, Gemini, DeepInfra, or a custom OpenAI-compatible endpoint. Qwen models appear under OpenRouter or DeepInfra when those catalogs provide them.
+Or run the interactive terminal and enter `/model` to search provider catalogs and select models.
 
-| Provider | Completion | Embedding | Credential variable |
+<details>
+<summary><strong>Supported providers and credential variables</strong></summary>
+
+| Provider | Completion | Embedding | Credential |
 |---|:---:|:---:|---|
 | OpenAI | ✓ | ✓ | `OPENAI_API_KEY` |
 | OpenRouter | ✓ | ✓ | `OPENROUTER_API_KEY` |
@@ -363,42 +269,71 @@ Completion providers are OpenAI, OpenRouter, Gemini, Anthropic, DeepInfra, DeepS
 | DeepSeek | ✓ | — | `DEEPSEEK_API_KEY` |
 | Kimi | ✓ | — | `MOONSHOT_API_KEY` |
 | OpenAI-compatible | ✓ | ✓ | `OPENAI_COMPATIBLE_API_KEY` when required |
-| SentenceTransformers | — | ✓ | none |
+| SentenceTransformers | — | ✓ | None |
 
-Changing completion affects future generation only. Changing embeddings requires confirmation and rebuilds a new vector index before switching away from the working index. See [Operations](docs/operations.md#completion-and-embedding-providers) for credentials and [API and Interfaces](docs/api.md#model-configuration) for every configuration surface.
+Qwen models appear through OpenRouter or DeepInfra when their live catalogs provide them. Model choices are stored per memory store; credentials remain environment-only.
 
-The same change from Python:
+Changing completion affects future work only. Changing embeddings on a non-empty store requires confirmation and builds a complete replacement index before switching. A failed rebuild leaves the old index active.
 
-```python
-from trisynapse_memory import ProviderSelection
+[Provider setup and model behavior →](docs/operations.md#completion-and-embedding-providers)
 
-configuration = memory.get_model_configuration()
-configuration.completion = ProviderSelection(
-    provider="deepseek", model="deepseek-chat"
-)
-memory.set_model_configuration(configuration)
-```
+</details>
 
-Benchmark modes stay explicit:
+## Memory lifecycle
 
-- `retrieval` measures offline ingestion, retrieval, grounding, and extractive answers;
-- `end-to-end` adds provider-backed extraction, Recall generation, answering, and judging.
+| Operation | Meaning |
+|---|---|
+| `correct()` | Add a replacement while preserving what changed. |
+| `forget()` | Logically retract memory while retaining authorized history. |
+| `remove()` | Physically redact selected memory content. |
+| `remove_source()` | Remove an original source and all memory derived from it. |
 
-Artifacts record provider/model and prompt version/hash provenance without credentials or provider URLs.
+Namespaces isolate memory by project and optionally by user, agent, and session. The same namespace rules apply to Python, CLI, REST, Studio, and TypeScript.
 
-```bash
-trisynapse-memory bench run locomo --mode retrieval --data-root data/locomo --max-questions 100
-trisynapse-memory bench gate --mode retrieval
-```
+## Documentation
 
-## Development
+| Read this | When you need to… |
+|---|---|
+| [Architecture](docs/architecture.md) | Understand Formation, Trace, Recall, retrieval, graphs, and storage |
+| [API and interfaces](docs/api.md) | Use Python, REST, SSE, TypeScript, or CLI contracts |
+| [Operations](docs/operations.md) | Configure providers, deploy Studio, back up, restore, or troubleshoot |
+| [Release notes](docs/releases/) | See what changed in each version |
+| [Contributing](CONTRIBUTING.md) | Set up development and submit changes |
+| [Security](SECURITY.md) | Understand the deployment boundary or report a vulnerability |
+
+## Release notes
+
+Published installers and packages are on [GitHub Releases](https://github.com/shanmukh05/trisynapse-memory/releases). Written notes for each version live in [`docs/releases/`](docs/releases/).
+
+| Version | Notes |
+|---|---|
+| [v0.1.2](docs/releases/v0.1.2.md) | Retrieval profiles, token-aware grounding, store validation, and the `@trisynapse/trisynapse-memory` npm package. Includes breaking CLI, REST, and SDK renames. |
+| [v0.1.1](docs/releases/v0.1.1.md) | Current published release. Installers pin 0.1.1; tagged releases always rebuild and publish. |
+| [v0.1.0](docs/releases/v0.1.0.md) | First public alpha of the Trace & Recall engine. |
+
+## Development and benchmarks
 
 ```bash
 pip install -e '.[dev,all]'
 pytest -q
 ruff check src tests scripts
+
 pnpm install --frozen-lockfile
-pnpm --filter @trisynapse/memory check
+pnpm --filter @trisynapse/trisynapse-memory check
+pnpm --filter @trisynapse/studio test
 ```
 
-Trace & Recall is the only engine implementation. License: Apache-2.0.
+Benchmark adapters support LoCoMo, LongMemEval, HaluMem, and MemoryDoc. Retrieval mode measures the evidence pipeline without answer-generation calls; end-to-end mode adds provider-backed formation, answering, and judging.
+
+```bash
+trisynapse-memory bench run locomo \
+  --mode retrieval --data-root data/locomo --max-questions 100
+
+trisynapse-memory bench gate --mode retrieval --data-root data
+```
+
+See the [benchmark operations guide](docs/operations.md) before treating a result as a release gate.
+
+## License
+
+[Apache 2.0](LICENSE)

@@ -16,12 +16,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from trisynapse_memory.engine.compilation import (
+from trisynapse_memory.engine.recall.compilation import (
     build_episode_recall_views,
     compile_claims,
 )
-from trisynapse_memory.engine.embedding import Embedder, SentenceTransformerEmbedder, UnavailableEmbedder
-from trisynapse_memory.engine.formation import extract_episode, ingest_document, ingest_observation
+from trisynapse_memory.engine.providers.embedding import Embedder, SentenceTransformerEmbedder, UnavailableEmbedder
+from trisynapse_memory.engine.formation.pipeline import extract_episode, ingest_document, ingest_observation
 from trisynapse_memory.engine.models import (
     Actor,
     Citation,
@@ -57,9 +57,9 @@ from trisynapse_memory.engine.models import (
     SourcePreview,
     SourcePreviewItem,
     SourceRecord,
+    StoreValidation,
 )
-from trisynapse_memory.engine.privacy import PrivacyFilter
-from trisynapse_memory.engine.providers import (
+from trisynapse_memory.engine.providers.registry import (
     EmbeddingRebuildRequired,
     ProviderError,
     ProviderSettings,
@@ -73,12 +73,14 @@ from trisynapse_memory.engine.providers import (
     settings_from_selection,
     validate_selection,
 )
-from trisynapse_memory.engine.retrieval import HybridRetriever, RetrieverConfig, classify_query
-from trisynapse_memory.engine.trace import SQLiteTraceStore
-from trisynapse_memory.engine.sources import PreparedSource, prepare_source, store_blob
-from trisynapse_memory.engine.vector_cache import VectorCache, preferred_vector_cache
+from trisynapse_memory.engine.retrieval.engine import HybridRetriever, RetrieverConfig, classify_query
+from trisynapse_memory.engine.retrieval.contracts import QueryPlanner, RouteRegistry
+from trisynapse_memory.engine.trace.store import SQLiteTraceStore
+from trisynapse_memory.engine.retrieval.tokenization import TokenCounter, token_counter_for
+from trisynapse_memory.engine.formation.sources import PreparedChunk, PreparedSource, prepare_source, store_blob
+from trisynapse_memory.engine.recall.vector_cache import VectorCache, preferred_vector_cache
 from trisynapse_memory.prompts import load_prompt
-from trisynapse_memory._version import __version__
+from trisynapse_memory.engine.utils import __version__
 
 CompletionJSON = Callable[[str, str], dict[str, Any]]
 
@@ -116,9 +118,11 @@ class MemoryEngine:
         embedder: Embedder | None = None,
         completion: CompletionJSON | None = None,
         retriever_config: RetrieverConfig | None = None,
+        query_planner: QueryPlanner | None = None,
+        retrieval_routes: RouteRegistry | None = None,
+        token_counter: TokenCounter | None = None,
         vector_cache: VectorCache | None = None,
         default_namespace: MemoryNamespace | dict[str, Any] | None = None,
-        privacy_filter: PrivacyFilter | None = None,
         auto_process: bool = True,
         _managed_completion: bool = False,
         _managed_embedding: bool = False,
@@ -131,10 +135,13 @@ class MemoryEngine:
         self.retriever_config = retriever_config or _retriever_config(
             self.store.get_retrieval_configuration()
         )
+        self.query_planner = query_planner
+        self.retrieval_routes = retrieval_routes
+        self._token_counter_override = token_counter is not None
+        self.token_counter = token_counter or token_counter_for(completion)
         self.vector_cache = vector_cache or preferred_vector_cache(store)
         self.snapshot = SnapshotManager(store)
         self.default_namespace = _namespace(default_namespace)
-        self.privacy_filter = privacy_filter or PrivacyFilter()
         self.auto_process = auto_process
         self._managed_completion = _managed_completion
         self._managed_embedding = _managed_embedding
@@ -151,6 +158,9 @@ class MemoryEngine:
         embedding_model: str = "all-MiniLM-L6-v2",
         local_files_only: bool = False,
         vector_cache: VectorCache | None = None,
+        query_planner: QueryPlanner | None = None,
+        retrieval_routes: RouteRegistry | None = None,
+        token_counter: TokenCounter | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         completion_provider: ProviderSettings | None = None,
         embedding_provider: ProviderSettings | None = None,
@@ -197,6 +207,9 @@ class MemoryEngine:
             embedder=provider,
             completion=completion_callable,
             vector_cache=vector_cache,
+            query_planner=query_planner,
+            retrieval_routes=retrieval_routes,
+            token_counter=token_counter,
             default_namespace=namespace,
             auto_process=auto_process,
             _managed_completion=managed_completion,
@@ -492,25 +505,29 @@ class MemoryEngine:
             providers[item.provider].credential_env for item in required
             if not providers[item.provider].credential_configured
         ]
-        verification = self.verify_trace()
+        storage = self.validate_store()
         return {
-            "ok": verification.valid and os.access(path, os.W_OK) and not missing,
+            "ok": storage.ok and os.access(path, os.W_OK) and not missing,
             "version": self.VERSION,
             "command": system_shutil.which("trisynapse-memory"),
             "store": str(path),
             "store_writable": os.access(path, os.W_OK),
             "store_permissions": oct(mode) if mode is not None else None,
             "store_encrypted": False,
-            "trace": verification.model_dump(mode="json"),
+            "storage": storage.model_dump(mode="json"),
             "model_configuration": status.model_dump(mode="json"),
             "missing_credentials": missing,
             "provider_errors": self._provider_errors,
             "vision_interface": hasattr(self.completion, "complete_multimodal"),
+            "token_counter": {
+                "name": self.token_counter.name,
+                "exact": self.token_counter.exact,
+            },
             "source_extras": {
                 name: importlib.util.find_spec(module) is not None
                 for name, module in {
                     "pdf": "pypdf", "office": "docx", "spreadsheets": "openpyxl",
-                    "tree_sitter": "tree_sitter_language_pack",
+                    "tree_sitter": "tree_sitter_language_pack", "tokens": "tiktoken",
                 }.items()
             },
             "port_8765_available": port_free,
@@ -536,39 +553,33 @@ class MemoryEngine:
         source_ref: dict[str, Any] | str | None = None,
         locator: dict[str, Any] | str | None = None,
         scope: dict[str, Any] | None = None,
-        privacy_scope: dict[str, Any] | None = None,
         observed_at: datetime | str | None = None,
         external_key: str | None = None,
         actor: Actor | dict[str, Any] | None = None,
+        modality: str = "text",
+        source_type: str | None = None,
+        retrieval_fields: dict[str, Any] | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         process: bool | None = None,
         schedule: bool = True,
     ) -> MemoryDelta:
         memory_namespace = self._resolve_namespace(namespace)
-        redaction = self.privacy_filter.redact(text)
-        filtered_source_ref, source_categories = self.privacy_filter.redact_value(source_ref)
-        filtered_locator, locator_categories = self.privacy_filter.redact_value(locator)
-        filtered_scope, scope_categories = self.privacy_filter.redact_value(scope or {})
-        effective_privacy, privacy_categories = self.privacy_filter.redact_value(privacy_scope or {})
-        redaction_categories = list(dict.fromkeys([
-            *redaction.categories, *source_categories, *locator_categories, *scope_categories, *privacy_categories,
-        ]))
-        if redaction_categories:
-            effective_privacy["redacted"] = True
-            effective_privacy["redaction_categories"] = redaction_categories
         delta = ingest_observation(
             self.store,
-            redaction.text,
+            text,
             episode_id=episode_id,
-            source_ref=filtered_source_ref,
-            locator=filtered_locator,
-            scope=self._scope(memory_namespace, filtered_scope),
-            privacy_scope=effective_privacy,
+            source_ref=source_ref,
+            locator=locator,
+            scope=self._scope(memory_namespace, scope),
             observed_at=observed_at,
             external_key=external_key,
             actor=actor,
+            modality=modality,
             namespace=memory_namespace,
-            payload_extra={"redaction_categories": redaction_categories},
+            payload_extra={
+                "source_type": source_type or modality,
+                "retrieval_fields": retrieval_fields or {},
+            },
         )
         if episode_id and schedule:
             self._schedule_episode(episode_id, memory_namespace, process=process)
@@ -608,6 +619,9 @@ class MemoryEngine:
                     namespace=memory_namespace,
                     observed_at=observed_at,
                     external_key=f"message:{episode_id}:{message_id or index}",
+                    modality="conversation",
+                    source_type="conversation",
+                    retrieval_fields={"speaker": role or "", "message": text},
                     process=False,
                     schedule=False,
                 )
@@ -628,18 +642,11 @@ class MemoryEngine:
         metadata: dict[str, Any] | None = None,
     ) -> list[MemoryDelta]:
         memory_namespace = self._resolve_namespace(namespace, session_id=f"item:{document_id}")
-        redaction = self.privacy_filter.redact(text)
-        filtered_title = self.privacy_filter.redact(title).text if title else title
-        filtered_scope, scope_categories = self.privacy_filter.redact_value(scope or {})
-        filtered_metadata, metadata_categories = self.privacy_filter.redact_value(metadata or {})
-        redaction_categories = list(dict.fromkeys([
-            *redaction.categories, *scope_categories, *metadata_categories,
-        ]))
         deltas = ingest_document(
-            self.store, redaction.text, document_id=document_id, title=filtered_title, chunk_chars=chunk_chars,
-            scope=self._scope(memory_namespace, filtered_scope), observed_at=observed_at,
+            self.store, text, document_id=document_id, title=title, chunk_chars=chunk_chars,
+            scope=self._scope(memory_namespace, scope), observed_at=observed_at,
             namespace=memory_namespace,
-            payload_extra={"document_metadata": filtered_metadata, "redaction_categories": redaction_categories},
+            payload_extra={"document_metadata": metadata or {}},
         )
         self._schedule_episode(f"item:{document_id}", memory_namespace)
         return deltas
@@ -672,8 +679,9 @@ class MemoryEngine:
         source: SourceInput | dict[str, Any],
         *,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> SourceIngestionResult:
-        run = self.ingest_many([source], namespace=namespace)
+        run = self.ingest_many([source], namespace=namespace, on_progress=on_progress)
         result = run.results[0]
         if result.status == "failed":
             raise RuntimeError(result.error or "source ingestion failed")
@@ -685,9 +693,16 @@ class MemoryEngine:
         *,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         max_workers: int = 4,
+        on_progress: Callable[[str], None] | None = None,
     ) -> IngestionRun:
+        if on_progress:
+            on_progress("Creating durable ingestion run")
         run = self.create_ingestion_run(sources, namespace=namespace)
-        return self.process_ingestion_run(run.id, max_workers=max_workers)
+        return self.process_ingestion_run(
+            run.id,
+            max_workers=max_workers,
+            on_progress=on_progress,
+        )
 
     def create_ingestion_run(
         self,
@@ -708,7 +723,15 @@ class MemoryEngine:
         self.store.put_ingestion_run(run)
         return run
 
-    def process_ingestion_run(self, run_id: str, *, max_workers: int = 4) -> IngestionRun:
+    def process_ingestion_run(
+        self,
+        run_id: str,
+        *,
+        max_workers: int = 4,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> IngestionRun:
+        if on_progress:
+            on_progress("Loading source and model configuration")
         self._sync_model_configuration()
         run = self.get_ingestion_run(run_id)
         inputs = run.inputs
@@ -720,12 +743,16 @@ class MemoryEngine:
         failures: dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 4, len(inputs)))) as pool:
             futures = {pool.submit(prepare_source, item, self.completion): index for index, item in enumerate(inputs)}
-            for future in as_completed(futures):
+            for prepared_count, future in enumerate(as_completed(futures), 1):
                 index = futures[future]
                 try:
                     prepared[index] = future.result()
                 except Exception as exc:
                     failures[index] = str(exc)
+                if on_progress:
+                    on_progress(
+                        f"Preprocessed source {prepared_count} of {len(inputs)}"
+                    )
         retained_bytes = 0
         for index in range(len(inputs)):
             if index not in prepared:
@@ -738,6 +765,8 @@ class MemoryEngine:
                 retained_bytes = candidate_bytes
         results: list[SourceIngestionResult] = []
         for index, item in enumerate(inputs):
+            if on_progress:
+                on_progress(f"Writing source {index + 1} of {len(inputs)} to Trace")
             if index in failures:
                 results.append(SourceIngestionResult(index=index, source_key=item.source_key, kind=item.kind, status="failed", error=failures[index]))
                 continue
@@ -751,6 +780,8 @@ class MemoryEngine:
         run.status = "failed" if failed and not succeeded else "partial" if failed else "completed"
         run.updated_at = datetime.now(timezone.utc)
         self.store.put_ingestion_run(run)
+        if on_progress:
+            on_progress("Finalizing ingestion run")
         return run
 
     def _commit_source(
@@ -764,6 +795,9 @@ class MemoryEngine:
         source_key = prepared.source.source_key or prepared.uri or f"upload:{prepared.filename}:{prepared.content_hash}"
         previous = self.store.latest_source(source_key, namespace)
         if previous is not None and previous.status == "active" and previous.content_hash == prepared.content_hash:
+            # A no-op ingestion still verifies and repairs its content-addressed
+            # retained blob before returning the existing source version.
+            store_blob(self.store.root, prepared.original, filename=prepared.filename)
             return SourceIngestionResult(
                 index=index, source_id=previous.id, source_key=source_key, kind=previous.kind,
                 status="skipped", episode_id=f"source:{previous.id}:v{previous.version}", delta_ids=previous.delta_ids,
@@ -789,6 +823,9 @@ class MemoryEngine:
         for chunk_index, chunk in enumerate(prepared.chunks):
             if not chunk.text.strip():
                 continue
+            modality, source_type, retrieval_fields = _source_retrieval_descriptor(
+                prepared, chunk
+            )
             delta = self.ingest_observation(
                 chunk.text,
                 episode_id=episode_id,
@@ -797,6 +834,9 @@ class MemoryEngine:
                 scope={**prepared.source.scope, "source_id": source_id, "source_kind": prepared.kind},
                 external_key=f"source:{source_id}:chunk:{chunk_index}:{hashlib.sha256(chunk.text.encode()).hexdigest()[:16]}",
                 namespace=namespace,
+                modality=modality,
+                source_type=source_type,
+                retrieval_fields=retrieval_fields,
                 process=False,
                 schedule=False,
             )
@@ -1044,12 +1084,11 @@ class MemoryEngine:
         target = self.get(delta_id, namespace=memory_namespace)
         if target is None:
             raise KeyError(f"unknown delta: {delta_id}")
-        safe_reason = self.privacy_filter.redact(reason).text
         return self.store.append(
             kind="retraction",
-            text=f"Retracted {delta_id}: {safe_reason}",
+            text=f"Retracted {delta_id}: {reason}",
             evidence_refs=[delta_id],
-            payload={"target_delta_ids": [delta_id], "reason": safe_reason, "requested_by": requested_by},
+            payload={"target_delta_ids": [delta_id], "reason": reason, "requested_by": requested_by},
             actor=Actor(type="user", id=requested_by),
             confidence=1.0,
             namespace=memory_namespace,
@@ -1069,19 +1108,16 @@ class MemoryEngine:
     ) -> MemoryDelta:
         memory_namespace = self._resolve_namespace(namespace)
         target = self.get(delta_id, namespace=memory_namespace)
-        redaction = self.privacy_filter.redact(text)
-        safe_reason = self.privacy_filter.redact(reason).text
         return self.store.append(
             kind="extraction",
-            text=redaction.text,
+            text=text,
             episode_id=target.episode_id,
             evidence_refs=[delta_id],
-            payload={"annotation_type": "correction", "target_delta_ids": [delta_id], "reason": safe_reason},
+            payload={"annotation_type": "correction", "target_delta_ids": [delta_id], "reason": reason},
             actor=Actor(type="user", id=requested_by),
             confidence=1.0,
             namespace=memory_namespace,
             scope=target.scope,
-            privacy_scope={"redaction_categories": redaction.categories} if redaction.categories else {},
         )
 
     def remove(
@@ -1093,13 +1129,12 @@ class MemoryEngine:
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> RemoveResult:
         memory_namespace = self._resolve_namespace(namespace)
-        safe_reason = self.privacy_filter.redact(reason).text
         for delta_id in delta_ids:
             self.get(delta_id, namespace=memory_namespace, include_retracted=True)
         for delta_id in delta_ids:
             if delta_id not in self.store.retracted_ids():
-                self.retract(delta_id=delta_id, reason=safe_reason, requested_by=requested_by, namespace=memory_namespace)
-        result = self.store.hard_remove(delta_ids, requested_by=requested_by, reason=safe_reason)
+                self.retract(delta_id=delta_id, reason=reason, requested_by=requested_by, namespace=memory_namespace)
+        result = self.store.hard_remove(delta_ids, requested_by=requested_by, reason=reason)
         self.vector_cache.clear()
         return result
 
@@ -1153,17 +1188,20 @@ class MemoryEngine:
         scope: dict[str, Any] | None = None,
         query_id: str | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
+        on_step: Callable[[QueryStep], None] | None = None,
     ) -> MemorySearchResult:
         memory_namespace = self._resolve_namespace(namespace)
-        safe_query = self.privacy_filter.redact(query).text
         identifier = query_id or f"q_{secrets.token_hex(8)}"
-        run = self._new_query_run(identifier, "search", safe_query, memory_namespace)
+        run = self._new_query_run(identifier, "search", query, memory_namespace)
+        if on_step and run.steps:
+            on_step(run.steps[0])
         return self._execute_search(
             run,
             top_k=top_k,
             episode_prefix=episode_prefix,
             scope=scope,
             finish=True,
+            on_step=on_step,
         )
 
     def query(
@@ -1176,13 +1214,15 @@ class MemoryEngine:
         abstain_threshold: float | None = None,
         history: list[dict[str, Any]] | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
+        on_step: Callable[[QueryStep], None] | None = None,
     ) -> MemoryQueryResult:
         del history
         memory_namespace = self._resolve_namespace(namespace)
-        safe_question = self.privacy_filter.redact(question).text
         run = self._new_query_run(
-            f"q_{secrets.token_hex(8)}", "query", safe_question, memory_namespace
+            f"q_{secrets.token_hex(8)}", "query", question, memory_namespace
         )
+        if on_step and run.steps:
+            on_step(run.steps[0])
         return self._execute_query(
             run,
             original_question=question,
@@ -1190,13 +1230,14 @@ class MemoryEngine:
             episode_prefix=episode_prefix,
             scope=scope,
             abstain_threshold=abstain_threshold,
+            on_step=on_step,
         )
 
     def _new_query_run(
         self,
         identifier: str,
         mode: str,
-        safe_query: str,
+        query: str,
         namespace: MemoryNamespace,
         *,
         status: str = "running",
@@ -1207,26 +1248,33 @@ class MemoryEngine:
             mode=mode,
             status=status,
             namespace=namespace,
-            query=safe_query,
+            query=query,
             retrieval_configuration=configuration,
             steps=[QueryStep(
-                id=f"{identifier}:0:privacy",
-                phase="privacy",
-                label="Filter private query data",
+                id=f"{identifier}:0:input",
+                phase="input",
+                label="Record query input",
                 sequence=0,
-                output={"query": safe_query, "redacted": safe_query != safe_query},
+                output={"query": query},
             )] if status == "running" else [],
             attempt=1 if status == "running" else 0,
         )
         self.store.put_query_run(run)
         return run
 
-    def _append_query_step(self, run: QueryRun, step: QueryStep) -> None:
+    def _append_query_step(
+        self,
+        run: QueryRun,
+        step: QueryStep,
+        on_step: Callable[[QueryStep], None] | None = None,
+    ) -> None:
         run.steps = [item for item in run.steps if item.id != step.id]
         run.steps.append(step)
         run.steps.sort(key=lambda item: item.sequence)
         run.updated_at = datetime.now(timezone.utc)
         self.store.put_query_run(run)
+        if on_step:
+            on_step(step)
 
     def _execute_search(
         self,
@@ -1236,24 +1284,30 @@ class MemoryEngine:
         episode_prefix: str | None,
         scope: dict[str, Any] | None,
         finish: bool,
+        on_step: Callable[[QueryStep], None] | None = None,
     ) -> MemorySearchResult:
         self._sync_model_configuration()
         if not self._retriever_override:
             self.retriever_config = _retriever_config(self.get_retrieval_configuration())
-        filtered_scope, _ = self.privacy_filter.redact_value(scope or {})
         effective_top_k = top_k or run.retrieval_configuration.default_top_k
         retriever = HybridRetriever(
-            self.store, self.embedder, self.vector_cache, self.retriever_config
+            self.store,
+            self.embedder,
+            self.vector_cache,
+            self.retriever_config,
+            planner=self.query_planner,
+            routes=self.retrieval_routes,
+            token_counter=self.token_counter,
         )
         started = time.perf_counter()
         result = retriever.search(
             run.query,
             top_k=effective_top_k,
             episode_prefix=episode_prefix,
-            scope=self._scope(run.namespace, filtered_scope),
+            scope=self._scope(run.namespace, scope),
             namespace=run.namespace,
             query_id=run.id,
-            on_step=lambda step: self._append_query_step(run, step),
+            on_step=lambda step: self._append_query_step(run, step, on_step),
         )
         run.retrieval_trace = result.retrieval_trace
         if finish:
@@ -1273,14 +1327,23 @@ class MemoryEngine:
         episode_prefix: str | None,
         scope: dict[str, Any] | None,
         abstain_threshold: float | None,
+        on_step: Callable[[QueryStep], None] | None = None,
     ) -> MemoryQueryResult:
         started = time.perf_counter()
         search_result = self._execute_search(
             run,
-            top_k=top_k,
+            # ``default_top_k`` controls ordinary search results. Answer
+            # generation gets the larger grounded context window unless the
+            # caller explicitly requests a limit.
+            top_k=(
+                top_k
+                if top_k is not None
+                else run.retrieval_configuration.max_context_items
+            ),
             episode_prefix=episode_prefix,
             scope=scope,
             finish=False,
+            on_step=on_step,
         )
         hits = search_result.hits
         threshold = (
@@ -1289,6 +1352,7 @@ class MemoryEngine:
         )
         relevant = bool(hits and hits[0].score >= threshold)
         generation_started = time.perf_counter()
+        cited_hits = hits
         if self.completion is not None and relevant:
             payload = self.completion(
                 load_prompt("answer").text,
@@ -1296,13 +1360,22 @@ class MemoryEngine:
             )
             answer = str(payload.get("answer") or "").strip()
             abstain = bool(payload.get("abstain", False)) or not answer
+            requested_citations = payload.get("citation_ids")
+            if requested_citations is not None:
+                if not isinstance(requested_citations, list):
+                    raise ValueError("answer citation_ids must be a list")
+                requested_ids = {str(value) for value in requested_citations}
+                cited_hits = [hit for hit in hits if hit.item_id in requested_ids]
+                if answer and not abstain and not cited_hits:
+                    answer = "I don't have enough grounded evidence to answer that."
+                    abstain = True
         elif relevant:
             answer = _extractive_answer(original_question, hits)
             abstain = not answer
         else:
             answer = "I don't have enough grounded evidence to answer that."
             abstain = True
-        citations = _citations(hits if not abstain else [])
+        citations = _citations(cited_hits if not abstain else [])
         provenance = {
             **provider_provenance(self.completion, kind="completion"),
             "prompt": load_prompt("answer").provenance() if self.completion is not None else None,
@@ -1316,8 +1389,7 @@ class MemoryEngine:
             output={"answer": answer, "abstain": abstain, "citation_ids": [item.delta_id for item in citations]},
             metrics={"evidence_count": len(hits), "citation_count": len(citations)},
             duration_ms=(time.perf_counter() - generation_started) * 1000,
-        ))
-        filtered_scope, _ = self.privacy_filter.redact_value(scope or {})
+        ), on_step)
         self.store.append(
             kind="access",
             text=f"Query access {search_result.query_id}",
@@ -1330,7 +1402,7 @@ class MemoryEngine:
             },
             confidence=1.0,
             namespace=run.namespace,
-            scope=self._scope(run.namespace, filtered_scope),
+            scope=self._scope(run.namespace, scope),
         )
         self._append_query_step(run, QueryStep(
             id=f"{run.id}:{len(run.steps)}:audit",
@@ -1338,7 +1410,7 @@ class MemoryEngine:
             label="Record citation access",
             sequence=len(run.steps),
             output={"query_id": run.id, "citation_ids": [item.delta_id for item in citations]},
-        ))
+        ), on_step)
         run.answer = answer
         run.abstain = abstain
         run.citations = citations
@@ -1354,6 +1426,7 @@ class MemoryEngine:
             answer=answer,
             abstain=abstain,
             citations=citations,
+            retrieval_hits=hits,
             retrieval_trace=search_result.retrieval_trace,
         )
 
@@ -1371,15 +1444,14 @@ class MemoryEngine:
         if mode not in {"query", "search"}:
             raise ValueError("mode must be query or search")
         memory_namespace = self._resolve_namespace(namespace)
-        safe_query = self.privacy_filter.redact(query).text
         run = self._new_query_run(
-            f"q_{secrets.token_hex(8)}", mode, safe_query, memory_namespace, status="pending"
+            f"q_{secrets.token_hex(8)}", mode, query, memory_namespace, status="pending"
         )
         job = self.store.enqueue_job(
             "execute_query",
             {
                 "query_id": run.id,
-                "query": safe_query,
+                "query": query,
                 "mode": mode,
                 "top_k": top_k,
                 "episode_prefix": episode_prefix,
@@ -1407,11 +1479,11 @@ class MemoryEngine:
         run.attempt += 1
         run.updated_at = datetime.now(timezone.utc)
         run.steps = [QueryStep(
-            id=f"{run.id}:0:privacy",
-            phase="privacy",
-            label="Filter private query data",
+            id=f"{run.id}:0:input",
+            phase="input",
+            label="Record query input",
             sequence=0,
-            output={"query": run.query, "redacted": True},
+            output={"query": run.query},
         )]
         self.store.put_query_run(run)
         try:
@@ -1434,7 +1506,7 @@ class MemoryEngine:
                 )
         except Exception as exc:
             run.status = "failed"
-            run.error = self.privacy_filter.redact(str(exc)).text[:1000]
+            run.error = str(exc)[:1000]
             run.updated_at = datetime.now(timezone.utc)
             run.completed_at = run.updated_at
             self.store.put_query_run(run)
@@ -1548,10 +1620,9 @@ class MemoryEngine:
         memory_namespace = self._resolve_namespace(namespace)
         deltas = self.store.list_deltas(namespace=memory_namespace, include_retracted=include_retracted)
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "engine_version": self.VERSION,
             "namespace": memory_namespace.model_dump(mode="json"),
-            "trace_valid": self.verify_trace().valid,
             "deltas": [item.model_dump(mode="json") for item in deltas],
         }
 
@@ -1562,6 +1633,12 @@ class MemoryEngine:
         return output
 
     def backup(self, destination: str | Path) -> Path:
+        validation = self.validate_store()
+        if not validation.ok:
+            raise RuntimeError(
+                "memory store failed validation before backup: "
+                + "; ".join(validation.issues)
+            )
         output = Path(destination).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)
         self.store._connection.execute("PRAGMA wal_checkpoint(FULL)")
@@ -1584,10 +1661,12 @@ class MemoryEngine:
                     raise ValueError(f"unsafe backup member: {member.filename}")
             bundle.extractall(target)
         engine = cls.open(target)
-        verification = engine.verify_trace()
-        if not verification.valid:
+        validation = engine.validate_store()
+        if not validation.ok:
             engine.close()
-            raise RuntimeError(f"restored Trace failed verification: {verification.reason}")
+            raise RuntimeError(
+                "restored memory store failed validation: " + "; ".join(validation.issues)
+            )
         return engine
 
     def get_retrieval_trace(
@@ -1897,18 +1976,17 @@ class MemoryEngine:
         trace = self.get_retrieval_trace(query_id, namespace=memory_namespace)
         if trace is None:
             raise KeyError(f"unknown query: {query_id}")
-        safe_comment = self.privacy_filter.redact(comment).text if comment else comment
         return self.store.append(
             kind="access",
             text=f"Feedback for query {query_id}: {'helpful' if helpful else 'not helpful'}",
-            payload={"query_id": query_id, "was_helpful": helpful, "comment": safe_comment},
+            payload={"query_id": query_id, "was_helpful": helpful, "comment": comment},
             namespace=memory_namespace,
             scope=self._scope(memory_namespace, None),
             confidence=1.0,
         )
 
-    def verify_trace(self) -> Any:
-        return self.store.verify()
+    def validate_store(self, *, check_source_blobs: bool = True) -> StoreValidation:
+        return self.store.validate(check_source_blobs=check_source_blobs)
 
     def list_jobs(self, *, status: str | None = None, limit: int = 100) -> list[MemoryJob]:
         return self.store.list_jobs(status=status, limit=limit)
@@ -1946,7 +2024,7 @@ class MemoryEngine:
                     run = self.store.get_query_run(str(job.payload.get("query_id") or ""))
                     if run is not None and run.status not in {"completed", "failed"}:
                         run.status = "failed"
-                        run.error = self.privacy_filter.redact(str(exc)).text[:1000]
+                        run.error = str(exc)[:1000]
                         run.updated_at = datetime.now(timezone.utc)
                         self.store.put_query_run(run)
                 completed.append(finished)
@@ -1987,6 +2065,8 @@ class MemoryEngine:
                     str(exc),
                 )
                 self._provider_errors["embedding"] = str(exc)
+        if not self._token_counter_override:
+            self.token_counter = token_counter_for(self.completion)
         self._config_revision = configuration.revision
 
     def _prewarm_embedding_cache(self, embedder: Embedder) -> None:
@@ -2063,22 +2143,97 @@ class MemoryEngine:
             self.run_jobs()
 
 def _answer_prompt(question: str, hits: list[Any]) -> str:
+    query_kind = classify_query(question)
+    policies = {
+        "fact": "Return the shortest directly supported factual answer.",
+        "temporal": "Resolve the event time from observed_at and temporal anchors; prefer an absolute date.",
+        "list": "Aggregate and deduplicate every supported item across the supplied records.",
+        "inference": "Combine all related records and make the best supported judgment; mention uncertainty only when evidence conflicts.",
+        "multi_hop": "Connect the relevant records step by step, then return the concise conclusion supported by that chain.",
+    }
     lines = [
-        f"[{hit.kind} id={hit.item_id}] ({hit.temporal_anchor or hit.observed_at or 'unknown date'}) {hit.text}"
+        (
+            f"[{hit.kind} id={hit.item_id} locator={hit.locator or 'unknown'}] "
+            f"({hit.temporal_anchor or hit.observed_at or 'unknown date'}) {hit.text}"
+        )
         for hit in hits
         if hit.kind in {"observation", "extraction"}
     ]
-    return f"Question: {question}\n\nTrace context:\n" + "\n".join(lines)
+    return (
+        f"Question type: {query_kind}\n"
+        f"Answer policy: {policies[query_kind]}\n"
+        f"Question: {question}\n\nTrace context:\n" + "\n".join(lines)
+    )
+
+
+def _source_retrieval_descriptor(
+    prepared: PreparedSource,
+    chunk: PreparedChunk,
+) -> tuple[str, str, dict[str, Any]]:
+    """Map every accepted source to generic modality and searchable fields."""
+
+    locator = chunk.locator
+    chunk_kind = str(locator.get("kind") or "")
+    source_type = str(
+        chunk.metadata.get("source_type")
+        or prepared.metadata.get("source_type")
+        or prepared.kind
+    )
+    if chunk_kind in {"code_symbol", "code_lines"}:
+        modality = "code"
+    elif chunk_kind == "notebook_cell":
+        modality = "code" if locator.get("cell_type") == "code" else "document"
+    elif chunk_kind in {"row", "cell"} or source_type in {"csv", "xlsx", "spreadsheet"}:
+        modality = "table"
+    elif chunk_kind == "image" or source_type == "image" or prepared.kind == "image":
+        modality = "image"
+    elif chunk_kind in {"message", "message_index", "dialog"}:
+        modality = "conversation"
+    else:
+        modality = "document"
+
+    fields: dict[str, Any] = {
+        "title": prepared.title,
+        "filename": prepared.filename,
+        "path": locator.get("path") or prepared.filename,
+        "section": locator.get("section"),
+        "page": locator.get("page"),
+        "slide": locator.get("slide"),
+        "sheet": locator.get("sheet"),
+        "row": locator.get("row"),
+        "symbol": locator.get("symbol"),
+        "symbol_kind": locator.get("symbol_kind"),
+        "language": locator.get("language") or chunk.metadata.get("language") or prepared.metadata.get("language"),
+        "imports": chunk.metadata.get("imports"),
+        "headers": chunk.metadata.get("headers") or prepared.metadata.get("headers"),
+    }
+    if modality == "image":
+        fields["visible_text"] = chunk.text
+        fields["description"] = chunk.text
+    elif modality == "table":
+        fields["record"] = chunk.text
+    elif modality == "code":
+        fields["code"] = chunk.text
+    else:
+        fields["content"] = chunk.text
+    return modality, source_type, {
+        key: value for key, value in fields.items() if value is not None and value != ""
+    }
 
 
 def _retriever_config(value: RetrievalConfiguration) -> RetrieverConfig:
     return RetrieverConfig(
         top_k=value.default_top_k,
         max_context_items=value.max_context_items,
+        max_context_tokens=value.max_context_tokens,
+        per_source_context_tokens=value.per_source_context_tokens,
         graph_hops=value.graph_hops,
         margin_threshold=value.confidence_margin,
         max_refinement_rounds=value.max_refinement_rounds,
         deep_recall_enabled=value.deep_recall_enabled,
+        retrieval_profile=value.retrieval_profile,
+        enabled_routes=tuple(value.enabled_routes),
+        route_weights=dict(value.route_weights),
     )
 
 

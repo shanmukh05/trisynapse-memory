@@ -125,11 +125,16 @@ export type Citation = {
 export type RetrievalConfiguration = {
   default_top_k: number;
   max_context_items: number;
+  max_context_tokens: number;
+  per_source_context_tokens: number;
   max_refinement_rounds: number;
   graph_hops: number;
   confidence_margin: number;
   deep_recall_enabled: boolean;
   answer_abstain_threshold: number;
+  retrieval_profile: "auto" | "balanced" | "precise" | "broad" | "mixed" | "code" | "table" | "image" | "document" | "conversation";
+  enabled_routes: string[];
+  route_weights: Record<string, number>;
   revision: number;
   updated_at: string;
 };

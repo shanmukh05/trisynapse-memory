@@ -1,4 +1,4 @@
-"""SQLite persistence for the immutable trace and disposable recall cache."""
+"""SQLite persistence for ordered Trace evidence and disposable Recall data."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -29,11 +30,11 @@ from trisynapse_memory.engine.models import (
     RetrievalTrace,
     SourceRecord,
     SnapshotDiff,
-    TraceVerification,
+    StoreValidation,
 )
-
-GENESIS_HASH = "0" * 64
-
+from trisynapse_memory.engine.retrieval.contracts import RetrievalDocument
+from trisynapse_memory.engine.utils import bm25_term_score
+from trisynapse_memory.engine.retrieval.tokenization import LEXICAL_TOKENIZER_VERSION, lexical_tokens
 
 def _json(value: Any) -> str:
     if hasattr(value, "model_dump"):
@@ -53,13 +54,29 @@ def _new_id(prefix: str = "d") -> str:
     return f"{prefix}_{millis:013x}{secrets.token_hex(6)}"
 
 
-def _delta_hash(delta: MemoryDelta) -> str:
-    payload = delta.model_dump(mode="json", exclude={"hash"})
-    return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+def _field_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_field_text(item) for item in value if _field_text(item))
+    if isinstance(value, dict):
+        return " ".join(f"{key} {_field_text(item)}" for key, item in value.items())
+    return str(value)
+
+
+def _normal_index_entity(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = " ".join(value.casefold().split())
+    if normalized in {"i", "you", "he", "she", "they", "we", "it", "user", "speaker"}:
+        return ""
+    return normalized
 
 
 class SQLiteTraceStore:
-    """Durable append-only trace with transactional sequence/hash assignment."""
+    """Durable ordered Trace with transactional sequence assignment."""
 
     def __init__(self, root: str | Path) -> None:
         root_path = Path(root).expanduser()
@@ -96,8 +113,6 @@ class SQLiteTraceStore:
             CREATE TABLE IF NOT EXISTS deltas (
                 id TEXT PRIMARY KEY,
                 seq INTEGER NOT NULL UNIQUE,
-                prev_hash TEXT NOT NULL,
-                hash TEXT NOT NULL UNIQUE,
                 written_at TEXT NOT NULL,
                 observed_at TEXT,
                 kind TEXT NOT NULL CHECK(kind IN ('observation','extraction','annotation','access','retraction')),
@@ -139,8 +154,6 @@ class SQLiteTraceStore:
             CREATE TABLE IF NOT EXISTS removal_audit (
                 remove_id TEXT PRIMARY KEY,
                 target_ids_json TEXT NOT NULL,
-                old_root_hash TEXT NOT NULL,
-                new_root_hash TEXT NOT NULL,
                 requested_by TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -192,7 +205,6 @@ class SQLiteTraceStore:
                 id TEXT PRIMARY KEY,
                 label TEXT,
                 seq_cutoff INTEGER NOT NULL,
-                evidence_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 active INTEGER NOT NULL DEFAULT 0
             );
@@ -241,20 +253,86 @@ class SQLiteTraceStore:
                 fetched_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS retrieval_documents (
+                delta_id TEXT PRIMARY KEY,
+                namespace_key TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                episode_id TEXT,
+                modality TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
+                text TEXT NOT NULL,
+                index_text TEXT NOT NULL,
+                fields_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                token_count INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                observed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_documents_namespace
+                ON retrieval_documents(namespace_key, active, seq);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_documents_modality
+                ON retrieval_documents(namespace_key, modality, active);
+            CREATE TABLE IF NOT EXISTS retrieval_terms (
+                delta_id TEXT NOT NULL,
+                namespace_key TEXT NOT NULL,
+                term TEXT NOT NULL,
+                term_frequency INTEGER NOT NULL,
+                PRIMARY KEY(delta_id, term)
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_terms_lookup
+                ON retrieval_terms(namespace_key, term, delta_id);
+            CREATE TABLE IF NOT EXISTS retrieval_graph_edges (
+                namespace_key TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                edge_kind TEXT NOT NULL,
+                weight REAL NOT NULL,
+                PRIMARY KEY(source_id, target_id, edge_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_edges_source
+                ON retrieval_graph_edges(namespace_key, source_id);
+            CREATE TABLE IF NOT EXISTS retrieval_index_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         tables = {row["name"] for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        self._migrate_delta_schema()
+        self._migrate_removal_audit_schema()
+        self._migrate_snapshot_schema()
         if "purge_audit" in tables:
             self._connection.execute(
                 """INSERT OR IGNORE INTO removal_audit
-                   SELECT purge_id,target_ids_json,old_root_hash,new_root_hash,requested_by,reason,created_at
+                   SELECT purge_id,target_ids_json,requested_by,reason,created_at
                    FROM purge_audit"""
             )
             self._connection.execute("DROP TABLE purge_audit")
-        columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(deltas)").fetchall()}
-        if "namespace_json" not in columns:
+        retrieval_columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(retrieval_documents)").fetchall()
+        }
+        if "text" not in retrieval_columns:
             self._connection.execute(
-                "ALTER TABLE deltas ADD COLUMN namespace_json TEXT NOT NULL DEFAULT '{\"project_id\":\"default\"}'"
+                "ALTER TABLE retrieval_documents ADD COLUMN text TEXT NOT NULL DEFAULT ''"
+            )
+            self._connection.execute(
+                """UPDATE retrieval_documents
+                   SET text=COALESCE((SELECT d.text FROM deltas d WHERE d.id=retrieval_documents.delta_id),'')"""
+            )
+        tokenizer_row = self._connection.execute(
+            "SELECT value FROM retrieval_index_metadata WHERE key='lexical_tokenizer_version'"
+        ).fetchone()
+        if tokenizer_row is None or tokenizer_row["value"] != LEXICAL_TOKENIZER_VERSION:
+            self._connection.execute("DELETE FROM retrieval_terms")
+            self._connection.execute("DELETE FROM retrieval_graph_edges")
+            self._connection.execute("DELETE FROM retrieval_documents")
+            self._connection.execute(
+                """INSERT OR REPLACE INTO retrieval_index_metadata(key,value)
+                   VALUES('lexical_tokenizer_version',?)""",
+                (LEXICAL_TOKENIZER_VERSION,),
             )
         for row in self._connection.execute(
             "SELECT id,payload_json FROM ingestion_runs WHERE status='running'"
@@ -302,7 +380,127 @@ class SQLiteTraceStore:
                 completed_at=trace.created_at,
             )
             self._put_query_run_uncommitted(run)
+        # The retrieval index is disposable and can be backfilled from Trace.
+        for row in self._connection.execute(
+            """SELECT d.* FROM deltas d
+               LEFT JOIN retrieval_documents r ON r.delta_id=d.id
+               WHERE r.delta_id IS NULL AND d.kind IN ('observation','extraction')"""
+        ).fetchall():
+            self._index_delta_uncommitted(self._connection, self._from_row(row))
+        for row in self._connection.execute(
+            "SELECT * FROM deltas WHERE kind='retraction' ORDER BY seq"
+        ).fetchall():
+            self._index_delta_uncommitted(self._connection, self._from_row(row))
         self._connection.commit()
+
+    def _migrate_delta_schema(self) -> None:
+        """Remove legacy chain columns while preserving ordered evidence."""
+
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(deltas)").fetchall()
+        }
+        if "namespace_json" not in columns:
+            self._connection.execute(
+                "ALTER TABLE deltas ADD COLUMN namespace_json TEXT NOT NULL DEFAULT '{\"project_id\":\"default\"}'"
+            )
+            columns.add("namespace_json")
+        # These column names exist only in pre-migration stores.
+        legacy_chain_columns = {"prev_hash", "hash"}
+        if not legacy_chain_columns.issubset(columns):
+            return
+        self._connection.executescript(
+            """
+            DROP TABLE IF EXISTS deltas_without_chain;
+            CREATE TABLE deltas_without_chain (
+                id TEXT PRIMARY KEY,
+                seq INTEGER NOT NULL UNIQUE,
+                written_at TEXT NOT NULL,
+                observed_at TEXT,
+                kind TEXT NOT NULL CHECK(kind IN ('observation','extraction','annotation','access','retraction')),
+                actor_json TEXT NOT NULL,
+                namespace_json TEXT NOT NULL DEFAULT '{"project_id":"default"}',
+                episode_id TEXT,
+                evidence_refs_json TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                privacy_scope_json TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                text TEXT NOT NULL,
+                subject TEXT,
+                relation TEXT,
+                object TEXT,
+                temporal_anchor TEXT,
+                source_ref_json TEXT,
+                locator_json TEXT,
+                external_key TEXT UNIQUE
+            );
+            INSERT INTO deltas_without_chain(
+                id,seq,written_at,observed_at,kind,actor_json,namespace_json,episode_id,
+                evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,text,
+                subject,relation,object,temporal_anchor,source_ref_json,locator_json,external_key
+            ) SELECT
+                id,seq,written_at,observed_at,kind,actor_json,namespace_json,episode_id,
+                evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,text,
+                subject,relation,object,temporal_anchor,source_ref_json,locator_json,external_key
+            FROM deltas ORDER BY seq;
+            DROP TABLE deltas;
+            ALTER TABLE deltas_without_chain RENAME TO deltas;
+            CREATE INDEX idx_deltas_episode ON deltas(episode_id, seq);
+            CREATE INDEX idx_deltas_kind ON deltas(kind, seq);
+            CREATE INDEX idx_deltas_observed ON deltas(observed_at);
+            """
+        )
+
+    def _migrate_removal_audit_schema(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(removal_audit)").fetchall()
+        }
+        legacy_root_columns = {"old_root_hash", "new_root_hash"}
+        if not legacy_root_columns.issubset(columns):
+            return
+        self._connection.executescript(
+            """
+            DROP TABLE IF EXISTS removal_audit_without_roots;
+            CREATE TABLE removal_audit_without_roots (
+                remove_id TEXT PRIMARY KEY,
+                target_ids_json TEXT NOT NULL,
+                requested_by TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO removal_audit_without_roots(
+                remove_id,target_ids_json,requested_by,reason,created_at
+            ) SELECT remove_id,target_ids_json,requested_by,reason,created_at
+              FROM removal_audit;
+            DROP TABLE removal_audit;
+            ALTER TABLE removal_audit_without_roots RENAME TO removal_audit;
+            """
+        )
+
+    def _migrate_snapshot_schema(self) -> None:
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(snapshots)").fetchall()
+        }
+        legacy_evidence_column = "evidence_hash"
+        if legacy_evidence_column not in columns:
+            return
+        self._connection.executescript(
+            """
+            DROP TABLE IF EXISTS snapshots_without_roots;
+            CREATE TABLE snapshots_without_roots (
+                id TEXT PRIMARY KEY,
+                label TEXT,
+                seq_cutoff INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO snapshots_without_roots(id,label,seq_cutoff,created_at,active)
+                SELECT id,label,seq_cutoff,created_at,active FROM snapshots;
+            DROP TABLE snapshots;
+            ALTER TABLE snapshots_without_roots RENAME TO snapshots;
+            """
+        )
 
     def get_retrieval_configuration(self) -> RetrievalConfiguration:
         row = self._connection.execute(
@@ -518,7 +716,6 @@ class SQLiteTraceStore:
         episode_id: str | None = None,
         evidence_refs: Iterable[str] = (),
         confidence: float = 0.7,
-        privacy_scope: dict[str, Any] | None = None,
         scope: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
         subject: str | None = None,
@@ -542,14 +739,11 @@ class SQLiteTraceStore:
             cursor = self._connection.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                previous = cursor.execute("SELECT seq, hash FROM deltas ORDER BY seq DESC LIMIT 1").fetchone()
+                previous = cursor.execute("SELECT seq FROM deltas ORDER BY seq DESC LIMIT 1").fetchone()
                 seq = int(previous["seq"]) + 1 if previous else 1
-                prev_hash = str(previous["hash"]) if previous else GENESIS_HASH
                 delta = MemoryDelta(
                     id=_new_id(),
                     seq=seq,
-                    prev_hash=prev_hash,
-                    hash="",
                     written_at=written,
                     observed_at=observed,
                     kind=kind,
@@ -558,7 +752,7 @@ class SQLiteTraceStore:
                     episode_id=episode_id,
                     evidence_refs=evidence,
                     confidence=confidence,
-                    privacy_scope=privacy_scope or {},
+                    privacy_scope={},
                     scope=scope or {},
                     payload=payload or {},
                     text=text,
@@ -570,15 +764,15 @@ class SQLiteTraceStore:
                     locator=locator,
                     external_key=external_key,
                 )
-                delta.hash = _delta_hash(delta)
                 cursor.execute(
                     """INSERT INTO deltas(
-                           id,seq,prev_hash,hash,written_at,observed_at,kind,actor_json,namespace_json,
+                           id,seq,written_at,observed_at,kind,actor_json,namespace_json,
                            episode_id,evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,
                            text,subject,relation,object,temporal_anchor,source_ref_json,locator_json,external_key
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     self._to_row(delta),
                 )
+                self._index_delta_uncommitted(cursor, delta)
                 if kind != "access":
                     cursor.execute("UPDATE recall_cache SET stale=1 WHERE stale=0")
                 self._connection.commit()
@@ -599,8 +793,6 @@ class SQLiteTraceStore:
         return (
             delta.id,
             delta.seq,
-            delta.prev_hash,
-            delta.hash,
             delta.written_at.isoformat(),
             delta.observed_at.isoformat() if delta.observed_at else None,
             delta.kind,
@@ -627,8 +819,6 @@ class SQLiteTraceStore:
         return MemoryDelta(
             id=row["id"],
             seq=row["seq"],
-            prev_hash=row["prev_hash"],
-            hash=row["hash"],
             written_at=_parse_datetime(row["written_at"]),
             observed_at=_parse_datetime(row["observed_at"]),
             kind=row["kind"],
@@ -716,22 +906,99 @@ class SQLiteTraceStore:
         row = self._connection.execute("SELECT COALESCE(MAX(seq), 0) AS value FROM deltas").fetchone()
         return int(row["value"])
 
-    def evidence_hash(self, *, seq_cutoff: int | None = None) -> str:
-        params: tuple[Any, ...] = () if seq_cutoff is None else (seq_cutoff,)
-        sql = "SELECT hash FROM deltas" + (" WHERE seq <= ?" if seq_cutoff is not None else "") + " ORDER BY seq"
-        hashes = [row["hash"] for row in self._connection.execute(sql, params).fetchall()]
-        return hashlib.sha256("".join(hashes).encode("ascii")).hexdigest()
+    def delta_count(self) -> int:
+        row = self._connection.execute("SELECT COUNT(*) AS value FROM deltas").fetchone()
+        return int(row["value"])
 
-    def verify(self) -> TraceVerification:
-        previous = GENESIS_HASH
-        deltas = self.list_deltas(include_retracted=True)
-        for delta in deltas:
-            if delta.prev_hash != previous:
-                return TraceVerification(valid=False, delta_count=len(deltas), broken_at_seq=delta.seq, reason="prev_hash mismatch")
-            if _delta_hash(delta) != delta.hash:
-                return TraceVerification(valid=False, delta_count=len(deltas), broken_at_seq=delta.seq, reason="delta hash mismatch")
-            previous = delta.hash
-        return TraceVerification(valid=True, delta_count=len(deltas))
+    def is_ready(self) -> bool:
+        try:
+            self._connection.execute("SELECT 1").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def validate(self, *, check_source_blobs: bool = True) -> StoreValidation:
+        """Check database structure, ordered records, references, and source bytes."""
+
+        issues: list[str] = []
+        malformed_delta_ids: list[str] = []
+        broken_evidence_refs: list[str] = []
+        missing_source_ids: list[str] = []
+        corrupted_source_ids: list[str] = []
+        source_blobs_checked = 0
+        database_ok = False
+        rows: list[sqlite3.Row] = []
+        try:
+            quick_check = [str(row[0]) for row in self._connection.execute("PRAGMA quick_check").fetchall()]
+            database_ok = quick_check == ["ok"]
+            if not database_ok:
+                issues.extend(f"SQLite: {message}" for message in quick_check)
+            rows = self._connection.execute("SELECT * FROM deltas ORDER BY seq").fetchall()
+        except sqlite3.Error as exc:
+            issues.append(f"SQLite validation failed: {exc}")
+
+        parsed: list[MemoryDelta] = []
+        sequence_contiguous = True
+        for expected_seq, row in enumerate(rows, 1):
+            delta_id = str(row["id"]) if "id" in row.keys() else f"row:{expected_seq}"
+            try:
+                if int(row["seq"]) != expected_seq:
+                    sequence_contiguous = False
+                parsed.append(self._from_row(row))
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                malformed_delta_ids.append(delta_id)
+                issues.append(f"Malformed delta {delta_id}: {exc}")
+        if not sequence_contiguous:
+            issues.append("Trace sequence numbers are not contiguous from 1")
+
+        delta_ids = {delta.id for delta in parsed}
+        for delta in parsed:
+            for evidence_id in delta.evidence_refs:
+                if evidence_id not in delta_ids:
+                    broken_evidence_refs.append(f"{delta.id}->{evidence_id}")
+        if broken_evidence_refs:
+            issues.append(f"{len(broken_evidence_refs)} evidence references point to missing deltas")
+
+        if check_source_blobs and database_ok:
+            source_rows = self._connection.execute(
+                "SELECT id,payload_json FROM sources WHERE status!='removed' ORDER BY created_at"
+            ).fetchall()
+            source_root = (self.root / "sources").resolve()
+            for row in source_rows:
+                source_id = str(row["id"])
+                try:
+                    source = SourceRecord.model_validate_json(row["payload_json"])
+                    path = (self.root / source.blob_path).resolve()
+                    if source_root not in path.parents or not path.is_file():
+                        missing_source_ids.append(source_id)
+                        continue
+                    source_blobs_checked += 1
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for block in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(block)
+                    if digest.hexdigest() != source.content_hash:
+                        corrupted_source_ids.append(source_id)
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    corrupted_source_ids.append(source_id)
+                    issues.append(f"Invalid source {source_id}: {exc}")
+            if missing_source_ids:
+                issues.append(f"{len(missing_source_ids)} retained source blobs are missing")
+            if corrupted_source_ids:
+                issues.append(f"{len(corrupted_source_ids)} retained source blobs failed SHA-256 validation")
+
+        return StoreValidation(
+            ok=database_ok and not issues,
+            database_ok=database_ok,
+            delta_count=len(rows),
+            sequence_contiguous=sequence_contiguous,
+            source_blobs_checked=source_blobs_checked,
+            missing_source_ids=missing_source_ids,
+            corrupted_source_ids=corrupted_source_ids,
+            malformed_delta_ids=malformed_delta_ids,
+            broken_evidence_refs=broken_evidence_refs,
+            issues=issues,
+        )
 
     def history(self, delta_id: str) -> list[MemoryDelta]:
         events = []
@@ -743,27 +1010,27 @@ class SQLiteTraceStore:
         return events
 
     def hard_remove(self, delta_ids: list[str], *, requested_by: str, reason: str) -> RemoveResult:
-        """Redact payloads and start a new verifiable hash-chain epoch.
-
-        The audit row retains identifiers and old/new aggregate roots, never
-        the deleted content. Normal forgetting should use a retraction instead.
-        """
+        """Redact selected payloads and record the lifecycle operation."""
 
         targets = list(dict.fromkeys(delta_ids))
         if not targets:
             raise ValueError("remove requires at least one delta id")
-        existing = {item.id for item in self.list_deltas(include_retracted=True)}
-        missing = [item for item in targets if item not in existing]
-        if missing:
-            raise KeyError(f"unknown deltas: {', '.join(missing)}")
         remove_id = _new_id("remove")
-        old_root = self.evidence_hash()
         created = datetime.now(timezone.utc)
         with self._lock:
             cursor = self._connection.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             try:
                 placeholders = ",".join("?" for _ in targets)
+                existing = {
+                    str(row["id"])
+                    for row in cursor.execute(
+                        f"SELECT id FROM deltas WHERE id IN ({placeholders})", targets
+                    ).fetchall()
+                }
+                missing = [item for item in targets if item not in existing]
+                if missing:
+                    raise KeyError(f"unknown deltas: {', '.join(missing)}")
                 cursor.execute(
                     f"""UPDATE deltas SET
                         text='[REMOVED]', observed_at=NULL, actor_json=?, episode_id=NULL,
@@ -774,25 +1041,27 @@ class SQLiteTraceStore:
                         WHERE id IN ({placeholders})""",
                     [
                         _json({"type": "external_api", "id": "remove"}), _json([]), _json({}),
-                        _json({"removed": True, "remove_id": remove_id}), _json({"removed": True}), *targets,
+                        _json({"removed": True, "remove_id": remove_id}), _json({}), *targets,
                     ],
                 )
-                previous = GENESIS_HASH
-                rows = cursor.execute("SELECT * FROM deltas ORDER BY seq").fetchall()
-                for row in rows:
-                    delta = self._from_row(row)
-                    delta.prev_hash = previous
-                    delta.hash = _delta_hash(delta)
-                    cursor.execute("UPDATE deltas SET prev_hash=?, hash=? WHERE id=?", (delta.prev_hash, delta.hash, delta.id))
-                    previous = delta.hash
-                new_hashes = [row["hash"] for row in cursor.execute("SELECT hash FROM deltas ORDER BY seq").fetchall()]
-                new_root = hashlib.sha256("".join(new_hashes).encode("ascii")).hexdigest()
                 cursor.execute(
-                    "INSERT INTO removal_audit VALUES(?,?,?,?,?,?,?)",
-                    (remove_id, _json(targets), old_root, new_root, requested_by, reason, created.isoformat()),
+                    "INSERT INTO removal_audit VALUES(?,?,?,?,?)",
+                    (remove_id, _json(targets), requested_by, reason, created.isoformat()),
                 )
                 cursor.execute("DELETE FROM embedding_cache")
                 cursor.execute("DELETE FROM recall_cache")
+                cursor.execute(
+                    f"DELETE FROM retrieval_terms WHERE delta_id IN ({placeholders})",
+                    targets,
+                )
+                cursor.execute(
+                    f"DELETE FROM retrieval_documents WHERE delta_id IN ({placeholders})",
+                    targets,
+                )
+                cursor.execute(
+                    f"DELETE FROM retrieval_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+                    [*targets, *targets],
+                )
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
@@ -802,8 +1071,6 @@ class SQLiteTraceStore:
         return RemoveResult(
             remove_id=remove_id,
             removed_delta_ids=targets,
-            old_root_hash=old_root,
-            new_root_hash=new_root,
             requested_by=requested_by,
             created_at=created,
         )
@@ -952,7 +1219,9 @@ class SQLiteTraceStore:
         )
 
     def put_episode_recall(self, view: EpisodeRecallView, recall_config_id: str = "episode-recall-v1") -> None:
-        evidence_hash = hashlib.sha256("".join(view.source_trace_ids).encode()).hexdigest()
+        evidence_hash = hashlib.sha256(
+            _json(view.source_trace_ids).encode("utf-8")
+        ).hexdigest()
         self._connection.execute(
             """INSERT INTO recall_cache(cache_key,view_type,scope_ref,evidence_hash,recall_config_id,generated_at,stale,payload_json)
                VALUES(?,?,?,?,?,?,?,?)
@@ -981,6 +1250,259 @@ class SQLiteTraceStore:
             views = [view for view in views if all(getattr(view.namespace, key) == value for key, value in requested.items())]
         return views
 
+    def _index_delta_uncommitted(self, cursor: Any, delta: MemoryDelta) -> None:
+        """Incrementally maintain disposable lexical/document/graph indexes."""
+
+        if delta.kind == "retraction":
+            targets = list(dict.fromkeys(delta.payload.get("target_delta_ids") or []))
+            if targets:
+                placeholders = ",".join("?" for _ in targets)
+                cursor.execute(
+                    f"UPDATE retrieval_documents SET active=0 WHERE delta_id IN ({placeholders})",
+                    targets,
+                )
+                cursor.execute(
+                    f"DELETE FROM retrieval_terms WHERE delta_id IN ({placeholders})",
+                    targets,
+                )
+                cursor.execute(
+                    f"DELETE FROM retrieval_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+                    [*targets, *targets],
+                )
+            return
+        if delta.kind not in {"observation", "extraction"} or not delta.text or delta.text == "[REMOVED]":
+            return
+
+        namespace_key = _json(delta.namespace.model_dump(mode="json", exclude_none=True))
+        raw_fields = delta.payload.get("retrieval_fields") or {}
+        fields = {
+            str(name): _field_text(value)
+            for name, value in raw_fields.items()
+            if _field_text(value)
+        } if isinstance(raw_fields, dict) else {}
+        modality = str(delta.payload.get("modality") or "text")
+        source_type = str(
+            delta.payload.get("source_type")
+            or (delta.scope.get("source_kind") if isinstance(delta.scope, dict) else None)
+            or modality
+        )
+        document = RetrievalDocument(
+            id=delta.id,
+            text=delta.text,
+            modality=modality,
+            source_type=source_type,
+            fields=fields,
+            metadata={
+                "source_ref": delta.source_ref,
+                "locator": delta.locator,
+                "scope": delta.scope,
+            },
+        )
+        tokens = lexical_tokens(document.index_text)
+        counts: dict[str, int] = {}
+        for token in tokens:
+            counts[token] = counts.get(token, 0) + 1
+        cursor.execute(
+            """INSERT OR REPLACE INTO retrieval_documents(
+                   delta_id,namespace_key,seq,kind,episode_id,modality,source_type,text_hash,
+                   text,index_text,fields_json,metadata_json,token_count,active,observed_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+            (
+                delta.id, namespace_key, delta.seq, delta.kind, delta.episode_id,
+                modality, source_type, hashlib.sha256(document.index_text.encode()).hexdigest(),
+                delta.text, document.index_text, _json(fields), _json(document.metadata), len(tokens),
+                delta.observed_at.isoformat() if delta.observed_at else None,
+            ),
+        )
+        cursor.execute("DELETE FROM retrieval_terms WHERE delta_id=?", (delta.id,))
+        cursor.executemany(
+            "INSERT INTO retrieval_terms(delta_id,namespace_key,term,term_frequency) VALUES(?,?,?,?)",
+            [(delta.id, namespace_key, term, frequency) for term, frequency in counts.items()],
+        )
+
+        if delta.episode_id:
+            previous = cursor.execute(
+                """SELECT delta_id FROM retrieval_documents
+                   WHERE namespace_key=? AND episode_id=? AND active=1 AND seq<?
+                   ORDER BY seq DESC LIMIT 1""",
+                (namespace_key, delta.episode_id, delta.seq),
+            ).fetchone()
+            if previous:
+                self._put_retrieval_edge_uncommitted(
+                    cursor, namespace_key, str(previous["delta_id"]), delta.id, "followed_by", 1.0
+                )
+                self._put_retrieval_edge_uncommitted(
+                    cursor, namespace_key, delta.id, str(previous["delta_id"]), "followed_by", 0.8
+                )
+        entities = {_normal_index_entity(delta.subject), _normal_index_entity(delta.object)} - {""}
+        for entity in entities:
+            rows = cursor.execute(
+                """SELECT id FROM deltas
+                   WHERE id!=? AND kind IN ('observation','extraction')
+                     AND namespace_json=?
+                     AND (lower(subject)=? OR lower(object)=?)
+                   ORDER BY seq DESC LIMIT 6""",
+                (delta.id, _json(delta.namespace), entity, entity),
+            ).fetchall()
+            for row in rows:
+                other = str(row["id"])
+                self._put_retrieval_edge_uncommitted(
+                    cursor, namespace_key, delta.id, other, "about_same_entity", 0.92
+                )
+                self._put_retrieval_edge_uncommitted(
+                    cursor, namespace_key, other, delta.id, "about_same_entity", 0.92
+                )
+
+    @staticmethod
+    def _put_retrieval_edge_uncommitted(
+        cursor: Any,
+        namespace_key: str,
+        source_id: str,
+        target_id: str,
+        edge_kind: str,
+        weight: float,
+    ) -> None:
+        if source_id == target_id:
+            return
+        cursor.execute(
+            """INSERT OR REPLACE INTO retrieval_graph_edges(
+                   namespace_key,source_id,target_id,edge_kind,weight
+               ) VALUES(?,?,?,?,?)""",
+            (namespace_key, source_id, target_id, edge_kind, weight),
+        )
+
+    def put_retrieval_edges(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+        edges: Iterable[tuple[str, str, str, float]],
+    ) -> None:
+        namespace_model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+        namespace_key = _json(namespace_model.model_dump(mode="json", exclude_none=True))
+        with self._lock:
+            cursor = self._connection.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                for source_id, target_id, edge_kind, weight in edges:
+                    self._put_retrieval_edge_uncommitted(
+                        cursor, namespace_key, source_id, target_id, edge_kind, weight
+                    )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def retrieval_graph(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+        *,
+        item_ids: Iterable[str] | None = None,
+    ) -> dict[str, list[tuple[str, float, str]]]:
+        namespace_model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+        namespace_key = _json(namespace_model.model_dump(mode="json", exclude_none=True))
+        params: list[Any] = [namespace_key]
+        sql = """SELECT e.source_id,e.target_id,e.edge_kind,e.weight
+                 FROM retrieval_graph_edges e
+                 JOIN retrieval_documents s ON s.delta_id=e.source_id AND s.active=1
+                 JOIN retrieval_documents t ON t.delta_id=e.target_id AND t.active=1
+                 WHERE e.namespace_key=?"""
+        selected = list(item_ids or [])
+        if selected:
+            placeholders = ",".join("?" for _ in selected)
+            sql += f" AND e.source_id IN ({placeholders}) AND e.target_id IN ({placeholders})"
+            params.extend(selected)
+            params.extend(selected)
+        adjacency: dict[str, list[tuple[str, float, str]]] = {}
+        for row in self._connection.execute(sql, params).fetchall():
+            adjacency.setdefault(str(row["source_id"]), []).append(
+                (str(row["target_id"]), float(row["weight"]), str(row["edge_kind"]))
+            )
+        return adjacency
+
+    def retrieval_index_statistics(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+    ) -> tuple[Counter[str], float, int]:
+        namespace_model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+        namespace_key = _json(namespace_model.model_dump(mode="json", exclude_none=True))
+        row = self._connection.execute(
+            """SELECT COUNT(*) AS n,COALESCE(AVG(token_count),0) AS avgdl
+               FROM retrieval_documents WHERE namespace_key=? AND active=1""",
+            (namespace_key,),
+        ).fetchone()
+        terms = self._connection.execute(
+            """SELECT t.term,COUNT(*) AS df FROM retrieval_terms t
+               JOIN retrieval_documents d ON d.delta_id=t.delta_id AND d.active=1
+               WHERE t.namespace_key=? GROUP BY t.term""",
+            (namespace_key,),
+        ).fetchall()
+        return Counter({str(item["term"]): int(item["df"]) for item in terms}), float(row["avgdl"]), int(row["n"])
+
+    def lexical_candidates(
+        self,
+        query: str,
+        namespace: MemoryNamespace | dict[str, Any],
+        *,
+        limit: int = 500,
+        k1: float = 1.5,
+        b: float = 0.75,
+    ) -> list[tuple[str, float]]:
+        """Read BM25 candidates from the incremental postings index."""
+
+        terms = list(dict.fromkeys(lexical_tokens(query)))
+        if not terms:
+            return []
+        namespace_model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+        namespace_key = _json(namespace_model.model_dump(mode="json", exclude_none=True))
+        df, avgdl, document_count = self.retrieval_index_statistics(namespace_model)
+        placeholders = ",".join("?" for _ in terms)
+        rows = self._connection.execute(
+            f"""SELECT t.delta_id,t.term,t.term_frequency,d.token_count
+                 FROM retrieval_terms t
+                 JOIN retrieval_documents d ON d.delta_id=t.delta_id AND d.active=1
+                 WHERE t.namespace_key=? AND t.term IN ({placeholders})""",
+            [namespace_key, *terms],
+        ).fetchall()
+        scores: dict[str, float] = {}
+        for row in rows:
+            term = str(row["term"])
+            frequency = int(row["term_frequency"])
+            length = int(row["token_count"])
+            score = bm25_term_score(
+                term_frequency=frequency,
+                document_length=length,
+                average_document_length=avgdl,
+                document_count=document_count,
+                document_frequency=df.get(term, 0),
+                k1=k1,
+                b=b,
+            )
+            identifier = str(row["delta_id"])
+            scores[identifier] = scores.get(identifier, 0.0) + score
+        return sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]
+
+    def retrieval_documents(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+    ) -> list[RetrievalDocument]:
+        namespace_model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+        namespace_key = _json(namespace_model.model_dump(mode="json", exclude_none=True))
+        rows = self._connection.execute(
+            """SELECT delta_id,text,index_text,modality,source_type,fields_json,metadata_json
+               FROM retrieval_documents WHERE namespace_key=? AND active=1 ORDER BY seq""",
+            (namespace_key,),
+        ).fetchall()
+        return [
+            RetrievalDocument(
+                id=str(row["delta_id"]),
+                text=str(row["text"]),
+                modality=str(row["modality"]),
+                source_type=str(row["source_type"]),
+                fields=json.loads(row["fields_json"]),
+                metadata=json.loads(row["metadata_json"]),
+            )
+            for row in rows
+        ]
+
     def get_embeddings(self, text_hashes: list[str], model: str) -> dict[str, list[float]]:
         if not text_hashes:
             return {}
@@ -998,6 +1520,13 @@ class SQLiteTraceStore:
             [(key, model, _json(vector), now) for key, vector in values.items()],
         )
         self._connection.commit()
+
+    def list_embeddings(self, model: str) -> dict[str, list[float]]:
+        rows = self._connection.execute(
+            "SELECT text_hash,vector_json FROM embedding_cache WHERE model=?",
+            (model,),
+        ).fetchall()
+        return {str(row["text_hash"]): json.loads(row["vector_json"]) for row in rows}
 
     def clear_embeddings(self) -> None:
         self._connection.execute("DELETE FROM embedding_cache")
@@ -1131,10 +1660,10 @@ class SQLiteTraceStore:
 
     def create_snapshot(self, label: str | None = None) -> RecallSnapshot:
         cutoff = self.max_seq()
-        snapshot = RecallSnapshot(id=_new_id("snap"), label=label, seq_cutoff=cutoff, evidence_hash=self.evidence_hash(seq_cutoff=cutoff))
+        snapshot = RecallSnapshot(id=_new_id("snap"), label=label, seq_cutoff=cutoff)
         self._connection.execute(
-            "INSERT INTO snapshots VALUES(?,?,?,?,?,0)",
-            (snapshot.id, snapshot.label, snapshot.seq_cutoff, snapshot.evidence_hash, snapshot.created_at.isoformat()),
+            "INSERT INTO snapshots VALUES(?,?,?,?,0)",
+            (snapshot.id, snapshot.label, snapshot.seq_cutoff, snapshot.created_at.isoformat()),
         )
         self._connection.commit()
         return snapshot
@@ -1142,7 +1671,7 @@ class SQLiteTraceStore:
     def list_snapshots(self) -> list[RecallSnapshot]:
         return [
             RecallSnapshot(
-                id=row["id"], label=row["label"], seq_cutoff=row["seq_cutoff"], evidence_hash=row["evidence_hash"],
+                id=row["id"], label=row["label"], seq_cutoff=row["seq_cutoff"],
                 created_at=_parse_datetime(row["created_at"]), active=bool(row["active"]),
             )
             for row in self._connection.execute("SELECT * FROM snapshots ORDER BY created_at").fetchall()
@@ -1174,7 +1703,7 @@ class SQLiteTraceStore:
         if not row:
             raise KeyError(f"unknown snapshot: {snapshot_id}")
         return RecallSnapshot(
-            id=row["id"], label=row["label"], seq_cutoff=row["seq_cutoff"], evidence_hash=row["evidence_hash"],
+            id=row["id"], label=row["label"], seq_cutoff=row["seq_cutoff"],
             created_at=_parse_datetime(row["created_at"]), active=bool(row["active"]),
         )
 

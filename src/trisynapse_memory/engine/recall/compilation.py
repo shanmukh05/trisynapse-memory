@@ -110,7 +110,9 @@ def build_episode_recall_views(
         else:
             concept, summary, alt_phrasings = _deterministic_episode_summary(episode_id, ordered)
         source_ids = [item.id for item in ordered]
-        evidence_hash = hashlib.sha256("".join(item.hash for item in ordered).encode()).hexdigest()
+        evidence_hash = hashlib.sha256(
+            json.dumps([item.id for item in ordered], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         cache_key = hashlib.sha256(f"episode|{episode_id}|{evidence_hash}|v{build_version}".encode()).hexdigest()
         observed = next((item.observed_at for item in ordered if item.observed_at), None)
         views.append(
@@ -150,17 +152,6 @@ def _deterministic_episode_summary(episode_id: str, deltas: list[MemoryDelta]) -
     concept = " ".join(terms) if terms else episode_id
     alt = [f"What happened in {episode_id}?", f"Recall {' '.join(terms[:3])}" if terms else f"Find {episode_id}"]
     return concept, summary, alt
-
-
-def parse_json_response(text: str) -> dict[str, Any]:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    value = json.loads(cleaned)
-    if not isinstance(value, dict):
-        raise ValueError("completion returned JSON that is not an object")
-    return value
 
 
 def _normal(value: str) -> str:

@@ -10,12 +10,12 @@ python scripts/version.py check
 ruff check src tests scripts
 pytest -q
 pnpm install --frozen-lockfile
-pnpm --filter @trisynapse/memory check
+pnpm --filter @trisynapse/trisynapse-memory check
 ```
 
 Preserve these invariants:
 
-- Trace evidence is append-only except for an explicit hard purge.
+- Trace evidence uses ordered lifecycle events; explicit physical removal redacts only requested records.
 - Episode Recall may route retrieval but must never enter answer context.
 - Embedding failures are explicit; never introduce substitute vectors.
 - Every read and write honors its namespace.

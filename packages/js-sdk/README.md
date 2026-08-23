@@ -1,9 +1,9 @@
-# `@trisynapse/memory`
+# `@trisynapse/trisynapse-memory`
 
 Typed, dependency-free client for a local or remote Trisynapse Memory server.
 
 ```ts
-import { TrisynapseMemory } from "@trisynapse/memory";
+import { TrisynapseMemory } from "@trisynapse/trisynapse-memory";
 
 const memory = new TrisynapseMemory({
   apiKey: process.env.TRISYNAPSE_API_KEY,

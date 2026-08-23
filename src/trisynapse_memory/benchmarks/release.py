@@ -10,11 +10,11 @@ from trisynapse_memory.benchmarks.evaluation import BENCHMARK_ARTIFACT_SCHEMA_VE
 
 
 RELEASE_REQUIREMENTS = {
-    "locomo": {"questions": 100, "evidence_recall_at_k": 0.25, "mean_token_f1": 0.20},
-    "longmemeval": {"questions": 25, "evidence_recall_at_k": 0.80, "mean_token_f1": 0.20},
+    "locomo": {"questions": 100, "evidence_recall_at_k": 0.55},
+    "longmemeval": {"questions": 25, "evidence_recall_at_k": 0.80},
 }
 END_TO_END_REQUIREMENTS = {
-    suite: {**requirements, "judge_accuracy": 0.50}
+    suite: {**requirements, "mean_token_f1": 0.20, "judge_accuracy": 0.50}
     for suite, requirements in RELEASE_REQUIREMENTS.items()
 }
 
@@ -64,10 +64,10 @@ def evaluate_release_gate(
             }
             for key, minimum in requirements.items()
         }
-        trace_valid = bool((payload.get("trace_verification") or {}).get("valid"))
+        storage_ok = bool((payload.get("store_validation") or {}).get("ok"))
         suite_passed = bool(
             production_artifact and schema_current and provenance_present and workflow_provenance_valid and engine_version
-            and trace_valid and all(item["passed"] for item in checks.values())
+            and storage_ok and all(item["passed"] for item in checks.values())
         )
         suites[suite] = {
             "passed": suite_passed,
@@ -78,7 +78,7 @@ def evaluate_release_gate(
             "workflow_provenance_valid": workflow_provenance_valid,
             "mode": mode,
             "engine_version": engine_version,
-            "trace_valid": trace_valid,
+            "storage_ok": storage_ok,
             "checks": checks,
         }
         passed = passed and suite_passed

@@ -29,7 +29,7 @@ export class StudioApi {
     return response.json() as Promise<T>;
   }
 
-  health() { return this.request<{ status: string; version: string; trace_valid: boolean; pending_jobs: number }>("/api/v1/health"); }
+  health() { return this.request<{ status: string; version: string; storage_ready: boolean; pending_jobs: number }>("/api/v1/health"); }
   session() { return this.request<{ role: string; effective_namespace: Namespace; capabilities: Record<string, boolean> }>("/api/v1/session"); }
 
   listSources(filters: { q?: string; kind?: string; status?: string; sort?: string; cursor?: number } = {}) {

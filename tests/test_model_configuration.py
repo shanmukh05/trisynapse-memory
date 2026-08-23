@@ -17,7 +17,11 @@ from trisynapse_memory.engine import (
     ProviderSelection,
 )
 from trisynapse_memory.engine import memory as memory_module
-from trisynapse_memory.engine.providers import (
+from trisynapse_memory.engine.providers.embedding import (
+    _configure_tqdm_thread_lock,
+    normalize_sentence_transformer_model,
+)
+from trisynapse_memory.engine.providers.registry import (
     AnthropicCompletion,
     ProviderSettings,
     completion_from_settings,
@@ -25,7 +29,7 @@ from trisynapse_memory.engine.providers import (
     fetch_model_catalog,
     list_provider_descriptors,
 )
-from trisynapse_memory.engine import providers as provider_module
+from trisynapse_memory.engine.providers import registry as provider_module
 
 
 class DeterministicEmbedder:
@@ -47,6 +51,15 @@ class ReplacementEmbedder(DeterministicEmbedder):
     model_name = "replacement-v1"
     cache_key = "deepinfra:replacement-v1"
     provider_name = "deepinfra"
+
+
+def test_local_embedding_is_safe_inside_terminal_event_loops() -> None:
+    from tqdm import tqdm
+
+    _configure_tqdm_thread_lock()
+
+    assert normalize_sentence_transformer_model("all-MinilM-L6-v2") == "all-MiniLM-L6-v2"
+    assert type(tqdm.get_lock()).__module__ == "_thread"
 
 
 def test_provider_matrix_and_direct_provider_endpoints(monkeypatch) -> None:

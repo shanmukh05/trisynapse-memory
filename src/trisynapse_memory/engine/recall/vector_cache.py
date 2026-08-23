@@ -9,12 +9,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
-from trisynapse_memory.engine.trace import SQLiteTraceStore
+import numpy as np
+
+from trisynapse_memory.engine.utils import cosine_scores
+from trisynapse_memory.engine.trace.store import SQLiteTraceStore
 
 
 class VectorCache(Protocol):
     def get(self, text_hashes: list[str], model: str) -> dict[str, list[float]]: ...
     def put(self, values: dict[str, list[float]], model: str) -> None: ...
+    def nearest(self, vector: list[float], model: str, limit: int) -> list[tuple[str, float]]: ...
     def clear(self) -> None: ...
 
 
@@ -32,6 +36,25 @@ class SQLiteVectorCache:
 
     def clear(self) -> None:
         self.store.clear_embeddings()
+
+    def nearest(self, vector: list[float], model: str, limit: int) -> list[tuple[str, float]]:
+        values = self.store.list_embeddings(model)
+        compatible = [
+            (text_hash, embedding)
+            for text_hash, embedding in values.items()
+            if len(embedding) == len(vector)
+        ]
+        if not compatible or not vector or limit <= 0:
+            return []
+        scores = cosine_scores(vector, [embedding for _, embedding in compatible])
+        count = min(limit, len(compatible))
+        candidate_indices = (
+            np.arange(len(compatible))
+            if count == len(compatible)
+            else np.argpartition(-scores, count - 1)[:count]
+        )
+        ordered = sorted(candidate_indices, key=lambda index: float(scores[index]), reverse=True)
+        return [(compatible[index][0], float(scores[index])) for index in ordered]
 
 
 class LanceVectorCache:
@@ -73,6 +96,22 @@ class LanceVectorCache:
     def clear(self) -> None:
         for table_name in self._table_names():
             self._db.drop_table(table_name)
+
+    def nearest(self, vector: list[float], model: str, limit: int) -> list[tuple[str, float]]:
+        table_name = _table_name(model)
+        if table_name not in self._table_names() or not vector:
+            return []
+        rows = (
+            self._db.open_table(table_name)
+            .search(vector)
+            .distance_type("cosine")
+            .limit(limit)
+            .to_list()
+        )
+        return [
+            (str(row["text_hash"]), 1.0 - float(row.get("_distance", 1.0)))
+            for row in rows
+        ]
 
     def _table_names(self) -> set[str]:
         response = self._db.list_tables()

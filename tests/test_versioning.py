@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from importlib.metadata import version as package_version
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,39 @@ from trisynapse_memory import MemoryEngine, __version__
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_typescript_sdk_uses_trisynapse_npm_scope() -> None:
+    package = json.loads(
+        (ROOT / "packages/js-sdk/package.json").read_text(encoding="utf-8")
+    )
+    workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+
+    assert package["name"] == "@trisynapse/trisynapse-memory"
+    assert 'package="@trisynapse/trisynapse-memory@${version}"' in workflow
+    assert 'from "@trisynapse/trisynapse-memory"' in workflow
+
+
+@pytest.mark.parametrize(
+    ("canonical", "expected"),
+    [
+        ("0.2.0", "0.2.0"),
+        ("0.2.0a1", "0.2.0-alpha.1"),
+        ("0.2.0b2", "0.2.0-beta.2"),
+        ("0.2.0rc3", "0.2.0-rc.3"),
+    ],
+)
+def test_npm_version_is_valid_semver(canonical: str, expected: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "scripts/version.py", "npm", canonical],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
 
 
 def test_all_version_surfaces_match_package_metadata() -> None:

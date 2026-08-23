@@ -62,6 +62,17 @@ class RecordingCompletion:
         raise AssertionError(f"unexpected prompt: {system[:80]}")
 
 
+class AbstainingCompletion(RecordingCompletion):
+    def __call__(self, system: str, user: str) -> dict:
+        if system.startswith(load_prompt("answer").text):
+            self.prompt_names.append("answer")
+            return {"answer": "", "abstain": True}
+        if system == load_prompt("benchmark_judge").text:
+            self.prompt_names.append("benchmark_judge")
+            return {"correct": False, "score": 0.0, "reason": "No answer."}
+        return super().__call__(system, user)
+
+
 def _locomo_fixture(path) -> None:
     path.write_text(json.dumps([{
         "sample_id": "sample-1",
@@ -83,7 +94,12 @@ def test_packaged_prompts_are_versioned_and_hashed() -> None:
     provenance = prompt_provenance(names)
 
     assert [item["name"] for item in provenance] == names
-    assert all(item["version"].endswith("-v1") for item in provenance)
+    assert [item["version"] for item in provenance] == [
+        "extraction-v2",
+        "episode-recall-v1",
+        "answer-v2",
+        "benchmark-judge-v1",
+    ]
     assert all(len(item["sha256"]) == 64 for item in provenance)
     with pytest.raises(KeyError, match="unknown production prompt"):
         load_prompt("removed-snapshot-prompt")
@@ -131,7 +147,7 @@ def test_benchmark_modes_record_provider_and_prompt_provenance(tmp_path, monkeyp
     )
     artifact = json.loads((output / f"trace_recall_locomo_{result['run_id']}.json").read_text(encoding="utf-8"))
 
-    assert artifact["artifact_schema_version"] == 2
+    assert artifact["artifact_schema_version"] == 4
     assert artifact["mode"] == mode
     assert artifact["providers"]["embedding"]["provider"] == "test"
     if mode == "retrieval":
@@ -154,16 +170,82 @@ def test_end_to_end_mode_requires_completion_configuration(tmp_path, monkeypatch
         benchmark_runner._open_benchmark_engine(tmp_path, "end-to-end")
 
 
+def test_retrieval_recall_is_not_erased_when_answer_abstains(tmp_path, monkeypatch) -> None:
+    dataset = tmp_path / "locomo.json"
+    _locomo_fixture(dataset)
+    completion = AbstainingCompletion()
+
+    def open_test_engine(store_path, requested_mode):
+        return MemoryEngine.open(
+            store_path,
+            embedder=DeterministicEmbedder(),
+            completion=completion,
+            auto_process=False,
+        )
+
+    monkeypatch.setattr(benchmark_runner, "_open_benchmark_engine", open_test_engine)
+    result = benchmark_runner.run_benchmark(
+        "locomo",
+        dataset,
+        max_questions=1,
+        output_root=tmp_path / "runs",
+        mode="end-to-end",
+    )
+    artifact = json.loads(
+        (tmp_path / "runs" / f"trace_recall_locomo_{result['run_id']}.json").read_text()
+    )
+    row = artifact["results"][0]
+
+    assert row["abstain"] is True
+    assert row["cited_ids"] == []
+    assert row["evidence_hit_at_k"] is True
+    assert row["evidence_recall_at_k"] == 1.0
+
+
+def test_benchmark_can_use_an_independent_judge(tmp_path, monkeypatch) -> None:
+    dataset = tmp_path / "locomo.json"
+    _locomo_fixture(dataset)
+    completion = RecordingCompletion()
+    judge = RecordingCompletion()
+    judge.model = "independent-judge-v1"
+
+    def open_test_engine(store_path, requested_mode):
+        return MemoryEngine.open(
+            store_path,
+            embedder=DeterministicEmbedder(),
+            completion=completion,
+            auto_process=False,
+        )
+
+    monkeypatch.setattr(benchmark_runner, "_open_benchmark_engine", open_test_engine)
+    result = benchmark_runner.run_benchmark(
+        "locomo",
+        dataset,
+        max_questions=1,
+        output_root=tmp_path / "runs",
+        mode="end-to-end",
+        judge_completion=judge,
+    )
+    artifact = json.loads(
+        (tmp_path / "runs" / f"trace_recall_locomo_{result['run_id']}.json").read_text()
+    )
+
+    assert artifact["providers"]["completion"]["model"] == completion.model
+    assert artifact["providers"]["judge"]["model"] == "independent-judge-v1"
+    assert "benchmark_judge" not in completion.prompt_names
+    assert judge.prompt_names == ["benchmark_judge"]
+
+
 def test_release_gate_does_not_mix_benchmark_modes(tmp_path) -> None:
-    for suite, questions, recall in [("locomo", 100, 0.25), ("longmemeval", 25, 0.80)]:
+    for suite, questions, recall in [("locomo", 100, 0.55), ("longmemeval", 25, 0.80)]:
         runs = tmp_path / suite / "runs"
         runs.mkdir(parents=True)
         common = {
             "benchmark": suite,
-            "artifact_schema_version": 2,
+            "artifact_schema_version": 4,
             "engine_version": "0.3.0",
             "architecture": "trace-and-recall-production",
-            "trace_verification": {"valid": True},
+            "store_validation": {"ok": True},
             "results": [],
         }
         retrieval = {

@@ -1,7 +1,16 @@
 {
-  "name": "@trisynapse/memory",
-  "version": "0.1.1",
+  "name": "@trisynapse/trisynapse-memory",
+  "version": "0.1.2",
   "description": "Typed client for the Trisynapse Trace & Recall API",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shanmukh05/trisynapse-memory.git",
+    "directory": "packages/js-sdk"
+  },
+  "homepage": "https://github.com/shanmukh05/trisynapse-memory#readme",
+  "bugs": {
+    "url": "https://github.com/shanmukh05/trisynapse-memory/issues"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -24,6 +33,10 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
   },
   "license": "Apache-2.0"
 }

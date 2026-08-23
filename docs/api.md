@@ -48,13 +48,13 @@ run = memory.ingest_many([
     SourceInput(kind="directory", path="./src", source_key="service-repo"),
     SourceInput(kind="url", url="https://example.com/handbook"),
     SourceInput(kind="git", url="https://github.com/org/public-repo.git", ref="main"),
-])
+], on_progress=lambda stage: print(stage))
 
 for result in run.results:
     print(result.index, result.status, result.source_id, result.error)
 ```
 
-`ingest_many()` preprocesses at most four sources concurrently and commits valid sources in input order. The run status is `completed`, `partial`, or `failed`.
+`ingest_many()` preprocesses at most four sources concurrently and commits valid sources in input order. The optional `on_progress` callback reports durable-run creation, preprocessing, Trace writes, and finalization. The run status is `completed`, `partial`, or `failed`.
 
 ```python
 memory.list_sources()
@@ -74,13 +74,82 @@ search = memory.search("How should the update look?", top_k=8)
 for hit in search.hits:
     print(hit.score, hit.text, hit.locator)
 
-answer = memory.query("How should I send the update?")
+answer = memory.query(
+    "How should I send the update?",
+    on_step=lambda step: print(step.phase, step.label, step.duration_ms),
+)
 print(answer.answer, answer.abstain)
+for hit in answer.retrieval_hits:  # populated even if answer.abstain is true
+    print(hit.score, hit.locator, hit.metadata["modality"], hit.metadata["retrieval_fields"])
 for citation in answer.citations:
     print(citation.delta_id, citation.source_ref, citation.locator)
 ```
 
-`search()` returns ranked evidence for application logic. `query()` returns an answer or abstention with citations. `retrieval_trace` explains routing and grounding.
+`search()` returns ranked evidence for application logic. `query()` returns an answer or abstention with citations and `retrieval_hits`. Retrieval hits are captured before answer generation and remain present after an abstention; citations are only the evidence attached to a completed answer. Both methods accept `on_step`, which receives each durable input, classification, retrieval, confidence, refinement, Deep Recall, grounding, answer, and audit step as it completes. `retrieval_trace` explains routing and grounding.
+
+Content, query text, metadata, locators, and retrieval fields are accepted as supplied. Sanitize sensitive values in the application before calling Python, REST, or TypeScript ingestion and query methods.
+
+For an already-normalized observation, Python and REST also accept `modality`, `source_type`, and `retrieval_fields`. The TypeScript `add()` options are `modality`, `sourceType`, and `retrievalFields`. Prefer `ingest()` for files because it derives these values and locators safely.
+
+The production retriever has a replaceable planner and route registry:
+
+```python
+from trisynapse_memory import MemoryEngine, QueryPlan, RouteRegistry
+
+class ProductPlanner:
+    def plan(self, query, **options):
+        return QueryPlan(
+            query=query,
+            query_kind="fact",
+            terms=tuple(query.casefold().split()),
+            modalities=("code",),
+            routes=("bm25", "semantic", "code"),
+            profile="code",
+        )
+
+memory = MemoryEngine.open("./memory", query_planner=ProductPlanner())
+```
+
+Implement `RetrievalRoute.name` and `rank(plan, context)`, then add the instance to a `RouteRegistry`. Pass the registry as `retrieval_routes=`. Custom routes return `(item_id, score)` pairs and still go through fusion, confidence checks, Trace grounding, and context limits.
+
+Applications with a model-specific local tokenizer can also supply context accounting:
+
+```python
+class ModelTokenCounter:
+    name = "my-model-tokenizer-v1"
+    exact = True
+
+    def count(self, text: str) -> int:
+        return len(my_tokenizer.encode(text))
+
+memory = MemoryEngine.open("./memory", token_counter=ModelTokenCounter())
+```
+
+The built-in `token_counter_for()` prefers a completion provider's local `count_tokens()` method, then Tiktoken for recognized OpenAI models, then `ApproximateTokenCounter`. Grounding steps and search-hit metadata expose the counter name; grounding also records its `exact` flag and selected context token count.
+
+### Benchmark runs
+
+`POST /api/v1/benchmarks/runs` accepts `benchmark`, `mode`, `limit`, `sampling`, and an optional non-secret `judge` provider selection. For a partial LoCoMo run, `sampling: "auto"` uses deterministic stratification across conversations and question categories. Use `sequential` only to reproduce an older prefix-based run.
+
+Schema-v4 artifacts retain bounded pre-answer hits, query steps, and the final store-validation result. The important metrics are:
+
+- `evidence_hit_at_k`: fraction of questions retrieving at least one gold evidence ID;
+- `evidence_recall_at_k`: mean fraction of all gold evidence IDs retrieved;
+- `all_evidence_retrieved_rate`: questions for which every gold evidence ID was retrieved;
+- `citation_evidence_recall` and `citation_precision`: answer citation quality, measured separately;
+- `abstention_rate`: answer-generation behavior, not a retrieval miss.
+
+API keys remain environment-only. An independent judge can be selected without changing the store completion model:
+
+```json
+{
+  "benchmark": "locomo",
+  "mode": "end-to-end",
+  "limit": 100,
+  "sampling": "stratified",
+  "judge": {"provider": "anthropic", "model": "claude-sonnet-4-5"}
+}
+```
 
 ### Lifecycle
 
@@ -100,7 +169,9 @@ memory.remove(
 )
 ```
 
-`correct()` and `forget()` append events. `remove()` physically redacts selected deltas and returns `RemoveResult` with `remove_id`, `removed_delta_ids`, and old/new root hashes. There is no `purge()` alias.
+`correct()` and `forget()` append events. `remove()` physically redacts selected deltas and returns `RemoveResult` with `remove_id` and `removed_delta_ids`. There is no `purge()` alias.
+
+Use `memory.validate_store()` for operational validation. It returns `StoreValidation` with SQLite status, delta count, sequence continuity, malformed or broken evidence references, and missing or corrupted retained-source IDs. This is a consistency and corruption check, not proof against an administrator who can rewrite the database.
 
 ### Model configuration
 
@@ -149,7 +220,7 @@ Use `Authorization: Bearer TOKEN` except for health. The OpenAPI document is at 
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/api/v1/health` | Version, Trace validity, pending jobs |
+| `GET` | `/api/v1/health` | Version, store readiness, pending jobs |
 | `POST` | `/api/v1/memory/observations` | Add one observation |
 | `POST` | `/api/v1/memory/messages` | Add a conversation episode |
 | `POST` | `/api/v1/memories/batch` | Add normalized observations |
@@ -182,9 +253,31 @@ These store-wide routes require the administrator bearer token when authenticati
 | `GET/PUT` | `/api/v1/retrieval-configuration` | Revisioned retrieval and abstention defaults |
 | `GET` | `/api/v1/session` | Authenticated role, effective namespace, and safe capabilities |
 | `GET` | `/api/v1/check` | Installation, store, provider, and pending-work checks |
-| `GET` | `/api/v1/health` | Lightweight liveness and Trace readiness |
+| `GET` | `/api/v1/health` | Lightweight liveness and store readiness |
 
 `PUT` returns `200` for an immediate change, `202` plus `job_id` for an embedding rebuild, and `409` when confirmation or a fresh revision is required. API keys are never accepted or returned.
+
+Retrieval configuration includes `retrieval_profile`, `enabled_routes`, `route_weights`, `max_context_tokens`, and `per_source_context_tokens`, in addition to result count, graph depth, refinement, confidence, Deep Recall, and abstention settings. For example:
+
+```json
+{
+  "default_top_k": 12,
+  "max_context_items": 24,
+  "max_context_tokens": 6000,
+  "per_source_context_tokens": 2000,
+  "retrieval_profile": "auto",
+  "enabled_routes": ["bm25", "semantic", "temporal", "graph", "code", "table", "image", "document", "conversation"],
+  "route_weights": {"code": 1.4},
+  "max_refinement_rounds": 2,
+  "graph_hops": 2,
+  "confidence_margin": 0.018,
+  "deep_recall_enabled": true,
+  "answer_abstain_threshold": 0.1,
+  "revision": 0
+}
+```
+
+Model selection uses a separate request body (the REST wrapper also accepts the rebuild confirmation flag):
 
 ```json
 {
@@ -247,10 +340,10 @@ Python exposes `get/list/remove_query_runs()`, `create/execute_query_run()`, `ge
 
 ## TypeScript
 
-`@trisynapse/memory` is a typed Fetch client for the REST API.
+`@trisynapse/trisynapse-memory` is a typed Fetch client for the REST API.
 
 ```ts
-import { TrisynapseMemory } from "@trisynapse/memory";
+import { TrisynapseMemory } from "@trisynapse/trisynapse-memory";
 
 const memory = new TrisynapseMemory({
   baseUrl: "http://127.0.0.1:8765",

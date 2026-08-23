@@ -2,18 +2,24 @@
 
 This runbook takes Trisynapse Memory from a finished source tree to a tested GitHub release, verified installers, and a production service. It is intentionally operational: follow it in order for every release.
 
-The examples use `0.1.0` as the next version. Replace it with the version being released. Versions in files do **not** include the leading `v`; Git tags do.
+Shell examples use `RELEASE_VERSION=0.2.0` as a placeholder. Set it to the version being released before running a section. Versions in files do **not** include the leading `v`; Git tags do.
+
+```bash
+RELEASE_VERSION=0.2.0
+```
 
 ## 1. Know what the release produces
 
-Pushing a tag such as `v0.1.0` starts [`.github/workflows/release.yml`](../.github/workflows/release.yml). The workflow:
+Pushing a tag such as `v0.2.0` starts [`.github/workflows/release.yml`](../../.github/workflows/release.yml). A tag points to an existing commit; it does not create a branch. The workflow:
 
 1. tests Python 3.11 and 3.12 on Linux, macOS, and Windows;
-2. checks the TypeScript client and checks, tests, and builds Studio;
-3. builds the Python wheel and source distribution;
-4. publishes `trisynapse-memory` to PyPI using trusted publishing;
-5. creates a GitHub Release and uploads the distributions, installers, release metadata, and checksums;
-6. installs the published PyPI version on Linux, macOS, and Windows and runs `check`.
+2. checks the TypeScript client and checks, unit-tests, and builds Studio;
+3. builds and publishes `@trisynapse/trisynapse-memory` to npm using trusted publishing;
+4. installs the published npm version and imports its public client;
+5. builds the Python wheel and source distribution;
+6. publishes `trisynapse-memory` to PyPI using trusted publishing;
+7. creates a GitHub Release and uploads the distributions, installers, release metadata, and checksums;
+8. installs the published PyPI version on Linux, macOS, and Windows and runs `check`.
 
 The expected GitHub Release assets are:
 
@@ -28,7 +34,7 @@ SHA256SUMS
 
 The installers are small wrappers around `uv tool install`. They do not contain Python, models, or the application itself. The version must already exist on PyPI before an installer can install it.
 
-The TypeScript package is currently checked and built as part of the repository, but the workflow does **not** publish `@trisynapse/memory` to npm. Treat npm publication as a separate future release surface.
+The Python and TypeScript versions are synchronized by `scripts/version.py`. A tag is considered successful only when both registries publish the same version and their smoke tests pass.
 
 ## 2. Production gates
 
@@ -37,20 +43,21 @@ Do not push a release tag until every required gate below passes.
 | Gate | Required result |
 |---|---|
 | Version consistency | Tag, Python package, engine, Studio, TypeScript, installers, and README agree |
-| Offline tests | Ruff, 62+ Python tests, TypeScript check, Studio unit tests, and Studio browser tests pass |
+| Offline tests | Ruff, the complete Python suite, TypeScript check, Studio unit tests, and Studio browser tests pass locally |
 | Production build | Studio is rebuilt before the wheel; wheel contains hashed Studio assets and the logo |
-| Trace | `trisynapse-memory verify` reports a valid Trace |
+| npm package | Packed SDK contains only the compiled client, declarations, package metadata, and README |
+| Store validation | `trisynapse-memory validate` reports a consistent store and all retained source blobs are present |
 | Retrieval benchmark | Current-schema LoCoMo and LongMemEval production artifacts pass `bench gate --mode retrieval` |
 | Live provider smoke | Every provider/model intended for the deployment has an explicit successful connection test |
 | Installer smoke | Published installer works in clean Linux, macOS, and Windows environments |
-| Restore drill | A backup restores into an empty directory and the restored Trace verifies |
+| Restore drill | A backup restores into an empty directory and the restored store validates |
 | Security | No `.env`, provider key, API token, store, benchmark cache, or private source is committed or included in an image |
 
 At the time this runbook was added, `bench gate --mode retrieval --data-root data` reports that no current production retrieval artifacts exist. Generate and pass those artifacts before calling a build production-ready. The tag workflow does not run the benchmark gate automatically.
 
 End-to-end benchmarks are recommended before a public release that changes extraction, synthesis, prompts, provider transports, or answer generation. They make billable model calls and must be kept separate from retrieval-only artifacts.
 
-## 3. One-time GitHub and PyPI setup
+## 3. One-time GitHub, PyPI, and npm setup
 
 ### GitHub repository
 
@@ -67,7 +74,8 @@ In GitHub repository settings:
 3. Disable force pushes and branch deletion for `main`.
 4. Require pull requests for changes to release workflows and installers.
 5. Create an Actions environment named exactly `pypi`.
-6. Add required reviewers to the `pypi` environment if releases should need manual approval.
+6. Create an Actions environment named exactly `npm`.
+7. Add required reviewers to the registry environments if releases should need manual approval.
 
 The release workflow already requests `contents: write` and `id-token: write`. It does not need a long-lived PyPI API token.
 
@@ -85,6 +93,73 @@ On PyPI, create or configure the `trisynapse-memory` project and add a trusted p
 
 For the first publication, use PyPI's pending trusted publisher if the project does not exist yet. Confirm that the GitHub repository is public or otherwise meets PyPI's trusted-publishing requirements.
 
+### npm package and trusted publisher
+
+The public SDK package is the scoped package `@trisynapse/trisynapse-memory`. The scope marker is part of its name; `trisynapse-memory`, `trisynapse/trisynapse-memory`, and `@trisynapse/memory` are different package specifications.
+
+The canonical package already exists. Verify the currently published baseline before configuring automation:
+
+```bash
+npm view '@trisynapse/trisynapse-memory@0.1.1' version
+```
+
+Do not try to republish `0.1.1`: npm versions are immutable. A new release must use a new version. If setting up a fork whose package has never been published, publish its first version manually from a clean checkout, then configure trusted publishing; this bootstrap step is not needed for the canonical repository.
+
+Create or sign in to an npm account that has write access to `@trisynapse/trisynapse-memory`, has account-level two-factor authentication enabled, and is authorized to manage package settings. Configure one GitHub Actions trusted publisher using either the npm website or npm CLI.
+
+In the npm website, open the package, select **Settings**, and add a trusted publisher with these exact values:
+
+| Field | Value |
+|---|---|
+| GitHub organization or user | `shanmukh05` |
+| Repository | `trisynapse-memory` |
+| Workflow filename | `release.yml` |
+| Environment | `npm` |
+| Allowed action | `npm publish` |
+
+The release workflow uses a GitHub-hosted runner, Node.js 24, npm's public registry, and the existing `id-token: write` permission. npm exchanges the workflow identity for a short-lived publishing credential and generates provenance automatically; no `NPM_TOKEN` is used.
+
+To inspect or create the same relationship from the CLI, use npm 11.15.0 or newer:
+
+```bash
+npm install --global npm@latest
+npm --version
+npm login
+npm whoami
+npm trust list '@trisynapse/trisynapse-memory'
+npm trust github '@trisynapse/trisynapse-memory' \
+  --repo shanmukh05/trisynapse-memory \
+  --file release.yml \
+  --env npm \
+  --allow-publish
+npm trust list '@trisynapse/trisynapse-memory'
+```
+
+Run `npm trust github` only when the package does not already have the intended relationship. A package can have only one trusted publisher relationship. To replace one, get its ID from `npm trust list` and revoke that exact relationship before creating the replacement:
+
+```bash
+npm trust revoke '@trisynapse/trisynapse-memory' --id TRUST_ID
+```
+
+The workflow value is the filename `release.yml`, not `.github/workflows/release.yml`. Since npm requires an allowed action, include `--allow-publish` when configuring through the CLI.
+
+Once a tagged release has published successfully, set the package's publishing access to require two-factor authentication and disallow traditional tokens. Keep the trusted publisher enabled. Every later `v*` tag will build, publish, and install-test the matching npm version before PyPI and the GitHub Release are published.
+
+Before creating an automated tag, verify the existing package and trust relationship:
+
+```bash
+npm view '@trisynapse/trisynapse-memory@0.1.1' version
+npm trust list '@trisynapse/trisynapse-memory'
+```
+
+After the release workflow publishes the new version, verify it separately:
+
+```bash
+npm view "@trisynapse/trisynapse-memory@${RELEASE_VERSION}" version
+```
+
+If `npm trust` reports `Unknown command`, upgrade to npm 11.15.0 or newer. The npm website can be used instead. If publishing reports `ENEEDAUTH`, recheck the authenticated account, case-sensitive workflow filename, repository owner, repository name, GitHub environment, `id-token: write` permission, and the package's exact `repository.url`. See npm's official [trusted publishing guide](https://docs.npmjs.com/trusted-publishers/) and [`npm trust` reference](https://docs.npmjs.com/cli/v11/commands/npm-trust/).
+
 ### Maintainer workstation
 
 Install:
@@ -92,7 +167,7 @@ Install:
 - Git and access to the GitHub repository;
 - Python 3.11 or newer;
 - [`uv`](https://docs.astral.sh/uv/);
-- Node.js 22;
+- Node.js 24 and npm 11.15.0 or newer;
 - pnpm 10;
 - Docker with Compose, if the container deployment will be tested;
 - GitHub CLI (`gh`), optional but useful for watching workflows and downloading assets.
@@ -103,6 +178,7 @@ Check the toolchain:
 git --version
 uv --version
 node --version
+npm --version
 pnpm --version
 docker --version
 gh auth status
@@ -147,15 +223,15 @@ Never commit:
 - `dist/`, `build/`, `.venv/`, `node_modules/`, caches, or generated `*.egg-info`;
 - benchmark datasets or artifacts whose license does not permit redistribution.
 
-Create a normal feature/release branch and push it for review:
+Develop changes on normal short-lived feature branches and merge them through pull requests. Do not create a `release/VERSION` branch for pre-1.0 releases. The release itself is the tag applied to the reviewed commit on `main`, not a new branch. If the release changes are already merged, skip this example and continue on `main`:
 
 ```bash
-git switch -c release/0.1.0
+git switch -c codex/release-preparation
 git add .
 git status --short
 git diff --cached --check
-git commit -m "Prepare Trisynapse Memory 0.1.0"
-git push -u origin release/0.1.0
+git commit -m "Prepare Trisynapse Memory ${RELEASE_VERSION}"
+git push -u origin codex/release-preparation
 ```
 
 Open a pull request, let the entire `test` workflow pass, review the built Studio visually, then merge into `main`.
@@ -171,7 +247,7 @@ Trisynapse Memory is pre-1.0. Use semantic versioning with this interpretation:
 `pyproject.toml` is the canonical release version. Do not edit every version file manually. Set the new version once from the repository root:
 
 ```bash
-uv run python scripts/version.py set 0.2.0
+uv run python scripts/version.py set "$RELEASE_VERSION"
 ```
 
 The command validates the version, updates all duplicated release metadata, refreshes `uv.lock`, and then checks the result. If updating or locking fails, it restores every touched file. It updates:
@@ -189,12 +265,14 @@ The command validates the version, updates all duplicated release metadata, refr
 
 `pnpm-lock.yaml` does not store workspace package versions, so changing only the release version does not require regenerating it. Do not edit generated `dist/` or `src/trisynapse_memory.egg-info/` metadata by hand.
 
+Stable versions are identical on PyPI and npm. For prereleases, the command converts the canonical PEP 440 spelling into npm SemVer: for example, `0.2.0rc1` and tag `v0.2.0rc1` publish as `0.2.0-rc.1` on npm. Prerelease SDKs use the npm `next` dist-tag, so they do not replace the stable `latest` version.
+
 Inspect and verify the result:
 
 ```bash
 uv run python scripts/version.py current
 uv run python scripts/version.py check
-uv run python scripts/version.py check --tag v0.2.0
+uv run python scripts/version.py check --tag "v${RELEASE_VERSION}"
 ```
 
 `check` compares the canonical version with the Python lock, both JavaScript manifests, and both installers. The optional `--tag` additionally requires the exact `v<version>` Git tag. CI runs the ordinary check on every push, and the release workflow runs the tag-aware check before testing or publishing.
@@ -212,7 +290,7 @@ After changing the version, build Studio and run the normal test/build sequence.
 Prepare the release notes before tagging even though the workflow creates the GitHub Release automatically. Use this structure:
 
 ```markdown
-## Trisynapse Memory 0.1.0
+## Trisynapse Memory VERSION
 
 ### Highlights
 - User-visible outcome, not an internal implementation detail.
@@ -268,9 +346,9 @@ uv run --extra dev --extra all python -m pytest -q \
 uv run --extra dev --extra all python -m pytest -q \
   tests/test_model_configuration.py
 
-# Studio backend, query runs, source preview, graph, and retrieval settings
+# REST, Studio backend, query runs, source preview, graph, and retrieval settings
 uv run --extra dev --extra all python -m pytest -q \
-  tests/test_studio_redesign.py tests/test_api.py
+  tests/test_api.py
 
 # Benchmark adapters, provenance, prompts, and release gate logic
 uv run --extra dev --extra all python -m pytest -q \
@@ -282,9 +360,12 @@ The automated provider tests use mocks and do not prove that a real credential, 
 ### TypeScript client
 
 ```bash
-pnpm --filter @trisynapse/memory check
-pnpm --filter @trisynapse/memory build
+pnpm --filter @trisynapse/trisynapse-memory check
+pnpm --filter @trisynapse/trisynapse-memory build
+(cd packages/js-sdk && npm pack --dry-run)
 ```
+
+The dry run must show the compiled `dist/` client and declarations, `package.json`, and package README without source-tree secrets, caches, Studio assets, or repository-only files.
 
 ### Studio unit, production, responsive, and accessibility tests
 
@@ -311,7 +392,7 @@ Inspect the artifacts:
 
 ```bash
 ls -lh dist/
-unzip -l dist/trisynapse_memory-0.1.0-py3-none-any.whl | \
+unzip -l "dist/trisynapse_memory-${RELEASE_VERSION}-py3-none-any.whl" | \
   rg 'trisynapse_memory/(studio/dist|prompts)'
 ```
 
@@ -329,7 +410,7 @@ Create an isolated environment and install the local wheel with all user-facing 
 ```bash
 uv venv .release-smoke
 uv pip install --python .release-smoke/bin/python \
-  'dist/trisynapse_memory-0.1.0-py3-none-any.whl[all]'
+  "dist/trisynapse_memory-${RELEASE_VERSION}-py3-none-any.whl[all]"
 
 .release-smoke/bin/trisynapse-memory --version
 .release-smoke/bin/trisynapse-memory --path .release-smoke/store init
@@ -337,13 +418,13 @@ uv pip install --python .release-smoke/bin/python \
   "Production smoke memory"
 .release-smoke/bin/trisynapse-memory --path .release-smoke/store search \
   "Production smoke"
-.release-smoke/bin/trisynapse-memory --path .release-smoke/store verify
+.release-smoke/bin/trisynapse-memory --path .release-smoke/store validate
 .release-smoke/bin/trisynapse-memory --path .release-smoke/store --json check
 ```
 
 On Windows, use `.release-smoke\Scripts\python.exe` and `.release-smoke\Scripts\trisynapse-memory.exe`.
 
-`check.ok` must be true. Review `missing_credentials`, `failed_jobs`, source extras, store permissions, and Trace validity rather than checking only the process exit code.
+`check.ok` must be true. Review `missing_credentials`, `failed_jobs`, source extras, store permissions, and store validation rather than checking only the process exit code.
 
 Smoke-test the installed Python API as well:
 
@@ -359,8 +440,9 @@ try:
     found = memory.search("Python package smoke", top_k=3)
     assert added.id
     assert found.hits
-    assert memory.verify_trace().valid
-    print({"version": memory.VERSION, "trace_valid": True})
+    validation = memory.validate_store()
+    assert validation.ok
+    print({"version": memory.VERSION, "store_valid": True})
 finally:
     memory.close()
 PY
@@ -384,10 +466,12 @@ trisynapse-memory bench gate --data-root data --mode retrieval
 
 The gate requires current artifact schema, production architecture identity, provider/prompt provenance, a valid benchmark Trace, and these minimums:
 
-| Suite | Questions | Evidence recall@k | Mean token F1 |
-|---|---:|---:|---:|
-| LoCoMo | 100 | 0.25 | 0.20 |
-| LongMemEval | 25 | 0.80 | 0.20 |
+| Suite | Questions | Pre-answer evidence recall@k |
+|---|---:|---:|
+| LoCoMo | 100 | 0.55 |
+| LongMemEval | 25 | 0.80 |
+
+Retrieval mode does not gate on answer token F1: without a completion model its extractive output is intentionally a Trace excerpt, not a benchmark-style short answer. Token F1 and judge accuracy belong to the end-to-end gate.
 
 For an end-to-end release gate, configure and test a completion provider first, then run:
 
@@ -401,7 +485,7 @@ trisynapse-memory bench run longmemeval \
 trisynapse-memory bench gate --data-root data --mode end-to-end
 ```
 
-End-to-end mode additionally requires judge accuracy of at least `0.50`. Its artifacts must record completion provider/model plus extraction, Episode Recall, answer, and benchmark-judge prompt provenance. Budget and rate-limit this run; it can make many billable calls.
+End-to-end mode additionally requires mean token F1 of at least `0.20` and judge accuracy of at least `0.50`. Its artifacts must record completion provider/model plus extraction, Episode Recall, answer, and benchmark-judge prompt provenance. Budget and rate-limit this run; it can make many billable calls.
 
 Archive the exact passing artifact files with the release evidence. Do not let an older artifact satisfy a new algorithm release without deliberately reviewing its engine version and provenance.
 
@@ -425,7 +509,7 @@ trisynapse-memory --path "$PROVIDER_TEST_STORE" models test \
 
 Repeat for the selected embedding provider and model. The connection test can be billable. For a non-empty store, an embedding change requires `--yes` and performs a staged rebuild; use an empty disposable store for a simple release smoke.
 
-If the release claims image support for a selected model, ingest a small non-sensitive PNG/JPEG/WebP and verify that visible text, description, provenance, and privacy filtering are correct. A successful text request does not establish vision support.
+If the release claims image support for a selected model, ingest a small non-sensitive PNG/JPEG/WebP and verify that visible text, description, and provenance are correct. A successful text request does not establish vision support.
 
 ## 9. Manual CLI acceptance test
 
@@ -442,7 +526,7 @@ trisynapse-memory --path "$SMOKE_STORE" query \
   "What is Trisynapse Memory?"
 trisynapse-memory --path "$SMOKE_STORE" history
 trisynapse-memory --path "$SMOKE_STORE" jobs list
-trisynapse-memory --path "$SMOKE_STORE" verify
+trisynapse-memory --path "$SMOKE_STORE" validate
 trisynapse-memory --path "$SMOKE_STORE" --json check
 ```
 
@@ -549,14 +633,14 @@ Open `http://127.0.0.1:8765/studio/` and test:
 9. narrow-screen navigation and drawer close controls;
 10. browser console and network panel with no uncaught errors or failed same-origin requests.
 
-Stop the server with Ctrl+C and rerun `verify` on the test store.
+Stop the server with Ctrl+C and rerun `validate` on the test store.
 
 ### TypeScript client against the live REST server
 
 With the same REST smoke server still running, build the client and call the real API:
 
 ```bash
-pnpm --filter @trisynapse/memory build
+pnpm --filter @trisynapse/trisynapse-memory build
 export TRISYNAPSE_API_KEY="PASTE_THE_TEST_TOKEN"
 
 node --input-type=module <<'JS'
@@ -585,27 +669,27 @@ This verifies the built SDK, authentication header, namespace payload, observati
 Before upgrading any real store:
 
 ```bash
-trisynapse-memory --path /path/to/store verify
+trisynapse-memory --path /path/to/store validate
 trisynapse-memory --path /path/to/store backup ./pre-release-backup.zip
 trisynapse-memory restore ./pre-release-backup.zip ./restore-check
-trisynapse-memory --path ./restore-check verify
+trisynapse-memory --path ./restore-check validate
 ```
 
 Test the new wheel against a copy or restored store, never the only production store. Opening a store can run schema migrations. There is no supported schema downgrade, so preserve the pre-upgrade backup until the new version has been stable for the required retention period.
 
 ## 12. Commit, merge, tag, and publish
 
-After all gates pass, commit the version, locks, built Studio assets, tests, docs, and workflow changes. Do not commit local `dist/` output.
+After all gates pass, commit the version, locks, source, tests, docs, and workflow changes. Do not commit local `dist/` output or built Studio assets; the release workflow rebuilds Studio before packaging the Python distributions.
 
 ```bash
 git status --short
 git diff --check
 git diff --stat
-uv run python scripts/version.py check --tag v0.1.0
+uv run python scripts/version.py check --tag "v${RELEASE_VERSION}"
 git add pyproject.toml uv.lock pnpm-lock.yaml \
   packages src README.md docs install.sh install.ps1 \
   .github Dockerfile docker-compose.yml .dockerignore
-git commit -m "Release Trisynapse Memory 0.1.0"
+git commit -m "Release Trisynapse Memory ${RELEASE_VERSION}"
 git push
 ```
 
@@ -620,15 +704,15 @@ git status --short
 Create an annotated tag. Use a signed tag when signing is configured:
 
 ```bash
-git tag -s v0.1.0 -m "Trisynapse Memory 0.1.0"
-git push origin v0.1.0
+git tag -s "v${RELEASE_VERSION}" -m "Trisynapse Memory ${RELEASE_VERSION}"
+git push origin "v${RELEASE_VERSION}"
 ```
 
 Without signing:
 
 ```bash
-git tag -a v0.1.0 -m "Trisynapse Memory 0.1.0"
-git push origin v0.1.0
+git tag -a "v${RELEASE_VERSION}" -m "Trisynapse Memory ${RELEASE_VERSION}"
+git push origin "v${RELEASE_VERSION}"
 ```
 
 Pushing the tag is the publication trigger, not a preview. The workflow can publish to PyPI before a maintainer has time to intervene. Never use a tag merely to test the workflow.
@@ -647,16 +731,16 @@ If any job fails before PyPI publication, fix the cause, delete the failed remot
 Download all assets with GitHub CLI:
 
 ```bash
-mkdir release-assets-0.1.0
-gh release download v0.1.0 --dir release-assets-0.1.0
-cd release-assets-0.1.0
+mkdir "release-assets-${RELEASE_VERSION}"
+gh release download "v${RELEASE_VERSION}" --dir "release-assets-${RELEASE_VERSION}"
+cd "release-assets-${RELEASE_VERSION}"
 ```
 
 Or download a specific asset directly:
 
 ```bash
-curl -fLO https://github.com/shanmukh05/trisynapse-memory/releases/download/v0.1.0/install.sh
-curl -fLO https://github.com/shanmukh05/trisynapse-memory/releases/download/v0.1.0/SHA256SUMS
+curl -fLO "https://github.com/shanmukh05/trisynapse-memory/releases/download/v${RELEASE_VERSION}/install.sh"
+curl -fLO "https://github.com/shanmukh05/trisynapse-memory/releases/download/v${RELEASE_VERSION}/SHA256SUMS"
 ```
 
 On Linux:
@@ -679,6 +763,20 @@ Get-ChildItem -File | Where-Object Name -ne "SHA256SUMS" | Get-FileHash -Algorit
 
 Inspect `release.json`; its version must match the tag, PyPI, and wheel metadata. Verify the tag in GitHub and confirm that the release points to the intended commit.
 
+Confirm the published SDK independently of the repository workspace:
+
+```bash
+npm view "@trisynapse/trisynapse-memory@${RELEASE_VERSION}" version
+SDK_SMOKE_ROOT="$(mktemp -d)"
+cd "$SDK_SMOKE_ROOT"
+npm init --yes
+npm install "@trisynapse/trisynapse-memory@${RELEASE_VERSION}"
+node --input-type=module -e \
+  'import { TrisynapseMemory } from "@trisynapse/trisynapse-memory"; if (typeof TrisynapseMemory !== "function") process.exit(1)'
+```
+
+This test must install from npm rather than resolving the local workspace package.
+
 ## 14. Test the published installers
 
 Use clean disposable machines or VMs for all three supported operating systems. An existing `uv` tool environment can hide dependency and PATH errors.
@@ -688,12 +786,12 @@ Use clean disposable machines or VMs for all three supported operating systems. 
 Test the version-specific release asset first:
 
 ```bash
-curl -LsSf https://github.com/shanmukh05/trisynapse-memory/releases/download/v0.1.0/install.sh | sh
+curl -LsSf "https://github.com/shanmukh05/trisynapse-memory/releases/download/v${RELEASE_VERSION}/install.sh" | sh
 trisynapse-memory --version
 trisynapse-memory --json check
 ```
 
-Then verify the public latest-release command resolves to the same version:
+For a stable release, verify that the public latest-release command resolves to the same version:
 
 ```bash
 curl -LsSf https://github.com/shanmukh05/trisynapse-memory/releases/latest/download/install.sh | sh
@@ -703,22 +801,23 @@ trisynapse-memory --version
 ### Windows PowerShell
 
 ```powershell
-irm https://github.com/shanmukh05/trisynapse-memory/releases/download/v0.1.0/install.ps1 | iex
+$Version = "0.2.0"
+irm "https://github.com/shanmukh05/trisynapse-memory/releases/download/v$Version/install.ps1" | iex
 trisynapse-memory --version
 trisynapse-memory --json check
 ```
 
-Then repeat with `/releases/latest/download/install.ps1`.
+For a stable release, repeat with `/releases/latest/download/install.ps1`. Skip the `latest` check for a release candidate because GitHub's latest stable release should remain unchanged.
 
 ### Installer acceptance criteria
 
 - detects the supported OS and CPU architecture;
 - installs or reuses `uv`;
-- installs `trisynapse-memory[all]==0.1.0` from PyPI;
+- installs `trisynapse-memory[all]==VERSION` from PyPI;
 - records installer metadata under the user state directory;
 - explains any required PATH change;
 - exposes only the `trisynapse-memory` command;
-- reports version `0.1.0`;
+- reports the requested release version;
 - passes `--json check` without a logo or progress content;
 - can launch the CLI, REST API, and packaged Studio;
 - re-running the installer upgrades or leaves the same version healthy.
@@ -768,7 +867,7 @@ The supplied Compose file publishes only on loopback and persists `/data` in a n
 
 ```bash
 pnpm --filter @trisynapse/studio build
-docker build --pull -t trisynapse-memory:0.1.0 .
+docker build --pull -t "trisynapse-memory:${RELEASE_VERSION}" .
 ```
 
 Create a deployment-only environment file outside Git with a strong random API key and only the provider credentials required by the selected models. The checked-in Compose file forwards the administrator API key; add explicit provider-variable mappings in a deployment override when external models are used.
@@ -802,7 +901,7 @@ For a concrete Linux/systemd deployment, create a dedicated account and director
 ```bash
 uv venv /opt/trisynapse-memory
 uv pip install --python /opt/trisynapse-memory/bin/python \
-  'trisynapse-memory[all]==0.1.0'
+  "trisynapse-memory[all]==${RELEASE_VERSION}"
 ```
 
 Create `/etc/systemd/system/trisynapse-memory.service`:
@@ -867,7 +966,7 @@ GET /api/v1/metrics
 
 Alert on:
 
-- liveness failure or invalid Trace;
+- liveness failure or invalid store validation;
 - failed or persistently pending jobs;
 - failed/interrupted ingestion and query runs;
 - missing provider credentials or provider connection failures;
@@ -886,17 +985,17 @@ Within the release window:
 3. install through both the versioned and `latest` installer URLs;
 4. repeat the CLI, REST, Studio, and wheel smoke tests against published artifacts;
 5. deploy first to staging with a restored production-like store;
-6. run `verify`, `check`, one ingestion, one query, one query-history replay, and one backup;
+6. run `validate`, `check`, one ingestion, one query, one query-history replay, and one backup;
 7. canary production traffic before full rollout;
 8. preserve the release evidence: commit SHA, tag signature, CI URLs, checksums, benchmark artifacts, restore result, and acceptance-test result.
 
 ## 17. Failure, rollback, and yanking
 
-If application startup or migration fails, stop the new process and preserve the store unchanged. Restore the verified pre-upgrade backup into a new empty directory. Do not hand-edit SQLite rows or Trace hashes.
+If application startup or migration fails, stop the new process and preserve the store unchanged. Restore the validated pre-upgrade backup into a new empty directory. Do not hand-edit SQLite rows, retained source blobs, or index files.
 
 If the release is defective but safe to install, publish a patch release. PyPI versions are immutable: never overwrite a published version or move its tag to different code.
 
-Yank a PyPI release only when users should not select it, and clearly explain the reason in the GitHub Release. Deleting a GitHub Release does not remove the PyPI package or installations already made. For a credential or supply-chain incident, also rotate affected credentials, invalidate tokens, preserve evidence, and follow [`SECURITY.md`](../SECURITY.md).
+Yank a PyPI release only when users should not select it, and clearly explain the reason in the GitHub Release. Deleting a GitHub Release does not remove the PyPI package or installations already made. For a credential or supply-chain incident, also rotate affected credentials, invalidate tokens, preserve evidence, and follow [`SECURITY.md`](../../SECURITY.md).
 
 ## 18. Final sign-off checklist
 
@@ -915,10 +1014,11 @@ Yank a PyPI release only when users should not select it, and clearly explain th
 [ ] CLI manual acceptance passes
 [ ] REST and SSE manual acceptance passes with authentication
 [ ] Studio desktop and narrow-screen acceptance passes
-[ ] Backup restore drill and restored Trace verification pass
-[ ] Docker or host staging deployment passes health/check/verify
+[ ] Backup restore drill and restored store validation pass
+[ ] Docker or host staging deployment passes health/check/validate
 [ ] Protected-main CI is green
 [ ] PyPI trusted publisher and GitHub pypi environment are configured
+[ ] `@trisynapse/trisynapse-memory` trusted publisher and GitHub npm environment are configured
 [ ] Annotated/signed tag points to the reviewed main commit
 [ ] Release workflow, publication, checksums, and three-OS installer smoke pass
 [ ] Published artifacts are canary-tested before full production rollout

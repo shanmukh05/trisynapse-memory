@@ -6,14 +6,14 @@ import base64
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from trisynapse_memory.engine.compilation import parse_json_response
-from trisynapse_memory.engine.embedding import (
+from trisynapse_memory.engine.providers.embedding import (
     GeminiEmbedder,
     OpenAICompatibleEmbedder,
     SentenceTransformerEmbedder,
@@ -51,6 +51,19 @@ class CompletionProvider(Protocol):
     def complete_multimodal(
         self, system: str, user: str, image: bytes, media_type: str
     ) -> dict[str, Any]: ...
+
+
+def parse_json_response(text: str) -> dict[str, Any]:
+    """Parse a provider's JSON-object response, allowing a Markdown fence."""
+
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    value = json.loads(cleaned)
+    if not isinstance(value, dict):
+        raise ValueError("completion returned JSON that is not an object")
+    return value
 
 
 @dataclass(frozen=True)
@@ -398,7 +411,7 @@ def embedder_from_settings(settings: ProviderSettings | None) -> Any:
         model = settings.model if settings and settings.model else "all-MiniLM-L6-v2"
         value = SentenceTransformerEmbedder(model)
         value.provider_name = "sentence-transformers"
-        value.cache_key = embedding_cache_key("sentence-transformers", None, model)
+        value.cache_key = embedding_cache_key("sentence-transformers", None, value.model_name)
         return value
     provider = settings.provider.strip().lower()
     selection = selection_from_settings(settings, ProviderRole.EMBEDDING)

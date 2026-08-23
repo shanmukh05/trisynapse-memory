@@ -10,6 +10,7 @@ import io
 import ipaddress
 import json
 import mimetypes
+import os
 import re
 import socket
 import stat
@@ -18,12 +19,12 @@ import tarfile
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from trisynapse_memory.engine.loaders import CODE_SUFFIXES, TEXT_SUFFIXES, _TextHTMLParser
 from trisynapse_memory.engine.models import SourceInput
 from trisynapse_memory.prompts import load_prompt
 
@@ -32,6 +33,15 @@ MAX_RUN_BYTES = 250 * 1024 * 1024
 MAX_ARCHIVE_FILES = 10_000
 MAX_REDIRECTS = 5
 FETCH_TIMEOUT = 30
+CODE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".java",
+    ".js", ".jsx", ".kt", ".lua", ".php", ".py", ".rb", ".rs", ".scala",
+    ".sh", ".sql", ".swift", ".ts", ".tsx", ".vue", ".zig",
+}
+TEXT_SUFFIXES = {
+    ".txt", ".md", ".mdx", ".rst", ".json", ".jsonl", ".yaml", ".yml",
+    ".toml", ".csv",
+}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".tar.gz"}
 OFFICE_SUFFIXES = {".docx", ".pptx", ".xlsx"}
@@ -44,6 +54,38 @@ SECRET_NAMES = {
     "secrets.json", "service-account.json",
 }
 SECRET_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".keystore"}
+
+
+@dataclass(frozen=True)
+class LoadedDocument:
+    text: str
+    title: str
+    media_type: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class _TextHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self._ignored = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag in {"script", "style", "noscript"}:
+            self._ignored += 1
+        elif tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "li", "br", "tr"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript"} and self._ignored:
+            self._ignored -= 1
+        elif tag in {"p", "div", "section", "article", "li", "tr"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored:
+            self.parts.append(data)
 
 
 @dataclass(frozen=True)
@@ -73,6 +115,82 @@ class PreparedSource:
 
 class SourceError(ValueError):
     pass
+
+
+def load_document(path: str | Path) -> LoadedDocument:
+    """Load one local document into the legacy normalized-text contract."""
+
+    file_path = Path(path).expanduser().resolve()
+    if not file_path.is_file():
+        raise FileNotFoundError(file_path)
+    suffix = file_path.suffix.lower()
+    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    metadata = {
+        "path": str(file_path),
+        "size_bytes": file_path.stat().st_size,
+        "suffix": suffix,
+    }
+    if suffix == ".pdf":
+        return _load_pdf_document(file_path, metadata)
+    if suffix in {".html", ".htm"}:
+        parser = _TextHTMLParser()
+        parser.feed(file_path.read_text(encoding="utf-8", errors="replace"))
+        text = "\n".join(
+            line.strip()
+            for line in "".join(parser.parts).splitlines()
+            if line.strip()
+        )
+        return LoadedDocument(
+            text=text,
+            title=file_path.name,
+            media_type="text/html",
+            metadata=metadata,
+        )
+    if suffix in CODE_SUFFIXES:
+        raw = file_path.read_text(encoding="utf-8", errors="replace")
+        numbered = "\n".join(
+            f"{index:06d}: {line}" for index, line in enumerate(raw.splitlines(), 1)
+        )
+        metadata["language"] = suffix.lstrip(".")
+        return LoadedDocument(
+            text=numbered,
+            title=file_path.name,
+            media_type=media_type,
+            metadata=metadata,
+        )
+    if suffix in TEXT_SUFFIXES or media_type.startswith("text/"):
+        return LoadedDocument(
+            text=file_path.read_text(encoding="utf-8", errors="replace"),
+            title=file_path.name,
+            media_type=media_type,
+            metadata=metadata,
+        )
+    raise ValueError(
+        f"unsupported file type: {suffix or media_type}; "
+        "supported: PDF, HTML, text, and source code"
+    )
+
+
+def _load_pdf_document(path: Path, metadata: dict[str, Any]) -> LoadedDocument:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF loading requires: pip install 'trisynapse-memory[files]'"
+        ) from exc
+    reader = PdfReader(str(path))
+    pages: list[str] = []
+    for index, page in enumerate(reader.pages, 1):
+        text = page.extract_text() or ""
+        pages.append(f"\n[Page {index}]\n{text.strip()}")
+    metadata["page_count"] = len(reader.pages)
+    title = str((reader.metadata or {}).get("/Title") or path.name)
+    return LoadedDocument(
+        text="\n".join(pages).strip(),
+        title=title,
+        media_type="application/pdf",
+        metadata=metadata,
+    )
 
 
 def prepare_source(source: SourceInput, completion: Any | None = None) -> PreparedSource:
@@ -123,12 +241,26 @@ def store_blob(root: Path, content: bytes, *, filename: str) -> str:
     except OSError:
         pass
     target = directory / digest
-    if not target.exists():
-        target.write_bytes(content)
-        try:
-            target.chmod(0o600)
-        except OSError:
-            pass
+    if (
+        target.is_file()
+        and not target.is_symlink()
+        and hashlib.sha256(target.read_bytes()).hexdigest() == digest
+    ):
+        return str(target.relative_to(root))
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=directory, prefix=f".{digest}.", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(target)
+        target.chmod(0o600)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return str(target.relative_to(root))
 
 

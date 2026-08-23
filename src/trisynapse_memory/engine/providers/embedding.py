@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -16,6 +17,38 @@ class Embedder(Protocol):
 
 class EmbeddingProviderError(RuntimeError):
     """Raised when the configured real embedding model cannot be used."""
+
+
+DEFAULT_SENTENCE_TRANSFORMER_MODEL = "all-MiniLM-L6-v2"
+
+
+def normalize_sentence_transformer_model(model_name: str) -> str:
+    """Normalize common casing variants of the built-in local model."""
+
+    normalized = model_name.strip()
+    if normalized.casefold() in {
+        DEFAULT_SENTENCE_TRANSFORMER_MODEL.casefold(),
+        f"sentence-transformers/{DEFAULT_SENTENCE_TRANSFORMER_MODEL}".casefold(),
+    }:
+        return DEFAULT_SENTENCE_TRANSFORMER_MODEL
+    return normalized
+
+
+def _configure_tqdm_thread_lock() -> None:
+    """Keep tqdm from creating multiprocessing locks inside terminal UIs.
+
+    Textual redirects stderr while the application runs. A multiprocessing lock
+    created by tqdm may try to preserve that synthetic file descriptor on macOS,
+    which fails with ``bad value(s) in fds_to_keep``. Embedding is in-process, so
+    a regular re-entrant thread lock is the correct synchronization primitive.
+    """
+
+    lock = threading.RLock()
+    from tqdm import tqdm as standard_tqdm
+    from tqdm.auto import tqdm as automatic_tqdm
+
+    standard_tqdm.set_lock(lock)
+    automatic_tqdm.set_lock(lock)
 
 
 class UnavailableEmbedder:
@@ -35,8 +68,8 @@ class UnavailableEmbedder:
 class SentenceTransformerEmbedder:
     """Lazy SentenceTransformers wrapper with no substitute-vector fallback."""
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", *, local_files_only: bool = False) -> None:
-        self.model_name = model_name
+    def __init__(self, model_name: str = DEFAULT_SENTENCE_TRANSFORMER_MODEL, *, local_files_only: bool = False) -> None:
+        self.model_name = normalize_sentence_transformer_model(model_name)
         self.local_files_only = local_files_only
         self._model: Any | None = None
 
@@ -44,6 +77,7 @@ class SentenceTransformerEmbedder:
         if self._model is not None:
             return self._model
         try:
+            _configure_tqdm_thread_lock()
             from sentence_transformers import SentenceTransformer
 
             # Cache-first avoids an unnecessary network metadata request when

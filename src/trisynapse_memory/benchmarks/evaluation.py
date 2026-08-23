@@ -1,4 +1,4 @@
-"""Shared benchmark scoring and schema-v2 artifact handling."""
+"""Shared benchmark scoring and schema-v4 artifact handling."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any, Literal
 from trisynapse_memory.engine import MemoryEngine
 
 BenchmarkMode = Literal["retrieval", "end-to-end"]
-BENCHMARK_ARTIFACT_SCHEMA_VERSION = 2
+BENCHMARK_ARTIFACT_SCHEMA_VERSION = 4
 _SAFE_COMPONENT = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
@@ -34,19 +34,46 @@ def result_row(
     }
 
 
-def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize(
+    rows: list[dict[str, Any]],
+    *,
+    include_categories: bool = True,
+) -> dict[str, Any]:
     count = len(rows)
     result = {
         "questions": count,
         "mean_token_f1": sum(row["token_f1"] for row in rows) / count if count else 0,
         "evidence_in_context_rate": sum(row["evidence_in_context"] for row in rows) / count if count else 0,
     }
-    if rows and all("evidence_hit" in row for row in rows):
+    evidence_rows = [row for row in rows if row.get("evidence_recall_at_k") is not None]
+    if evidence_rows:
+        result["evidence_recall_at_k"] = sum(float(row["evidence_recall_at_k"]) for row in evidence_rows) / len(evidence_rows)
+        result["evidence_hit_at_k"] = sum(bool(row.get("evidence_hit_at_k")) for row in evidence_rows) / len(evidence_rows)
+        result["all_evidence_retrieved_rate"] = sum(bool(row.get("all_evidence_retrieved")) for row in evidence_rows) / len(evidence_rows)
+    elif rows and all("evidence_hit" in row for row in rows):
+        # Compatibility for adapters whose datasets provide evidence text but no
+        # stable evidence identifiers.
         result["evidence_recall_at_k"] = sum(bool(row["evidence_hit"]) for row in rows) / count
+    citation_recall = [row["citation_evidence_recall"] for row in rows if row.get("citation_evidence_recall") is not None]
+    citation_precision = [row["citation_precision"] for row in rows if row.get("citation_precision") is not None]
+    if citation_recall:
+        result["citation_evidence_recall"] = sum(citation_recall) / len(citation_recall)
+    if citation_precision:
+        result["citation_precision"] = sum(citation_precision) / len(citation_precision)
+    if rows and all("abstain" in row for row in rows):
+        result["abstention_rate"] = sum(bool(row["abstain"]) for row in rows) / count
     judged = [row["judge"] for row in rows if "judge" in row]
     if judged:
         result["mean_judge_score"] = sum(item["score"] for item in judged) / len(judged)
         result["judge_accuracy"] = sum(bool(item["correct"]) for item in judged) / len(judged)
+    if include_categories and any(row.get("category") is not None for row in rows):
+        categories: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            categories.setdefault(str(row.get("category", "uncategorized")), []).append(row)
+        result["by_category"] = {
+            category: summarize(values, include_categories=False)
+            for category, values in sorted(categories.items())
+        }
     return result
 
 
@@ -77,8 +104,9 @@ def write_benchmark_artifact(
     providers: dict[str, Any],
     prompts: list[dict[str, str]],
     summary: dict[str, Any],
-    trace_verification: dict[str, Any],
+    store_validation: dict[str, Any],
     results: list[dict[str, Any]],
+    run_configuration: dict[str, Any] | None = None,
 ) -> tuple[str, Path]:
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -93,8 +121,9 @@ def write_benchmark_artifact(
         "mode": mode,
         "providers": providers,
         "prompts": prompts,
+        "run_configuration": run_configuration or {},
         "summary": summary,
-        "trace_verification": trace_verification,
+        "store_validation": store_validation,
         "results": results,
     }
     output.write_text(json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

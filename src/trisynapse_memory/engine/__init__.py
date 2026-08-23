@@ -5,7 +5,7 @@ The public :class:`MemoryEngine` lives here so applications can import either
 """
 
 from trisynapse_memory.engine.memory import MemoryEngine
-from trisynapse_memory.engine.loaders import LoadedDocument, load_document
+from trisynapse_memory.engine.formation.sources import LoadedDocument, load_document
 from trisynapse_memory.engine.models import (
     Actor,
     Citation,
@@ -47,14 +47,27 @@ from trisynapse_memory.engine.models import (
     SourceRecord,
     SourcePreview,
     SourcePreviewItem,
-    TraceVerification,
+    StoreValidation,
 )
-from trisynapse_memory.engine.privacy import PrivacyFilter, RedactionResult
-from trisynapse_memory.engine.providers import (
+from trisynapse_memory.engine.providers.registry import (
     CompletionProvider,
     EmbeddingRebuildRequired,
     ProviderError,
     ProviderSettings,
+)
+from trisynapse_memory.engine.retrieval.contracts import (
+    HeuristicQueryPlanner,
+    QueryPlan,
+    QueryPlanner,
+    RetrievalDocument,
+    RetrievalRoute,
+    RouteRegistry,
+)
+from trisynapse_memory.engine.retrieval.tokenization import (
+    ApproximateTokenCounter,
+    CallableTokenCounter,
+    TokenCounter,
+    token_counter_for,
 )
 
 __all__ = [
@@ -81,7 +94,6 @@ __all__ = [
     "ModelConfigurationChange",
     "ModelDescriptor",
     "LoadedDocument",
-    "PrivacyFilter",
     "ProviderError",
     "ProviderDescriptor",
     "ProviderRole",
@@ -91,14 +103,19 @@ __all__ = [
     "QueryRunPage",
     "QueryRunRemoveRequest",
     "QueryStep",
+    "QueryPlan",
+    "QueryPlanner",
     "RetrievalConfiguration",
     "ProviderSettings",
     "IngestionRun",
     "RemoveRequest",
     "RemoveResult",
     "RecallSnapshot",
-    "RedactionResult",
     "RetrievalTrace",
+    "RetrievalDocument",
+    "RetrievalRoute",
+    "RouteRegistry",
+    "HeuristicQueryPlanner",
     "SearchHit",
     "SnapshotDiff",
     "SourceIngestionResult",
@@ -106,6 +123,10 @@ __all__ = [
     "SourceRecord",
     "SourcePreview",
     "SourcePreviewItem",
-    "TraceVerification",
+    "StoreValidation",
+    "TokenCounter",
+    "ApproximateTokenCounter",
+    "CallableTokenCounter",
+    "token_counter_for",
     "load_document",
 ]

@@ -8,16 +8,18 @@ import secrets
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import typer
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from trisynapse_memory.engine import MemoryEngine, SourceInput
 from trisynapse_memory.engine.models import MemoryNamespace, ProviderRole, ProviderSelection
 
 
+_T = TypeVar("_T")
 CONTEXT = {"help_option_names": ["-h", "--help"]}
 app = typer.Typer(name="trisynapse-memory", help="Store traces. Recall meaning.", invoke_without_command=True, no_args_is_help=False, context_settings=CONTEXT)
 add_app = typer.Typer(help="Append normalized observations or compatibility documents.")
@@ -50,6 +52,7 @@ class State:
     quiet: bool = False
     no_color: bool = False
     yes: bool = False
+    progress: bool = True
 
     def engine(self) -> MemoryEngine:
         return MemoryEngine.from_env(self.path, namespace=self.namespace)
@@ -73,12 +76,26 @@ def root(
     quiet: bool = typer.Option(False, "--quiet", help="Suppress non-essential output."),
     no_color: bool = typer.Option(False, "--no-color", help="Disable ANSI color."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Confirm irreversible operations."),
+    no_progress: bool = typer.Option(False, "--no-progress", help="Disable interactive progress indicators."),
     version: bool = typer.Option(False, "--version", callback=_version, is_eager=True, help="Show the version and exit."),
 ) -> None:
     """Open the full terminal when no command is provided in a TTY."""
 
     del version
-    state = State(path.expanduser(), MemoryNamespace(user_id=user_id, agent_id=agent_id, project_id=project_id, session_id=session_id), json_output, quiet, no_color, yes)
+    state = State(
+        path.expanduser(),
+        MemoryNamespace(
+            user_id=user_id,
+            agent_id=agent_id,
+            project_id=project_id,
+            session_id=session_id,
+        ),
+        json_output=json_output,
+        quiet=quiet,
+        no_color=no_color,
+        yes=yes,
+        progress=not no_progress,
+    )
     ctx.obj = state
     if ctx.invoked_subcommand is None:
         if sys.stdin.isatty() and sys.stdout.isatty() and not json_output:
@@ -114,6 +131,67 @@ def _emit(ctx: typer.Context, value: Any, *, table: Table | None = None) -> None
         Console(no_color=state.no_color).print(table)
 
 
+def _progress_enabled(ctx: typer.Context) -> bool:
+    state = _state(ctx)
+    return (
+        state.progress
+        and not state.json_output
+        and not state.quiet
+        and sys.stderr.isatty()
+    )
+
+
+def _run_with_status(ctx: typer.Context, description: str, operation: Callable[[], _T]) -> _T:
+    """Run an operation with a non-invasive spinner in interactive terminals."""
+
+    if not _progress_enabled(ctx):
+        return operation()
+    state = _state(ctx)
+    console = Console(stderr=True, no_color=state.no_color)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}", markup=False),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task(description, total=None)
+        return operation()
+
+
+def _run_benchmark_with_progress(
+    ctx: typer.Context,
+    max_questions: int,
+    operation: Callable[[Callable[[Any], None] | None], _T],
+) -> _T:
+    """Render structured benchmark events as one stable progress bar."""
+
+    if not _progress_enabled(ctx):
+        return operation(None)
+    state = _state(ctx)
+    console = Console(stderr=True, no_color=state.no_color)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}", markup=False),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task_id = progress.add_task("Preparing benchmark", total=max_questions)
+
+        def update(event: Any) -> None:
+            progress.update(
+                task_id,
+                description=event.description,
+                completed=event.completed,
+                total=max(event.total, 1),
+            )
+
+        return operation(update)
+
+
 @app.command("init")
 def initialize(ctx: typer.Context, force_key: bool = typer.Option(False, "--force-key")) -> None:
     """Initialize a local store and permission-restricted API key."""
@@ -124,7 +202,7 @@ def initialize(ctx: typer.Context, force_key: bool = typer.Option(False, "--forc
     if force_key or not key_path.exists():
         key_path.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
         key_path.chmod(0o600)
-    _emit(ctx, {"status": "initialized", "store_path": str(state.path.resolve()), "api_key_path": str(key_path), "trace": engine.verify_trace()})
+    _emit(ctx, {"status": "initialized", "store_path": str(state.path.resolve()), "api_key_path": str(key_path), "storage": engine.validate_store()})
     engine.close()
 
 
@@ -133,7 +211,7 @@ def add_observation(ctx: typer.Context, text: str, episode: str = "manual:defaul
     state = _state(ctx)
     engine = state.engine()
     delta = engine.ingest_observation(text, episode_id=episode, source_ref={"type": "manual", **({"id": source} if source else {})}, scope={"topic_ids": [topic]} if topic else None, namespace=state.namespace)
-    _emit(ctx, {"delta_id": delta.id, "seq": delta.seq, "hash": delta.hash})
+    _emit(ctx, {"delta_id": delta.id, "seq": delta.seq})
     engine.close()
 
 
@@ -143,7 +221,14 @@ def add_document(ctx: typer.Context, file: Path, document_id: str | None = None,
 
     state = _state(ctx)
     engine = state.engine()
-    result = engine.ingest(SourceInput(kind="file", path=str(file), source_key=document_id, title=title), namespace=state.namespace)
+    result = _run_with_status(
+        ctx,
+        f"Ingesting {file.name}",
+        lambda: engine.ingest(
+            SourceInput(kind="file", path=str(file), source_key=document_id, title=title),
+            namespace=state.namespace,
+        ),
+    )
     _emit(ctx, result)
     engine.close()
 
@@ -161,7 +246,12 @@ def ingest_sources(ctx: typer.Context, source: list[str] = typer.Argument(None),
         raise typer.BadParameter("provide at least one SOURCE or --manifest")
     state = _state(ctx)
     engine = state.engine()
-    _emit(ctx, engine.ingest_many(descriptors, namespace=state.namespace))
+    result = _run_with_status(
+        ctx,
+        f"Ingesting {len(descriptors)} source{'s' if len(descriptors) != 1 else ''}",
+        lambda: engine.ingest_many(descriptors, namespace=state.namespace),
+    )
+    _emit(ctx, result)
     engine.close()
 
 
@@ -217,7 +307,8 @@ def runs_show(ctx: typer.Context, run_id: str) -> None:
 def runs_retry(ctx: typer.Context, run_id: str) -> None:
     state = _state(ctx)
     engine = state.engine()
-    _emit(ctx, engine.retry_ingestion(run_id))
+    result = _run_with_status(ctx, f"Retrying ingestion run {run_id}", lambda: engine.retry_ingestion(run_id))
+    _emit(ctx, result)
     engine.close()
 
 
@@ -227,7 +318,12 @@ def remove_memory(ctx: typer.Context, memory_id: list[str] = typer.Argument(...)
     if not state.yes and not typer.confirm("Physically redact these memory records? This cannot be undone"):
         raise typer.Abort()
     engine = state.engine()
-    _emit(ctx, engine.remove(delta_ids=memory_id, reason=reason, namespace=state.namespace))
+    result = _run_with_status(
+        ctx,
+        f"Removing {len(memory_id)} memory record{'s' if len(memory_id) != 1 else ''}",
+        lambda: engine.remove(delta_ids=memory_id, reason=reason, namespace=state.namespace),
+    )
+    _emit(ctx, result)
     engine.close()
 
 
@@ -241,7 +337,12 @@ def _remove_source(ctx: typer.Context, source_id: str, reason: str) -> None:
     if not state.yes and not typer.confirm("Remove the original source and all derived memory? This cannot be undone"):
         raise typer.Abort()
     engine = state.engine()
-    _emit(ctx, engine.remove_source(source_id, reason=reason, namespace=state.namespace))
+    result = _run_with_status(
+        ctx,
+        f"Removing source {source_id}",
+        lambda: engine.remove_source(source_id, reason=reason, namespace=state.namespace),
+    )
+    _emit(ctx, result)
     engine.close()
 
 
@@ -289,7 +390,12 @@ def forget(ctx: typer.Context, memory_id: str, reason: str = typer.Option(..., "
 def search(ctx: typer.Context, query: str, top_k: int = 12, episode_prefix: str | None = None) -> None:
     state = _state(ctx)
     engine = state.engine()
-    _emit(ctx, engine.search(query, top_k=top_k, episode_prefix=episode_prefix, namespace=state.namespace))
+    result = _run_with_status(
+        ctx,
+        "Searching memory",
+        lambda: engine.search(query, top_k=top_k, episode_prefix=episode_prefix, namespace=state.namespace),
+    )
+    _emit(ctx, result)
     engine.close()
 
 
@@ -297,7 +403,12 @@ def search(ctx: typer.Context, query: str, top_k: int = 12, episode_prefix: str 
 def query(ctx: typer.Context, question: str, top_k: int = 12, episode_prefix: str | None = None) -> None:
     state = _state(ctx)
     engine = state.engine()
-    _emit(ctx, engine.query(question, top_k=top_k, episode_prefix=episode_prefix, namespace=state.namespace))
+    result = _run_with_status(
+        ctx,
+        "Running grounded query",
+        lambda: engine.query(question, top_k=top_k, episode_prefix=episode_prefix, namespace=state.namespace),
+    )
+    _emit(ctx, result)
     engine.close()
 
 
@@ -305,7 +416,11 @@ def query(ctx: typer.Context, question: str, top_k: int = 12, episode_prefix: st
 def export_memory(ctx: typer.Context, output: Path, active_only: bool = False) -> None:
     state = _state(ctx)
     engine = state.engine()
-    result = engine.export_to(output, namespace=state.namespace, include_retracted=not active_only)
+    result = _run_with_status(
+        ctx,
+        "Exporting memory",
+        lambda: engine.export_to(output, namespace=state.namespace, include_retracted=not active_only),
+    )
     _emit(ctx, {"output": str(result.resolve())})
     engine.close()
 
@@ -313,14 +428,19 @@ def export_memory(ctx: typer.Context, output: Path, active_only: bool = False) -
 @app.command("backup")
 def backup(ctx: typer.Context, destination: Path) -> None:
     engine = _state(ctx).engine()
-    _emit(ctx, {"output": str(engine.backup(destination).resolve())})
+    result = _run_with_status(ctx, "Creating backup", lambda: engine.backup(destination))
+    _emit(ctx, {"output": str(result.resolve())})
     engine.close()
 
 
 @app.command("restore")
 def restore(ctx: typer.Context, archive: Path, destination: Path) -> None:
-    engine = MemoryEngine.restore_backup(archive, destination)
-    _emit(ctx, {"status": "restored", "store_path": engine.store_path, "trace": engine.verify_trace()})
+    engine = _run_with_status(
+        ctx,
+        "Restoring backup",
+        lambda: MemoryEngine.restore_backup(archive, destination),
+    )
+    _emit(ctx, {"status": "restored", "store_path": engine.store_path, "storage": engine.validate_store()})
     engine.close()
 
 
@@ -334,7 +454,8 @@ def jobs_list(ctx: typer.Context, status: str | None = None, limit: int = 100) -
 @jobs_app.command("run")
 def jobs_run(ctx: typer.Context, limit: int = 100) -> None:
     engine = _state(ctx).engine()
-    _emit(ctx, {"jobs": engine.run_jobs(max_jobs=limit)})
+    jobs = _run_with_status(ctx, f"Processing up to {limit} jobs", lambda: engine.run_jobs(max_jobs=limit))
+    _emit(ctx, {"jobs": jobs})
     engine.close()
 
 
@@ -350,14 +471,19 @@ def episodes_list(ctx: typer.Context) -> None:
 def episodes_compile(ctx: typer.Context, episode: list[str] = typer.Option(None, "--episode")) -> None:
     state = _state(ctx)
     engine = state.engine()
-    _emit(ctx, {"episode_recall_entries": engine.build_episode_recall(episode or None, namespace=state.namespace)})
+    entries = _run_with_status(
+        ctx,
+        "Compiling episode Recall",
+        lambda: engine.build_episode_recall(episode or None, namespace=state.namespace),
+    )
+    _emit(ctx, {"episode_recall_entries": entries})
     engine.close()
 
 
 @graph_app.command("export")
 def graph_export(ctx: typer.Context, format: str = "json", output: Path | None = None) -> None:
     engine = _state(ctx).engine()
-    value = engine.export_graph(format=format)
+    value = _run_with_status(ctx, "Building memory graph", lambda: engine.export_graph(format=format))
     if output:
         output.write_text(json.dumps(value, indent=2) if isinstance(value, dict) else value, encoding="utf-8")
         _emit(ctx, {"output": str(output.resolve())})
@@ -369,7 +495,8 @@ def graph_export(ctx: typer.Context, format: str = "json", output: Path | None =
 @snapshot_app.command("create")
 def snapshot_create(ctx: typer.Context, label: str | None = None) -> None:
     engine = _state(ctx).engine()
-    _emit(ctx, engine.snapshot.create(label))
+    result = _run_with_status(ctx, "Creating snapshot", lambda: engine.snapshot.create(label))
+    _emit(ctx, result)
     engine.close()
 
 
@@ -383,28 +510,38 @@ def snapshot_list(ctx: typer.Context) -> None:
 @snapshot_app.command("diff")
 def snapshot_diff(ctx: typer.Context, a: str, b: str) -> None:
     engine = _state(ctx).engine()
-    _emit(ctx, engine.snapshot.diff(a, b))
+    result = _run_with_status(ctx, "Comparing snapshots", lambda: engine.snapshot.diff(a, b))
+    _emit(ctx, result)
     engine.close()
 
 
 @snapshot_app.command("rollback")
 def snapshot_rollback(ctx: typer.Context, snapshot_id: str) -> None:
     engine = _state(ctx).engine()
-    _emit(ctx, engine.snapshot.rollback(snapshot_id))
+    result = _run_with_status(
+        ctx,
+        f"Rolling back to snapshot {snapshot_id}",
+        lambda: engine.snapshot.rollback(snapshot_id),
+    )
+    _emit(ctx, result)
     engine.close()
 
 
-@app.command("verify")
-def verify(ctx: typer.Context) -> None:
+@app.command("validate")
+def validate(ctx: typer.Context) -> None:
+    """Validate SQLite consistency, evidence references, and retained sources."""
+
     engine = _state(ctx).engine()
-    _emit(ctx, engine.verify_trace())
+    result = _run_with_status(ctx, "Validating memory store", engine.validate_store)
+    _emit(ctx, result)
     engine.close()
 
 
 @app.command("migrate")
 def migrate(ctx: typer.Context) -> None:
     engine = _state(ctx).engine()
-    _emit(ctx, {"status": "migrated", "trace": engine.verify_trace(), "version": engine.VERSION})
+    storage = _run_with_status(ctx, "Migrating and validating store", engine.validate_store)
+    _emit(ctx, {"status": "migrated", "storage": storage, "version": engine.VERSION})
     engine.close()
 
 
@@ -412,7 +549,8 @@ def migrate(ctx: typer.Context) -> None:
 def check(ctx: typer.Context) -> None:
     """Check installation, provider credentials, store health, and pending work."""
     engine = _state(ctx).engine()
-    _emit(ctx, engine.check())
+    result = _run_with_status(ctx, "Checking installation and store", engine.check)
+    _emit(ctx, result)
     engine.close()
 
 
@@ -467,7 +605,11 @@ def models_list(
     base_url: str | None = typer.Option(None, "--base-url"),
 ) -> None:
     engine = _state(ctx).engine()
-    values = engine.list_models(role, provider, refresh=refresh, base_url=base_url)
+    values = _run_with_status(
+        ctx,
+        f"{'Refreshing' if refresh else 'Loading'} {provider} models",
+        lambda: engine.list_models(role, provider, refresh=refresh, base_url=base_url),
+    )
     table = Table("Model", "Roles", "Vision", "Context", "Source")
     for item in values:
         table.add_row(
@@ -511,10 +653,14 @@ def models_set(
                     engine.close()
                     raise typer.Abort()
             confirm_rebuild = True
-    result = engine.set_model_configuration(
-        configuration,
-        confirm_embedding_rebuild=confirm_rebuild,
-        wait=confirm_rebuild,
+    result = _run_with_status(
+        ctx,
+        "Rebuilding embedding index" if confirm_rebuild else "Saving model configuration",
+        lambda: engine.set_model_configuration(
+            configuration,
+            confirm_embedding_rebuild=confirm_rebuild,
+            wait=confirm_rebuild,
+        ),
     )
     _emit(ctx, result)
     engine.close()
@@ -524,27 +670,69 @@ def models_set(
 def models_test(ctx: typer.Context, role: ProviderRole = typer.Option(..., "--role")) -> None:
     """Send one small, potentially billable request to the selected provider."""
     engine = _state(ctx).engine()
-    _emit(ctx, engine.test_model_connection(role))
+    result = _run_with_status(ctx, f"Testing {role.value} connection", lambda: engine.test_model_connection(role))
+    _emit(ctx, result)
     engine.close()
 
 
 @bench_app.command("run")
-def bench_run(ctx: typer.Context, suite: str, data_root: str | None = None, max_questions: int = 25, mode: str = "retrieval") -> None:
+def bench_run(
+    ctx: typer.Context,
+    suite: str,
+    data_root: str | None = None,
+    max_questions: int = 25,
+    mode: str = "retrieval",
+    sampling: str = typer.Option("auto", help="auto, stratified, or sequential"),
+    judge_provider: str | None = typer.Option(None, help="Optional independent judge provider"),
+    judge_model: str | None = typer.Option(None, help="Model for the independent judge"),
+    judge_base_url: str | None = typer.Option(None, help="Custom judge provider base URL"),
+) -> None:
     state = _state(ctx)
+    if sampling not in {"auto", "stratified", "sequential"}:
+        raise typer.BadParameter("sampling must be auto, stratified, or sequential")
+    if bool(judge_provider) != bool(judge_model):
+        raise typer.BadParameter("--judge-provider and --judge-model must be provided together")
+    judge_selection = (
+        ProviderSelection(provider=judge_provider, model=judge_model, base_url=judge_base_url)
+        if judge_provider and judge_model
+        else None
+    )
     engine = state.engine()
     model_configuration = engine.get_model_configuration()
     engine.close()
     if suite in {"halumem", "memorydoc"}:
         from trisynapse_memory.benchmarks import run_trace_recall_smoke
-        value = run_trace_recall_smoke(
-            suite, data_root or f"data/{suite}", max_questions=max_questions,
-            mode=mode, model_configuration=model_configuration,
+
+        value = _run_benchmark_with_progress(
+            ctx,
+            max_questions,
+            lambda on_progress: run_trace_recall_smoke(
+                suite,
+                data_root or f"data/{suite}",
+                max_questions=max_questions,
+                mode=mode,
+                model_configuration=model_configuration,
+                on_progress=on_progress,
+                sampling=sampling,
+                judge_selection=judge_selection,
+            ),
         )
     else:
         from trisynapse_memory.benchmarks import run_trace_recall_benchmark
-        value = run_trace_recall_benchmark(
-            suite, data_root or f"data/{suite}", max_questions=max_questions,
-            mode=mode, model_configuration=model_configuration,
+
+        value = _run_benchmark_with_progress(
+            ctx,
+            max_questions,
+            lambda on_progress: run_trace_recall_benchmark(
+                suite,
+                data_root or f"data/{suite}",
+                max_questions=max_questions,
+                mode=mode,
+                model_configuration=model_configuration,
+                on_progress=on_progress,
+                sampling=sampling,
+                judge_selection=judge_selection,
+            ),
         )
     _emit(ctx, value)
 
@@ -553,7 +741,11 @@ def bench_run(ctx: typer.Context, suite: str, data_root: str | None = None, max_
 def bench_gate(ctx: typer.Context, data_root: str = "data", mode: str = "retrieval") -> None:
     from trisynapse_memory.benchmarks.release import evaluate_release_gate
 
-    value = evaluate_release_gate(data_root, mode=mode)
+    value = _run_with_status(
+        ctx,
+        "Evaluating benchmark release gate",
+        lambda: evaluate_release_gate(data_root, mode=mode),
+    )
     _emit(ctx, value)
     if not value["passed"]:
         raise typer.Exit(1)

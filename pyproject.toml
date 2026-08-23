@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trisynapse-memory"
-version = "0.1.1"
+version = "0.1.2"
 description = "Append-only, citation-first memory for AI agents using Trace & Recall."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -49,6 +49,9 @@ sources = [
   "PyYAML>=6.0",
   "tree-sitter-language-pack>=0.9",
 ]
+tokens = [
+  "tiktoken>=0.9",
+]
 all = [
   "fastapi>=0.115",
   "uvicorn>=0.34",
@@ -58,6 +61,7 @@ all = [
   "openpyxl>=3.1",
   "PyYAML>=6.0",
   "tree-sitter-language-pack>=0.9",
+  "tiktoken>=0.9",
 ]
 
 [project.urls]

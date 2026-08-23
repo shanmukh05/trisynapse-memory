@@ -30,7 +30,7 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -e '.[server]'
       - run: pnpm install --frozen-lockfile=false
-      - run: pnpm --filter @trisynapse/memory check
+      - run: pnpm --filter @trisynapse/trisynapse-memory check
       - run: pnpm --filter @trisynapse/studio check
       - run: pnpm --filter @trisynapse/studio test
       - run: pnpm --filter @trisynapse/studio build

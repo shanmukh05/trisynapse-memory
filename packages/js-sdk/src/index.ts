@@ -10,8 +10,6 @@ export type DeltaKind = "observation" | "extraction" | "annotation" | "access" |
 export interface MemoryDelta {
   id: string;
   seq: number;
-  prev_hash: string;
-  hash: string;
   written_at: string;
   observed_at?: string | null;
   kind: DeltaKind;
@@ -19,7 +17,6 @@ export interface MemoryDelta {
   episode_id?: string | null;
   evidence_refs: string[];
   confidence: number;
-  privacy_scope: Record<string, unknown>;
   scope: Record<string, unknown>;
   payload: Record<string, unknown>;
   text: string;
@@ -34,14 +31,20 @@ export interface SearchHit {
   score: number;
   route: string;
   episode_id?: string | null;
+  observed_at?: string | null;
+  temporal_anchor?: string | null;
   source_delta_ids: string[];
+  source_ref?: Record<string, unknown> | string | null;
+  locator?: Record<string, unknown> | string | null;
+  confidence: number;
+  metadata: Record<string, unknown>;
 }
 
 export interface RetrievalTrace {
   query_id: string;
   query: string;
   namespace: Required<Pick<MemoryNamespace, "project_id">> & MemoryNamespace;
-  query_kind: "fact" | "temporal" | "list" | "inference";
+  query_kind: "fact" | "temporal" | "list" | "inference" | "multi_hop";
   stage: "fast" | "refine_1" | "refine_2" | "deep_recall" | "cold";
   confident: boolean;
   escalated: boolean;
@@ -64,6 +67,7 @@ export interface QueryResult {
   answer: string;
   abstain: boolean;
   citations: Array<{ delta_id: string; excerpt: string; source_ref?: unknown; locator?: unknown }>;
+  retrieval_hits: SearchHit[];
   retrieval_trace: RetrievalTrace;
 }
 
@@ -132,10 +136,21 @@ export interface IngestionRun {
 export interface RemoveResult {
   remove_id: string;
   removed_delta_ids: string[];
-  old_root_hash: string;
-  new_root_hash: string;
   requested_by: string;
   created_at: string;
+}
+
+export interface StoreValidation {
+  ok: boolean;
+  database_ok: boolean;
+  delta_count: number;
+  sequence_contiguous: boolean;
+  source_blobs_checked: number;
+  missing_source_ids: string[];
+  corrupted_source_ids: string[];
+  malformed_delta_ids: string[];
+  broken_evidence_refs: string[];
+  issues: string[];
 }
 
 export type ProviderRole = "completion" | "embedding";
@@ -199,11 +214,16 @@ export interface ConnectionTestResult {
 export interface RetrievalConfiguration {
   default_top_k: number;
   max_context_items: number;
+  max_context_tokens: number;
+  per_source_context_tokens: number;
   max_refinement_rounds: number;
   graph_hops: number;
   confidence_margin: number;
   deep_recall_enabled: boolean;
   answer_abstain_threshold: number;
+  retrieval_profile: "auto" | "balanced" | "precise" | "broad" | "mixed" | "code" | "table" | "image" | "document" | "conversation";
+  enabled_routes: string[];
+  route_weights: Record<string, number>;
   revision: number;
   updated_at: string;
 }
@@ -298,11 +318,11 @@ export class TrisynapseMemory {
     if (!this.fetcher) throw new Error("A Fetch API implementation is required");
   }
 
-  async health(): Promise<{ status: string; version: string; trace_valid: boolean; pending_jobs: number }> {
+  async health(): Promise<{ status: string; version: string; storage_ready: boolean; pending_jobs: number }> {
     return this.request("GET", "/api/v1/health", undefined, false);
   }
 
-  async check(): Promise<Record<string, unknown>> {
+  async check(): Promise<Record<string, unknown> & { storage?: StoreValidation }> {
     return this.request("GET", "/api/v1/check");
   }
 
@@ -345,17 +365,20 @@ export class TrisynapseMemory {
     return this.request("POST", "/api/v1/model-configuration/test", { role, selection });
   }
 
-  async add(text: string, options: { episodeId?: string; scope?: Record<string, unknown>; externalKey?: string } = {}) {
+  async add(text: string, options: { episodeId?: string; scope?: Record<string, unknown>; externalKey?: string; modality?: string; sourceType?: string; retrievalFields?: Record<string, unknown> } = {}) {
     return this.request<{ delta_id: string }>("POST", "/api/v1/memory/observations", {
       text,
       episode_id: options.episodeId,
       scope: options.scope,
       external_key: options.externalKey,
+      modality: options.modality,
+      source_type: options.sourceType,
+      retrieval_fields: options.retrievalFields,
       namespace: this.namespace,
     });
   }
 
-  async addBatch(items: Array<{ text: string; episode_id?: string; external_key?: string }>) {
+  async addBatch(items: Array<{ text: string; episode_id?: string; external_key?: string; modality?: string; source_type?: string; retrieval_fields?: Record<string, unknown> }>) {
     return this.request<{ delta_ids: string[] }>("POST", "/api/v1/memories/batch", {
       items: items.map(item => ({ ...item, namespace: this.namespace })),
     });

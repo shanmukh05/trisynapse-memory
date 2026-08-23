@@ -135,12 +135,10 @@ class MemoryNamespace(EngineModel):
 
 
 class MemoryDelta(EngineModel):
-    """One immutable, hash-chained piece of evidence."""
+    """One ordered piece of source-grounded evidence."""
 
     id: str
     seq: int
-    prev_hash: str
-    hash: str
     written_at: datetime = Field(default_factory=utc_now)
     observed_at: datetime | None = None
     kind: Literal["observation", "extraction", "annotation", "access", "retraction"]
@@ -149,6 +147,8 @@ class MemoryDelta(EngineModel):
     episode_id: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.7, ge=0, le=1)
+    # Serialized legacy field retained for store compatibility.
+    # New writes leave it empty; it has no filtering behavior.
     privacy_scope: dict[str, Any] = Field(default_factory=dict)
     scope: dict[str, Any] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -212,7 +212,7 @@ class RetrievalTrace(EngineModel):
     query_id: str
     query: str
     namespace: MemoryNamespace = Field(default_factory=MemoryNamespace)
-    query_kind: Literal["fact", "temporal", "list", "inference"]
+    query_kind: Literal["fact", "temporal", "list", "inference", "multi_hop"]
     stage: Literal["fast", "refine_1", "refine_2", "deep_recall", "cold"]
     confident: bool
     escalated: bool = False
@@ -250,7 +250,10 @@ class QueryStep(EngineModel):
     input: dict[str, Any] = Field(default_factory=dict)
     output: dict[str, Any] = Field(default_factory=dict)
     metrics: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
-    candidates: list[QueryCandidateSnapshot] = Field(default_factory=list, max_length=80)
+    # Up to 20 snapshots for each bounded retrieval route. The current engine
+    # Route registries can add source-aware routes; each route remains bounded
+    # to 20 snapshots by the retriever.
+    candidates: list[QueryCandidateSnapshot] = Field(default_factory=list, max_length=400)
     duration_ms: float | None = Field(default=None, ge=0)
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -258,11 +261,22 @@ class QueryStep(EngineModel):
 class RetrievalConfiguration(EngineModel):
     default_top_k: int = Field(default=12, ge=1, le=100)
     max_context_items: int = Field(default=24, ge=1, le=100)
+    max_context_tokens: int = Field(default=6000, ge=256, le=200_000)
+    per_source_context_tokens: int = Field(default=2000, ge=128, le=100_000)
     max_refinement_rounds: int = Field(default=2, ge=0, le=2)
     graph_hops: int = Field(default=2, ge=0, le=4)
     confidence_margin: float = Field(default=0.018, ge=0, le=1)
     deep_recall_enabled: bool = True
     answer_abstain_threshold: float = Field(default=0.10, ge=0, le=1)
+    retrieval_profile: Literal[
+        "auto", "balanced", "precise", "broad", "mixed", "code", "table",
+        "image", "document", "conversation",
+    ] = "auto"
+    enabled_routes: list[str] = Field(default_factory=lambda: [
+        "bm25", "semantic", "temporal", "graph", "code", "table", "image",
+        "document", "conversation",
+    ], min_length=1)
+    route_weights: dict[str, float] = Field(default_factory=dict)
     revision: int = Field(default=0, ge=0)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -270,6 +284,14 @@ class RetrievalConfiguration(EngineModel):
     def _context_covers_results(self) -> "RetrievalConfiguration":
         if self.max_context_items < self.default_top_k:
             raise ValueError("max_context_items must be at least default_top_k")
+        if self.per_source_context_tokens > self.max_context_tokens:
+            raise ValueError("per_source_context_tokens cannot exceed max_context_tokens")
+        if len(self.enabled_routes) != len(set(self.enabled_routes)):
+            raise ValueError("enabled_routes cannot contain duplicates")
+        if any(not name.strip() for name in self.enabled_routes):
+            raise ValueError("enabled_routes cannot contain empty route names")
+        if any(weight < 0 or weight > 10 for weight in self.route_weights.values()):
+            raise ValueError("route weights must be between 0 and 10")
         return self
 
 
@@ -329,6 +351,9 @@ class MemoryQueryResult(EngineModel):
     answer: str
     abstain: bool
     citations: list[Citation] = Field(default_factory=list)
+    # Pre-answer retrieval evidence. Unlike citations this remains populated when
+    # the answer model abstains, which lets callers evaluate retrieval honestly.
+    retrieval_hits: list[SearchHit] = Field(default_factory=list)
     retrieval_trace: RetrievalTrace
 
 
@@ -342,18 +367,25 @@ class EpisodeInfo(EngineModel):
     stale: bool = True
 
 
-class TraceVerification(EngineModel):
-    valid: bool
+class StoreValidation(EngineModel):
+    """Practical consistency checks for the SQLite store and retained sources."""
+
+    ok: bool
+    database_ok: bool
     delta_count: int
-    broken_at_seq: int | None = None
-    reason: str | None = None
+    sequence_contiguous: bool
+    source_blobs_checked: int = 0
+    missing_source_ids: list[str] = Field(default_factory=list)
+    corrupted_source_ids: list[str] = Field(default_factory=list)
+    malformed_delta_ids: list[str] = Field(default_factory=list)
+    broken_evidence_refs: list[str] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
 
 
 class RecallSnapshot(EngineModel):
     id: str
     label: str | None = None
     seq_cutoff: int
-    evidence_hash: str
     created_at: datetime = Field(default_factory=utc_now)
     active: bool = False
 
@@ -380,8 +412,6 @@ class MemoryHistory(EngineModel):
 class RemoveResult(EngineModel):
     remove_id: str
     removed_delta_ids: list[str] = Field(default_factory=list)
-    old_root_hash: str
-    new_root_hash: str
     requested_by: str
     created_at: datetime = Field(default_factory=utc_now)
 

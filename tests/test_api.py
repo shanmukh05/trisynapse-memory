@@ -33,7 +33,7 @@ def test_api_discovers_only_production_benchmark_artifacts(tmp_path):
         "engine_version": "0.3.0",
         "architecture": "trace-and-recall-production",
         "summary": {"questions": 1},
-        "trace_verification": {"valid": True},
+        "store_validation": {"ok": True},
         "results": [],
     }
     (runs_root / "trace_recall_locomo_20260804T010203Z.json").write_text(json.dumps(artifact), encoding="utf-8")

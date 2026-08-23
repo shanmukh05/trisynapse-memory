@@ -7,18 +7,24 @@ import io
 import json
 import zipfile
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from textual.widgets import RichLog
 from typer.testing import CliRunner
 
 from trisynapse_memory.api import create_app
 from trisynapse_memory.cli import app
 from trisynapse_memory.engine import MemoryEngine, SourceInput
-from trisynapse_memory.engine.sources import SourceError, _validate_public_url, prepare_source
-from trisynapse_memory.engine.trace import _delta_hash
-from trisynapse_memory.engine.models import MemoryNamespace
+from trisynapse_memory.engine.formation.sources import SourceError, _validate_public_url, prepare_source
+from trisynapse_memory.engine.models import (
+    IngestionRun,
+    MemoryNamespace,
+    QueryStep,
+    SourceIngestionResult,
+)
 from trisynapse_memory.terminal import (
     COMPACT_LOGO,
     WIDE_LOGO,
@@ -69,6 +75,9 @@ def test_code_directory_has_symbol_chunks_manifest_and_skips(tmp_path) -> None:
     assert symbol.locator["start_line"] == 3
     assert symbol.locator["end_line"] == 4
     assert "import json" in symbol.locator["metadata"]["imports"]
+    assert symbol.payload["modality"] == "code"
+    assert symbol.payload["retrieval_fields"]["symbol"] == "answer"
+    assert symbol.payload["retrieval_fields"]["language"] == "py"
     assert "ignored.py" in source.metadata["skipped_paths"]
     assert ".env" in source.metadata["skipped_paths"]
     repeated = engine.ingest(SourceInput(kind="directory", path=str(repository), source_key="repo"))
@@ -78,16 +87,20 @@ def test_code_directory_has_symbol_chunks_manifest_and_skips(tmp_path) -> None:
 def test_mixed_ingestion_is_ordered_durable_and_failed_only_retry(tmp_path) -> None:
     missing = tmp_path / "later.md"
     engine = memory_at(tmp_path / "store")
+    progress: list[str] = []
     run = engine.ingest_many([
         SourceInput(kind="text", text="A valid first source", source_key="first"),
         SourceInput(kind="file", path=str(missing), source_key="later"),
         SourceInput(kind="text", text="A valid third source", source_key="third"),
-    ])
+    ], on_progress=progress.append)
 
     assert run.status == "partial"
     assert [item.index for item in run.results] == [0, 1, 2]
     assert [item.status for item in run.results] == ["success", "failed", "success"]
     assert engine.get_ingestion_run(run.id).status == "partial"
+    assert progress[0] == "Creating durable ingestion run"
+    assert any(item.startswith("Preprocessed source") for item in progress)
+    assert progress[-1] == "Finalizing ingestion run"
 
     missing.write_text("The failed item is available now.", encoding="utf-8")
     retried = engine.retry_ingestion(run.id)
@@ -115,7 +128,7 @@ def test_source_dedup_version_replacement_and_physical_removal(tmp_path) -> None
     assert removed.removed_delta_ids == second_record.delta_ids
     assert engine.get(second_record.delta_ids[0], include_retracted=True).text == "[REMOVED]"
     assert not blob.exists()
-    assert engine.verify_trace().valid
+    assert engine.validate_store().ok
 
 
 def test_retained_original_is_in_backup_and_restore(tmp_path) -> None:
@@ -145,6 +158,41 @@ def test_blob_deduplication_is_content_only_and_reference_counted(tmp_path) -> N
     assert not blob.exists()
 
 
+def test_store_validation_detects_and_reingestion_repairs_corrupted_blob(tmp_path) -> None:
+    engine = memory_at(tmp_path / "store")
+    first = engine.ingest(
+        SourceInput(kind="text", text="authentic bytes", source_key="repairable")
+    )
+    source = engine.get_source(first.source_id)
+    blob = engine.store.root / source.blob_path
+    blob.write_bytes(b"corrupted bytes")
+
+    invalid = engine.validate_store()
+    assert invalid.ok is False
+    assert source.id in invalid.corrupted_source_ids
+
+    repeated = engine.ingest(
+        SourceInput(kind="text", text="authentic bytes", source_key="repairable")
+    )
+    assert repeated.status == "skipped"
+    assert blob.read_bytes() == b"authentic bytes"
+    assert engine.validate_store().ok is True
+
+
+def test_backup_refuses_a_store_with_a_corrupted_retained_source(tmp_path) -> None:
+    engine = memory_at(tmp_path / "store")
+    result = engine.ingest(
+        SourceInput(kind="text", text="original bytes", source_key="backup-check")
+    )
+    source = engine.get_source(result.source_id)
+    (engine.store.root / source.blob_path).write_bytes(b"changed outside the engine")
+
+    with pytest.raises(RuntimeError, match="failed validation before backup"):
+        engine.backup(tmp_path / "invalid-backup.zip")
+
+    assert not (tmp_path / "invalid-backup.zip").exists()
+
+
 def test_archive_traversal_is_one_item_failure(tmp_path) -> None:
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w") as archive:
@@ -159,7 +207,7 @@ def test_archive_traversal_is_one_item_failure(tmp_path) -> None:
     assert not (tmp_path / "escape.md").exists()
 
 
-def test_image_uses_multimodal_provider_then_privacy_filter(tmp_path) -> None:
+def test_image_uses_multimodal_provider_and_stores_extracted_text(tmp_path) -> None:
     class Vision:
         def __call__(self, system, user):
             return {}
@@ -173,9 +221,11 @@ def test_image_uses_multimodal_provider_then_privacy_filter(tmp_path) -> None:
     encoded = __import__("base64").b64encode(b"not-a-real-image-but-provider-is-mocked").decode()
     result = engine.ingest(SourceInput(kind="image", content_base64=encoded, filename="status.png"))
     delta = engine.get(result.delta_ids[0])
-    assert "super-secret-value" not in delta.text
+    assert "super-secret-value" in delta.text
     assert "Status OK" in delta.text
-    assert delta.privacy_scope["redacted"] is True
+    assert delta.privacy_scope == {}
+    assert delta.payload["modality"] == "image"
+    assert "Status OK" in delta.payload["retrieval_fields"]["visible_text"]
 
 
 def test_source_rest_contract_and_breaking_remove_route(tmp_path) -> None:
@@ -237,10 +287,12 @@ def test_office_and_notebook_locators(tmp_path) -> None:
     assert locators[2]["sheet"] == "Owners" and locators[2]["row"] == 1
     assert locators[2]["cells"] == ["A1", "B1"]
     assert locators[3]["kind"] == "notebook_cell" and locators[3]["cell_index"] == 0
+    modalities = [engine.get(result.delta_ids[0]).payload["modality"] for result in run.results]
+    assert modalities == ["document", "document", "table", "code"]
 
 
 def test_mocked_public_git_snapshot_records_commit_and_manifest(tmp_path, monkeypatch) -> None:
-    from trisynapse_memory.engine import sources as source_module
+    from trisynapse_memory.engine.formation import sources as source_module
 
     def fake_run(command, **kwargs):
         if "clone" in command:
@@ -260,7 +312,7 @@ def test_mocked_public_git_snapshot_records_commit_and_manifest(tmp_path, monkey
 
 
 def test_private_network_urls_and_images_without_vision_are_rejected(tmp_path, monkeypatch) -> None:
-    from trisynapse_memory.engine import sources as source_module
+    from trisynapse_memory.engine.formation import sources as source_module
 
     monkeypatch.setattr(source_module.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 6, "", ("127.0.0.1", 80))])
     with pytest.raises(SourceError, match="private"):
@@ -273,7 +325,7 @@ def test_private_network_urls_and_images_without_vision_are_rejected(tmp_path, m
     assert "vision support" in run.results[0].error
 
 
-def test_historical_purged_delta_migrates_without_rehashing(tmp_path) -> None:
+def test_legacy_chain_columns_and_purge_audit_are_removed_during_migration(tmp_path) -> None:
     engine = memory_at(tmp_path / "store")
     delta = engine.add("old sensitive content")
     connection = engine.store._connection
@@ -281,35 +333,58 @@ def test_historical_purged_delta_migrates_without_rehashing(tmp_path) -> None:
         "UPDATE deltas SET text='[PURGED]',payload_json=?,privacy_scope_json=? WHERE id=?",
         ('{"purged":true,"purge_id":"purge_old"}', '{"purged":true}', delta.id),
     )
-    historical = engine.store.get(delta.id)
-    historical.hash = _delta_hash(historical)
-    connection.execute("UPDATE deltas SET hash=? WHERE id=?", (historical.hash, delta.id))
+    connection.execute("ALTER TABLE deltas ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''")
+    connection.execute("ALTER TABLE deltas ADD COLUMN hash TEXT NOT NULL DEFAULT ''")
+    connection.execute("ALTER TABLE snapshots ADD COLUMN evidence_hash TEXT NOT NULL DEFAULT ''")
+    connection.execute("ALTER TABLE removal_audit ADD COLUMN old_root_hash TEXT NOT NULL DEFAULT ''")
+    connection.execute("ALTER TABLE removal_audit ADD COLUMN new_root_hash TEXT NOT NULL DEFAULT ''")
     connection.execute("ALTER TABLE removal_audit RENAME TO purge_audit")
     connection.execute("ALTER TABLE purge_audit RENAME COLUMN remove_id TO purge_id")
     connection.execute(
         "INSERT INTO purge_audit VALUES(?,?,?,?,?,?,?)",
-        ("purge_old", f'["{delta.id}"]', "old", "new", "legacy", "legacy deletion", "2025-01-01T00:00:00+00:00"),
+        (
+            "purge_old",
+            f'["{delta.id}"]',
+            "legacy",
+            "legacy deletion",
+            "2025-01-01T00:00:00+00:00",
+            "old",
+            "new",
+        ),
     )
     connection.commit()
-    before_hash = historical.hash
     engine.close()
 
     reopened = memory_at(tmp_path / "store")
     migrated = reopened.get(delta.id, include_retracted=True)
     assert migrated.text == "[PURGED]"
-    assert migrated.hash == before_hash
-    assert reopened.verify_trace().valid
+    assert reopened.validate_store().ok
     tables = {row["name"] for row in reopened.store._connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "removal_audit" in tables and "purge_audit" not in tables
+    delta_columns = {
+        row["name"] for row in reopened.store._connection.execute("PRAGMA table_info(deltas)")
+    }
+    audit_columns = {
+        row["name"] for row in reopened.store._connection.execute("PRAGMA table_info(removal_audit)")
+    }
+    snapshot_columns = {
+        row["name"] for row in reopened.store._connection.execute("PRAGMA table_info(snapshots)")
+    }
+    assert "prev_hash" not in delta_columns and "hash" not in delta_columns
+    assert "old_root_hash" not in audit_columns and "new_root_hash" not in audit_columns
+    assert "evidence_hash" not in snapshot_columns
 
 
 def test_cli_non_tty_help_version_and_json_contract() -> None:
     runner = CliRunner()
     no_args = runner.invoke(app, [])
+    help_result = runner.invoke(app, ["--help"])
     version = runner.invoke(app, ["--version"])
     assert no_args.exit_code == 0
     assert "Store traces. Recall meaning." in no_args.output
     assert "●──" not in no_args.output
+    assert "validate" in help_result.output
+    assert "verify" not in help_result.output
     assert version.output.strip() == package_version("trisynapse-memory")
     assert logo_for_width(40) == COMPACT_LOGO
     assert logo_for_width(100) == WIDE_LOGO
@@ -323,11 +398,54 @@ def test_interactive_terminal_tabs_and_ctrl_c(tmp_path) -> None:
     async def exercise() -> None:
         terminal = MemoryTerminal(tmp_path / "terminal-store", MemoryNamespace())
         recent = terminal.engine.add("A memory ID completion target")
+        retained = terminal.engine.ingest(
+            SourceInput(kind="text", text="A retained terminal source", source_key="terminal")
+        )
+
+        def query_with_progress(*args, **kwargs):
+            kwargs["on_step"](
+                QueryStep(
+                    id="q:test:classification",
+                    phase="classification",
+                    label="Classify query and prepare index",
+                    sequence=1,
+                    duration_ms=2,
+                )
+            )
+            return SimpleNamespace(
+                answer="The completion target is visible here.", citations=[]
+            )
+
+        terminal.engine.query = query_with_progress
         async with terminal.run_test(size=(100, 35)) as pilot:
             await pilot.pause()
-            assert len(terminal.query("TabPane")) == 5
-            assert WIDE_LOGO in str(terminal.query_one("#brand").render())
+            assert len(terminal.query("TabPane")) == 4
+            assert COMPACT_LOGO in str(terminal.query_one("#brand").render())
+            source_rows = "".join(
+                line.text for line in terminal.query_one("#sources-log", RichLog).lines
+            )
+            inspector = terminal.query_one("TabbedContent")
+            inspector.active = "trace-tab"
+            await pilot.pause()
+            trace_rows = "".join(
+                line.text for line in terminal.query_one("#trace-log", RichLog).lines
+            )
+            assert retained.source_id in source_rows
+            assert recent.id in trace_rows
             prompt = terminal.query_one("#prompt")
+            inspector.active = "sources-tab"
+            assert inspector.active == "sources-tab"
+            prompt.value = "What is the completion target?"
+            await pilot.press("enter")
+            await pilot.pause()
+            conversation = "\n".join(
+                line.text for line in terminal.query_one("#activity", RichLog).lines
+            )
+            assert "What is the completion target?" in conversation
+            assert "Classify query and prepare index" in conversation
+            assert "The completion target is visible here." in conversation
+            assert terminal._operation_label is None
+            assert inspector.active == "sources-tab"
             prompt.value = "unfinished question"
             await pilot.press("ctrl+c")
             await pilot.pause()
@@ -340,15 +458,22 @@ def test_interactive_terminal_tabs_and_ctrl_c(tmp_path) -> None:
             assert prompt.value == "/ingest "
             assert "/ingest SOURCE" in str(terminal.query_one("#recommendations").render())
             prompt.value = ""
+            suggested_memory_id = terminal._memory_ids()[0]
             await pilot.press("/", "h", "i", "s", "t", "o", "r", "y", " ", "d")
             await pilot.pause()
-            assert prompt._suggestion == f"/history {recent.id}"
+            assert prompt._suggestion == f"/history {suggested_memory_id}"
             await pilot.press("tab")
-            assert prompt.value == f"/history {recent.id}"
+            assert prompt.value == f"/history {suggested_memory_id}"
             prompt.value = ""
             await pilot.press("/", "c", "o", "n", "f", "i", "g", "enter")
             await pilot.pause()
             assert terminal.query_one("TabbedContent").active == "config-tab"
+            prompt.value = "/sources"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert terminal.query_one("TabbedContent").active == "sources-tab"
+            source_log = terminal.query_one("#sources-log", RichLog)
+            assert retained.source_id in "".join(line.text for line in source_log.lines)
             prompt.value = "/model embedding"
             await pilot.press("enter")
             await pilot.pause()
@@ -364,3 +489,56 @@ def test_ingestion_path_recommendations_follow_typed_characters(tmp_path, monkey
     (tmp_path / "source-notes.md").write_text("notes", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     assert _path_suggestions("sou") == ["source-code/", "source-notes.md"]
+
+
+def test_interactive_ingestion_keeps_the_input_responsive(tmp_path) -> None:
+    async def exercise() -> None:
+        terminal = MemoryTerminal(tmp_path / "responsive-store", MemoryNamespace())
+        started = Event()
+        release = Event()
+
+        def slow_ingestion(sources, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return IngestionRun(
+                id="ing_test",
+                status="completed",
+                inputs=sources,
+                results=[
+                    SourceIngestionResult(
+                        index=0,
+                        source_id="src_test",
+                        kind="file",
+                        status="success",
+                    )
+                ],
+            )
+
+        terminal.engine.ingest_many = slow_ingestion
+        async with terminal.run_test(size=(100, 35)) as pilot:
+            prompt = terminal.query_one("#prompt")
+            prompt.value = "/ingest README.md"
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if started.is_set():
+                    break
+            assert started.is_set()
+            assert "Reading and preprocessing" in str(
+                terminal.query_one("#operation-status").render()
+            )
+            await pilot.press("x")
+            assert prompt.value == "x"
+            prompt.value = ""
+            release.set()
+            for _ in range(20):
+                await pilot.pause()
+                if terminal._operation_label is None:
+                    break
+            assert terminal._operation_label is None
+            transcript = "\n".join(
+                line.text for line in terminal.query_one("#activity", RichLog).lines
+            )
+            assert "Ingestion finished" in transcript
+
+    asyncio.run(exercise())

@@ -28,13 +28,13 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22", cache: "pnpm" }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @trisynapse/memory check
+      - run: pnpm --filter @trisynapse/trisynapse-memory check
       - run: pnpm --filter @trisynapse/studio check
       - run: pnpm --filter @trisynapse/studio test
       - run: pnpm --filter @trisynapse/studio build
 
   publish:
-    needs: test
+    needs: [test, npm-smoke]
     runs-on: ubuntu-latest
     environment: pypi
     steps:
@@ -64,6 +64,62 @@ jobs:
             dist/install.ps1
             dist/release.json
             dist/SHA256SUMS
+
+  publish-npm:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @trisynapse/trisynapse-memory build
+      - name: Publish SDK to npm
+        shell: bash
+        run: |
+          version="$(node -p "require('./packages/js-sdk/package.json').version")"
+          if [[ "$version" == *-* ]]; then
+            npm publish ./packages/js-sdk --access public --tag next
+          else
+            npm publish ./packages/js-sdk --access public
+          fi
+
+  npm-smoke:
+    needs: publish-npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Install the published SDK
+        shell: bash
+        run: |
+          version="$(node -p "require('./packages/js-sdk/package.json').version")"
+          package="@trisynapse/trisynapse-memory@${version}"
+          for attempt in 1 2 3 4 5; do
+            if npm view "$package" version >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "npm package did not become available: $package" >&2
+              exit 1
+            fi
+            sleep 6
+          done
+          mkdir -p "${RUNNER_TEMP}/trisynapse-npm-smoke"
+          cd "${RUNNER_TEMP}/trisynapse-npm-smoke"
+          npm init --yes
+          npm install "$package"
+          node --input-type=module -e 'import { TrisynapseMemory } from "@trisynapse/trisynapse-memory"; if (typeof TrisynapseMemory !== "function") process.exit(1)'
 
   installer-smoke:
     needs: publish

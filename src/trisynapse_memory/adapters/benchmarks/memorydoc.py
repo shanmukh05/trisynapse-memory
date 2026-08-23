@@ -13,7 +13,7 @@ from trisynapse_memory.adapters.benchmarks.base import (
     PreparedCase,
 )
 from trisynapse_memory.engine import MemoryEngine
-from trisynapse_memory.engine.formation import chunk_document
+from trisynapse_memory.engine.formation.pipeline import chunk_document
 from trisynapse_memory.engine.models import MemoryNamespace
 
 

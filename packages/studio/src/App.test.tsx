@@ -5,7 +5,7 @@ import { BrowserRouter } from "react-router-dom";
 import { App } from "./App";
 
 const payloads: Record<string, unknown> = {
-  "/api/v1/health": { status: "ready", version: "0.0.0", trace_valid: true, pending_jobs: 0 },
+  "/api/v1/health": { status: "ready", version: "0.0.0", storage_ready: true, pending_jobs: 0 },
   "/api/v1/sources": {
     sources: [{ id: "src_demo", source_key: "guide", kind: "file", title: "Product guide", content_hash: "abc", media_type: "text/markdown", byte_size: 1024, chunk_count: 4, skipped_count: 0, version: 1, status: "active", namespace: { project_id: "default" }, metadata: {}, delta_ids: [], created_at: "2026-08-11T00:00:00Z" }],
     total: 1, facets: { file: 1 }, next_cursor: null,

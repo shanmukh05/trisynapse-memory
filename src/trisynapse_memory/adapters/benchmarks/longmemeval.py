@@ -14,7 +14,7 @@ from trisynapse_memory.adapters.benchmarks.base import (
     PreparedCase,
 )
 from trisynapse_memory.engine import MemoryEngine
-from trisynapse_memory.engine.models import MemoryNamespace, MemoryQueryResult
+from trisynapse_memory.engine.models import MemoryNamespace, MemoryQueryResult, SearchHit
 
 
 class LongMemEvalAdapter(BenchmarkAdapter):
@@ -61,15 +61,36 @@ class LongMemEvalAdapter(BenchmarkAdapter):
         return PreparedCase(tuple(episode_ids), namespace, episode_prefix=f"lme:{case.id}:")
 
     def result_metadata(
-        self, question: BenchmarkQuestion, result: MemoryQueryResult
+        self,
+        question: BenchmarkQuestion,
+        result: MemoryQueryResult,
+        *,
+        retrieval_hits: list[SearchHit] | None = None,
     ) -> dict[str, Any]:
+        retrieval_hits = retrieval_hits or []
         prefix = f"lme:{question.id}:"
         cited_sessions = {
             str(citation.source_ref.get("id", "")).removeprefix(prefix)
             for citation in result.citations
             if isinstance(citation.source_ref, dict)
         }
+        retrieved_sessions = {
+            str(hit.source_ref.get("id", "")).removeprefix(prefix)
+            for hit in retrieval_hits
+            if isinstance(hit.source_ref, dict)
+        }
+        evidence = set(question.evidence or ())
+        retrieved_evidence = evidence & retrieved_sessions
+        cited_evidence = evidence & cited_sessions
         return {
             **question.metadata,
-            "evidence_hit": bool(set(question.evidence or ()) & cited_sessions),
+            "gold_evidence_ids": sorted(evidence),
+            "retrieved_ids": sorted(retrieved_sessions),
+            "cited_ids": sorted(cited_sessions),
+            "evidence_hit": bool(retrieved_evidence),
+            "evidence_hit_at_k": bool(retrieved_evidence),
+            "evidence_recall_at_k": len(retrieved_evidence) / len(evidence) if evidence else None,
+            "all_evidence_retrieved": bool(evidence) and evidence <= retrieved_sessions,
+            "citation_evidence_recall": len(cited_evidence) / len(evidence) if evidence else None,
+            "citation_precision": len(cited_evidence) / len(cited_sessions) if cited_sessions else None,
         }

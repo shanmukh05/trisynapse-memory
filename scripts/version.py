@@ -25,6 +25,9 @@ INSTALL_SH = ROOT / "install.sh"
 INSTALL_PS1 = ROOT / "install.ps1"
 
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:(?:a|b|rc)[0-9]+)?$")
+PRERELEASE_PATTERN = re.compile(
+    r"^(?P<base>[0-9]+\.[0-9]+\.[0-9]+)(?P<phase>a|b|rc)(?P<number>[0-9]+)$"
+)
 PYPROJECT_PATTERN = re.compile(r'(?m)^(version\s*=\s*)"[^"]+"\s*$')
 INSTALL_SH_PATTERN = re.compile(
     r'(?m)^(?P<prefix>VERSION="\$\{TRISYNAPSE_MEMORY_VERSION:-)'
@@ -55,6 +58,17 @@ def validate_version(value: str) -> str:
             "version must look like 0.2.0 or 0.2.0rc1; do not include the leading v"
         )
     return value
+
+
+def npm_version(value: str) -> str:
+    """Convert the canonical PEP 440 version to an npm-compatible SemVer value."""
+
+    value = validate_version(value)
+    match = PRERELEASE_PATTERN.fullmatch(value)
+    if match is None:
+        return value
+    phase = {"a": "alpha", "b": "beta", "rc": "rc"}[match.group("phase")]
+    return f"{match.group('base')}-{phase}.{match.group('number')}"
 
 
 def _json_version(path: Path) -> str:
@@ -93,12 +107,24 @@ def version_surfaces() -> dict[str, str]:
 def check_versions(tag: str | None = None) -> str:
     expected = validate_version(canonical_version())
     surfaces = version_surfaces()
+    npm_expected = npm_version(expected)
+    expectations = {
+        path: npm_expected
+        if path in {"packages/js-sdk/package.json", "packages/studio/package.json"}
+        else expected
+        for path in surfaces
+    }
     mismatches = {
-        path: value for path, value in surfaces.items() if value != expected
+        path: value
+        for path, value in surfaces.items()
+        if value != expectations[path]
     }
     if mismatches:
-        rendered = ", ".join(f"{path}={value}" for path, value in mismatches.items())
-        raise VersionError(f"version mismatch; expected {expected}: {rendered}")
+        rendered = ", ".join(
+            f"{path}={value} (expected {expectations[path]})"
+            for path, value in mismatches.items()
+        )
+        raise VersionError(f"version mismatch: {rendered}")
     if tag is not None and tag != f"v{expected}":
         raise VersionError(f"tag {tag!r} does not match expected tag 'v{expected}'")
     return expected
@@ -140,14 +166,15 @@ def _run(command: list[str]) -> None:
 
 def set_version(release_version: str) -> str:
     release_version = validate_version(release_version)
+    package_version = npm_version(release_version)
     tracked = [PYPROJECT, UV_LOCK, JS_PACKAGE, STUDIO_PACKAGE, INSTALL_SH, INSTALL_PS1]
     originals = {path: path.read_bytes() for path in tracked}
     updates: dict[Path, str] = {
         PYPROJECT: _replace_once(
             PYPROJECT, PYPROJECT_PATTERN, rf'\g<1>"{release_version}"'
         ),
-        JS_PACKAGE: _package_json(JS_PACKAGE, release_version),
-        STUDIO_PACKAGE: _package_json(STUDIO_PACKAGE, release_version),
+        JS_PACKAGE: _package_json(JS_PACKAGE, package_version),
+        STUDIO_PACKAGE: _package_json(STUDIO_PACKAGE, package_version),
         INSTALL_SH: _replace_once(
             INSTALL_SH,
             INSTALL_SH_PATTERN,
@@ -176,6 +203,12 @@ def parser() -> argparse.ArgumentParser:
     )
     subcommands = value.add_subparsers(dest="command", required=True)
     subcommands.add_parser("current", help="Print the canonical version.")
+    npm = subcommands.add_parser(
+        "npm", help="Print the npm SemVer for a canonical release version."
+    )
+    npm.add_argument(
+        "version", nargs="?", help="Canonical version; defaults to pyproject.toml."
+    )
     check = subcommands.add_parser("check", help="Fail when version surfaces disagree.")
     check.add_argument("--tag", help="Also require this tag to equal v<version>.")
     update = subcommands.add_parser("set", help="Update every version surface atomically.")
@@ -188,6 +221,7 @@ def main() -> int:
     try:
         handlers: dict[str, Callable[[], str]] = {
             "current": canonical_version,
+            "npm": lambda: npm_version(arguments.version or canonical_version()),
             "check": lambda: check_versions(arguments.tag),
             "set": lambda: set_version(arguments.version),
         }
@@ -195,7 +229,7 @@ def main() -> int:
     except VersionError as exc:
         print(f"version error: {exc}", file=sys.stderr)
         return 1
-    if arguments.command == "current":
+    if arguments.command in {"current", "npm"}:
         print(release_version)
     else:
         verb = "set" if arguments.command == "set" else "verified"

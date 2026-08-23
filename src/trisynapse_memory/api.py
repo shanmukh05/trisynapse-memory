@@ -48,6 +48,9 @@ class ObservationRequest(BaseModel):
     locator: dict[str, Any] | str | None = None
     scope: dict[str, Any] | None = None
     external_key: str | None = None
+    modality: str = "text"
+    source_type: str | None = None
+    retrieval_fields: dict[str, Any] | None = None
     namespace: MemoryNamespace | None = None
 
 
@@ -198,6 +201,8 @@ class BenchmarkRunRequest(BaseModel):
     mode: Literal["retrieval", "end-to-end"] = "retrieval"
     raw_data_root: str | None = None
     limit: int | None = Field(default=None, ge=1)
+    sampling: Literal["auto", "stratified", "sequential"] = "auto"
+    judge: ProviderSelection | None = None
 
 
 def create_app(
@@ -361,12 +366,12 @@ def create_app(
 
     @app.get("/api/v1/health")
     def health() -> dict[str, Any]:
-        trace = memory.verify_trace()
+        storage_ready = memory.store.is_ready()
         return {
-            "status": "ready" if trace.valid else "degraded",
+            "status": "ready" if storage_ready else "degraded",
             "version": MemoryEngine.VERSION,
             "store_path": memory.store_path,
-            "trace_valid": trace.valid,
+            "storage_ready": storage_ready,
             "pending_jobs": len(memory.list_jobs(status="pending")),
         }
 
@@ -383,7 +388,7 @@ def create_app(
             "embedding_model": model_status.configuration.embedding.model,
             "completion_configured": memory.completion is not None,
             "model_configuration": model_status.model_dump(mode="json"),
-            "trace": memory.verify_trace().model_dump(mode="json"),
+            "storage_ready": memory.store.is_ready(),
         }
 
     @app.get("/api/v1/check", dependencies=admin_auth)
@@ -486,14 +491,13 @@ def create_app(
 
     @app.get("/api/v1/metrics", dependencies=admin_auth)
     def metrics() -> dict[str, Any]:
-        verification = memory.verify_trace()
         job_counts = {
             status: len(memory.list_jobs(status=status, limit=500))
             for status in ("pending", "running", "completed", "failed")
         }
         return {
-            "trace_deltas": verification.delta_count,
-            "trace_valid": verification.valid,
+            "trace_deltas": memory.store.delta_count(),
+            "storage_ready": memory.store.is_ready(),
             "episode_recall_views": len(memory.store.episode_recall_views()),
             "jobs": job_counts,
         }
@@ -1301,6 +1305,8 @@ def _execute_benchmark(
                 output_root=storage_root / request.benchmark / "runs",
                 mode=request.mode,
                 model_configuration=model_configuration,
+                sampling=request.sampling,
+                judge_selection=request.judge,
             )
             with lock:
                 jobs[job_id].update(status="completed", summary=summary)
@@ -1313,6 +1319,8 @@ def _execute_benchmark(
             output_root=storage_root / request.benchmark / "runs",
             mode=request.mode,
             model_configuration=model_configuration,
+            sampling=request.sampling,
+            judge_selection=request.judge,
         )
         with lock:
             jobs[job_id].update(status="completed", summary=summary)

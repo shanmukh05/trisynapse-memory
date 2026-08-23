@@ -9,9 +9,9 @@ from trisynapse_memory.adapters.agent_events import capture_agent_event
 from trisynapse_memory.api import create_app
 from trisynapse_memory.cli import app
 from trisynapse_memory.engine import MemoryEngine
-from trisynapse_memory.engine.loaders import load_document
+from trisynapse_memory.engine.formation.sources import load_document
 from trisynapse_memory.engine.models import MemoryNamespace
-from trisynapse_memory.engine.providers import ProviderSettings, completion_from_settings, embedder_from_settings
+from trisynapse_memory.engine.providers.registry import ProviderSettings, completion_from_settings, embedder_from_settings
 
 
 class DeterministicEmbedder:
@@ -69,7 +69,7 @@ def test_namespaces_isolate_reads_and_search(tmp_path) -> None:
         raise AssertionError("cross-namespace get must be hidden")
 
 
-def test_privacy_lifecycle_and_remove_remain_verifiable(tmp_path) -> None:
+def test_lifecycle_and_remove_remain_consistent_without_content_filtering(tmp_path) -> None:
     engine = engine_at(tmp_path)
     namespace = MemoryNamespace(project_id="private")
     original = engine.add(
@@ -79,12 +79,12 @@ def test_privacy_lifecycle_and_remove_remain_verifiable(tmp_path) -> None:
         source_ref={"authorization": "Bearer abcdefghijklmnopqrstuvwxyz"},
         scope={"metadata": {"client_secret": "also-super-secret"}},
     )
-    assert "super-secret-value" not in original.text
-    assert "never store this" not in original.text
-    assert original.privacy_scope["redacted"] is True
+    assert "super-secret-value" in original.text
+    assert "never store this" in original.text
+    assert original.privacy_scope == {}
     serialized = original.model_dump_json()
-    assert "abcdefghijklmnopqrstuvwxyz" not in serialized
-    assert "also-super-secret" not in serialized
+    assert "abcdefghijklmnopqrstuvwxyz" in serialized
+    assert "also-super-secret" in serialized
 
     correction = engine.correct(delta_id=original.id, text="Use the credential vault instead.", namespace=namespace)
     history = engine.history(original.id, namespace=namespace)
@@ -94,9 +94,9 @@ def test_privacy_lifecycle_and_remove_remain_verifiable(tmp_path) -> None:
     result = engine.remove(delta_ids=[original.id], reason="credential incident", namespace=namespace)
     removed = engine.get(original.id, namespace=namespace, include_retracted=True)
     assert removed.text == "[REMOVED]"
-    assert result.old_root_hash != result.new_root_hash
+    assert result.removed_delta_ids == [original.id]
     assert engine.store.episode_recall_views(namespace=namespace) == []
-    assert engine.verify_trace().valid is True
+    assert engine.validate_store().ok is True
 
 
 def test_jobs_survive_reopen_and_process(tmp_path) -> None:
@@ -165,7 +165,7 @@ def test_pdf_loader_and_backup_restore(tmp_path) -> None:
     archive = engine.backup(tmp_path / "memory-backup.zip")
     engine.close()
     restored = MemoryEngine.restore_backup(archive, tmp_path / "restored")
-    assert restored.verify_trace().valid
+    assert restored.validate_store().ok
     assert restored.list(namespace=namespace).items[0].text == "The restore check keeps this evidence."
 
 

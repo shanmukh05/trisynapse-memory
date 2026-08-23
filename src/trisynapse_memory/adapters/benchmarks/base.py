@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from trisynapse_memory.engine import MemoryEngine
-from trisynapse_memory.engine.models import MemoryNamespace, MemoryQueryResult
+from trisynapse_memory.engine.models import MemoryNamespace, MemoryQueryResult, SearchHit
 
 
 @dataclass(frozen=True)
@@ -73,7 +73,10 @@ class BenchmarkAdapter(ABC):
         self,
         question: BenchmarkQuestion,
         result: MemoryQueryResult,
+        *,
+        retrieval_hits: list[SearchHit] | None = None,
     ) -> dict[str, Any]:
         """Return dataset-specific evidence metrics for one answer."""
 
+        del result, retrieval_hits
         return dict(question.metadata)

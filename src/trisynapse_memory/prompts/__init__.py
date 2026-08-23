@@ -23,9 +23,9 @@ class PromptSpec:
 
 
 _PROMPTS: dict[str, tuple[str, str]] = {
-    "extraction": ("extraction-v1", "extraction.md"),
+    "extraction": ("extraction-v2", "extraction.md"),
     "episode_recall": ("episode-recall-v1", "episode_recall.md"),
-    "answer": ("answer-v1", "answer.md"),
+    "answer": ("answer-v2", "answer.md"),
     "benchmark_judge": ("benchmark-judge-v1", "benchmark_judge.md"),
     "image_extraction": ("image-extraction-v1", "image_extraction.md"),
 }

@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from trisynapse_memory.engine.models import Actor, MemoryDelta, MemoryNamespace
-from trisynapse_memory.engine.trace import SQLiteTraceStore
+from trisynapse_memory.engine.trace.store import SQLiteTraceStore
 from trisynapse_memory.prompts import load_prompt
 
 
@@ -21,7 +21,6 @@ def ingest_observation(
     source_ref: dict[str, Any] | str | None = None,
     locator: dict[str, Any] | str | None = None,
     scope: dict[str, Any] | None = None,
-    privacy_scope: dict[str, Any] | None = None,
     external_key: str | None = None,
     actor: Actor | dict[str, Any] | None = None,
     modality: str = "text",
@@ -41,7 +40,6 @@ def ingest_observation(
         source_ref=source_ref,
         locator=locator,
         scope=scope,
-        privacy_scope=privacy_scope,
         external_key=external_key,
         actor=actor,
         namespace=namespace,
@@ -79,7 +77,15 @@ def ingest_document(
             external_key=f"document:{document_id}:chunk:{index}:{hashlib.sha256(chunk.encode()).hexdigest()[:16]}",
             modality="document",
             namespace=namespace,
-            payload_extra=payload_extra,
+            payload_extra={
+                **(payload_extra or {}),
+                "source_type": "document",
+                "retrieval_fields": {
+                    "title": title or document_id,
+                    "section": f"chunk {index}",
+                    "content": chunk,
+                },
+            },
         )
         for index, chunk in enumerate(chunks)
     ]
@@ -99,7 +105,17 @@ def extract_episode(
     if not observations:
         raise KeyError(f"episode has no observations: {episode_id}")
     timestamp = next((item.observed_at for item in observations if item.observed_at), None)
-    prompt = f"Episode: {episode_id}\nTimestamp: {timestamp or 'unknown'}\n\n" + "\n".join(item.text for item in observations)
+    prompt_lines = []
+    for item in observations:
+        prompt_lines.append(
+            "[observation_id={identifier} observed_at={observed} locator={locator}] {text}".format(
+                identifier=item.id,
+                observed=item.observed_at or "unknown",
+                locator=item.locator or "unknown",
+                text=item.text,
+            )
+        )
+    prompt = f"Episode: {episode_id}\nEpisode timestamp: {timestamp or 'unknown'}\n\n" + "\n".join(prompt_lines)
     extraction_prompt = load_prompt("extraction")
     payload = complete_json(extraction_prompt.text, prompt)
     facts = payload.get("facts") or []
@@ -110,14 +126,17 @@ def extract_episode(
         text = str(fact.get("text") or "").strip()
         if not text:
             continue
-        temporal = _resolve_temporal(fact.get("temporal_expression"), timestamp)
+        evidence = _fact_evidence(fact, observations)
+        evidence_time = next((item.observed_at for item in evidence if item.observed_at), timestamp)
+        temporal = _resolve_temporal(fact.get("temporal_expression"), evidence_time)
+        primary = evidence[0]
         result.append(
             store.append(
                 kind="extraction",
                 text=text,
                 episode_id=episode_id,
-                observed_at=timestamp,
-                evidence_refs=[item.id for item in observations],
+                observed_at=evidence_time,
+                evidence_refs=[item.id for item in evidence],
                 subject=_optional(fact.get("subject")),
                 relation=_optional(fact.get("relation")),
                 object=_optional(fact.get("object")),
@@ -131,7 +150,17 @@ def extract_episode(
                 ),
                 namespace=observations[0].namespace,
                 scope=observations[0].scope,
+                source_ref=primary.source_ref,
+                locator=primary.locator,
                 payload={
+                    "modality": primary.payload.get("modality", "text"),
+                    "source_type": primary.payload.get("source_type", primary.payload.get("modality", "text")),
+                    "retrieval_fields": {
+                        **(primary.payload.get("retrieval_fields") or {}),
+                        "subject": _optional(fact.get("subject")) or "",
+                        "relation": _optional(fact.get("relation")) or "",
+                        "object": _optional(fact.get("object")) or "",
+                    },
                     "generation": {
                         "provider": getattr(getattr(complete_json, "settings", None), "provider", "custom"),
                         "model": getattr(complete_json, "model", None),
@@ -142,6 +171,56 @@ def extract_episode(
             )
         )
     return result
+
+
+def _fact_evidence(fact: dict[str, Any], observations: list[MemoryDelta]) -> list[MemoryDelta]:
+    """Resolve model evidence IDs and provide a narrow legacy fallback.
+
+    New extraction prompts require immutable observation IDs. Older/custom
+    completion providers may omit them, so we select the smallest set of
+    observations with direct lexical support instead of assigning an entire
+    episode to every fact.
+    """
+
+    by_id = {item.id: item for item in observations}
+    supplied = fact.get("evidence_ids")
+    if supplied is not None:
+        if not isinstance(supplied, list):
+            raise ValueError("extraction fact evidence_ids must be a list")
+        unknown = [str(value) for value in supplied if str(value) not in by_id]
+        if unknown:
+            raise ValueError(f"extraction fact referenced unknown observation IDs: {unknown}")
+        selected = [by_id[str(value)] for value in supplied]
+        if selected:
+            return list({item.id: item for item in selected}.values())
+
+    fact_text = " ".join(
+        str(fact.get(key) or "")
+        for key in ("subject", "relation", "object", "text", "temporal_expression")
+    )
+    wanted = _evidence_tokens(fact_text)
+    ranked: list[tuple[float, MemoryDelta]] = []
+    for observation in observations:
+        available = _evidence_tokens(observation.text)
+        overlap = len(wanted & available) / max(len(wanted), 1)
+        ranked.append((overlap, observation))
+    ranked.sort(key=lambda item: (item[0], -item[1].seq), reverse=True)
+    best = ranked[0][0]
+    if best <= 0:
+        return [observations[0]]
+    return [item for score, item in ranked[:3] if score >= max(0.12, best * 0.72)]
+
+
+def _evidence_tokens(text: str) -> set[str]:
+    stop = {
+        "the", "a", "an", "and", "or", "to", "of", "in", "on", "for",
+        "is", "was", "are", "it", "that", "this", "with", "from", "has",
+        "had", "have",
+    }
+    return {
+        token for token in re.findall(r"[a-z0-9']+", text.lower())
+        if len(token) > 2 and token not in stop
+    }
 
 
 def chunk_document(text: str, *, chunk_chars: int) -> list[str]:
