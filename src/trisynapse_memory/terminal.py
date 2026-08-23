@@ -17,6 +17,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     Checkbox,
@@ -467,6 +468,9 @@ class MemoryTerminal(App[None]):
         self._operation_label: str | None = None
         self._operation_started_at = 0.0
         self._spinner_index = 0
+        self._operation_status: Static | None = None
+        self._operation_timer: Timer | None = None
+        self._panel_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="header"):
@@ -506,9 +510,10 @@ class MemoryTerminal(App[None]):
         )
         self.query_one("#prompt", Input).focus()
         self._update_config_view()
-        self.set_interval(0.1, self._animate_operation)
+        self._operation_status = self.query_one("#operation-status", Static)
+        self._operation_timer = self.set_interval(0.1, self._animate_operation)
         self._refresh_panels()
-        self.set_interval(2.5, self._refresh_panels)
+        self._panel_timer = self.set_interval(2.5, self._refresh_panels)
 
     def on_resize(self) -> None:
         brand = self.query_one("#brand", Static)
@@ -518,6 +523,11 @@ class MemoryTerminal(App[None]):
         )
 
     def on_unmount(self) -> None:
+        if self._operation_timer is not None:
+            self._operation_timer.stop()
+        if self._panel_timer is not None:
+            self._panel_timer.stop()
+        self._operation_status = None
         self.engine.close()
 
     def action_clear(self) -> None:
@@ -606,7 +616,9 @@ class MemoryTerminal(App[None]):
         self._animate_operation()
 
     def _animate_operation(self) -> None:
-        status = self.query_one("#operation-status", Static)
+        status = self._operation_status
+        if status is None or not status.is_mounted:
+            return
         if not self._operation_label:
             status.update("")
             return
