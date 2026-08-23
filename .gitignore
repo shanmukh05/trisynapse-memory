@@ -19,5 +19,5 @@ var/
 !.env.example
 design_docs/
 data/
-# docs/local/
+docs/local/
 .cursor/
