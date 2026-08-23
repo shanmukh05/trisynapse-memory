@@ -15,6 +15,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
 from textual.timer import Timer
@@ -527,6 +528,7 @@ class MemoryTerminal(App[None]):
             self._operation_timer.stop()
         if self._panel_timer is not None:
             self._panel_timer.stop()
+        self.workers.cancel_group(self, "panel-refresh")
         self._operation_status = None
         self.engine.close()
 
@@ -660,10 +662,17 @@ class MemoryTerminal(App[None]):
         self.call_from_thread(self._panels_loaded, sources, trace, jobs)
 
     def _panels_loaded(self, sources: list[Any], trace: Any, jobs: list[Any]) -> None:
-        self._render_sources(sources)
-        self._render_trace(trace.items)
-        self._render_jobs(jobs)
-        self._update_config_view()
+        try:
+            self._render_sources(sources)
+            self._render_trace(trace.items)
+            self._render_jobs(jobs)
+            self._update_config_view()
+        except NoMatches:
+            # App.query_one() is scoped to the active screen. A panel worker may
+            # finish while a modal owns that screen or while the app is being
+            # unmounted, so the main-screen inspector widgets are temporarily
+            # unavailable. The next scheduled refresh will render them.
+            return
 
     def _render_sources(self, sources: list[Any]) -> None:
         log = self.query_one("#sources-log", RichLog)
