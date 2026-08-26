@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="${TRISYNAPSE_MEMORY_VERSION:-0.1.2}"
+VERSION="${TRISYNAPSE_MEMORY_VERSION:-0.1.3}"
 PACKAGE="trisynapse-memory[all]==$VERSION"
 METADATA_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/trisynapse-memory"
 

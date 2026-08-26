@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Version = if ($env:TRISYNAPSE_MEMORY_VERSION) { $env:TRISYNAPSE_MEMORY_VERSION } else { "0.1.2" }
+$Version = if ($env:TRISYNAPSE_MEMORY_VERSION) { $env:TRISYNAPSE_MEMORY_VERSION } else { "0.1.3" }
 $Package = "trisynapse-memory[all]==$Version"
 $StateRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME ".local\state" }
 $MetadataDir = Join-Path $StateRoot "trisynapse-memory"
