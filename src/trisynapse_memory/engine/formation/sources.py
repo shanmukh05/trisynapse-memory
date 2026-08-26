@@ -93,6 +93,9 @@ class PreparedChunk:
     text: str
     locator: dict[str, Any]
     metadata: dict[str, Any] = field(default_factory=dict)
+    modality: str | None = None
+    source_type: str | None = None
+    retrieval_fields: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,19 @@ class PreparedSource:
 
 class SourceError(ValueError):
     pass
+
+
+class BuiltinSourceHandler:
+    """Compatibility handler retaining all current bounded source behavior."""
+
+    name = "builtin.sources"
+    kinds = ("text", "file", "url", "git", "directory", "archive", "image")
+
+    def accepts(self, source: SourceInput) -> bool:
+        return source.kind in self.kinds
+
+    def prepare(self, source: SourceInput, context: Any) -> PreparedSource:
+        return prepare_source(source, getattr(context, "completion", None))
 
 
 def load_document(path: str | Path) -> LoadedDocument:

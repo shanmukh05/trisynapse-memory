@@ -33,6 +33,7 @@ from trisynapse_memory.engine.models import (
     StoreValidation,
 )
 from trisynapse_memory.engine.retrieval.contracts import RetrievalDocument
+from trisynapse_memory.engine.extensions import ExtensionState, RecallRecord
 from trisynapse_memory.engine.utils import bm25_term_score
 from trisynapse_memory.engine.retrieval.tokenization import LEXICAL_TOKENIZER_VERSION, lexical_tokens
 
@@ -175,6 +176,36 @@ class SQLiteTraceStore:
                 payload_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_recall_scope ON recall_cache(view_type, scope_ref);
+
+            CREATE TABLE IF NOT EXISTS recall_records (
+                channel_id TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                namespace_key TEXT NOT NULL,
+                evidence_version INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                fields_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                stale INTEGER NOT NULL DEFAULT 0,
+                producer_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(channel_id, record_id, namespace_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_recall_records_channel
+                ON recall_records(namespace_key, channel_id, active, updated_at);
+
+            CREATE TABLE IF NOT EXISTS extension_state (
+                extension_id TEXT PRIMARY KEY,
+                installed_version TEXT NOT NULL,
+                engine_api TEXT NOT NULL,
+                storage_revision INTEGER NOT NULL,
+                last_projected_seq INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS embedding_cache (
                 text_hash TEXT NOT NULL,
@@ -911,6 +942,12 @@ class SQLiteTraceStore:
         row = self._connection.execute("SELECT COALESCE(MAX(seq), 0) AS value FROM deltas").fetchone()
         return int(row["value"])
 
+    def namespaces(self) -> list[MemoryNamespace]:
+        rows = self._connection.execute(
+            "SELECT DISTINCT namespace_json FROM deltas ORDER BY namespace_json"
+        ).fetchall()
+        return [MemoryNamespace.model_validate(json.loads(row["namespace_json"])) for row in rows]
+
     def delta_count(self) -> int:
         row = self._connection.execute("SELECT COUNT(*) AS value FROM deltas").fetchone()
         return int(row["value"])
@@ -1055,6 +1092,16 @@ class SQLiteTraceStore:
                 )
                 cursor.execute("DELETE FROM embedding_cache")
                 cursor.execute("DELETE FROM recall_cache")
+                affected_recall_ids = self._dependent_delta_ids_uncommitted(cursor, targets)
+                affected_placeholders = ",".join("?" for _ in affected_recall_ids)
+                cursor.execute(
+                    f"""DELETE FROM recall_records
+                        WHERE EXISTS (
+                            SELECT 1 FROM json_each(recall_records.evidence_refs_json)
+                            WHERE json_each.value IN ({affected_placeholders})
+                        )""",
+                    affected_recall_ids,
+                )
                 cursor.execute(
                     f"DELETE FROM retrieval_terms WHERE delta_id IN ({placeholders})",
                     targets,
@@ -1255,6 +1302,193 @@ class SQLiteTraceStore:
             views = [view for view in views if all(getattr(view.namespace, key) == value for key, value in requested.items())]
         return views
 
+    def put_recall_record(self, record: RecallRecord) -> None:
+        """Upsert one extension-owned Recall record in core-managed storage."""
+
+        namespace_key = _namespace_sql_key(record.namespace)
+        with self._lock:
+            values = self._recall_record_values(record, namespace_key)
+            self._connection.execute(self._recall_record_upsert_sql(), values)
+            self._connection.commit()
+
+    def _recall_record_values(
+        self, record: RecallRecord, namespace_key: str
+    ) -> tuple[Any, ...]:
+        evidence_refs = tuple(dict.fromkeys(record.evidence_refs))
+        if not evidence_refs:
+            raise ValueError("recall records require at least one evidence reference")
+        rows = self._connection.execute(
+            f"SELECT id,namespace_json,text FROM deltas WHERE id IN ({','.join('?' for _ in evidence_refs)})",
+            list(evidence_refs),
+        ).fetchall()
+        if len(rows) != len(evidence_refs):
+            found = {str(row["id"]) for row in rows}
+            raise ValueError(f"recall record has unknown evidence: {sorted(set(evidence_refs) - found)}")
+        if any(_namespace_sql_key(json.loads(row["namespace_json"])) != namespace_key for row in rows):
+            raise ValueError("recall record evidence must belong to the record namespace")
+        if any(row["text"] == "[REMOVED]" for row in rows):
+            raise ValueError("recall record cannot reference removed evidence")
+        now = datetime.now(timezone.utc).isoformat()
+        return (
+            record.channel_id, record.record_id, namespace_key, record.evidence_version,
+            record.text, _json(dict(record.fields)), _json(dict(record.metadata)),
+            _json(evidence_refs), int(record.active), int(record.stale),
+            record.producer_version, now, now,
+        )
+
+    @staticmethod
+    def _recall_record_upsert_sql() -> str:
+        return """INSERT INTO recall_records(
+                      channel_id,record_id,namespace_key,evidence_version,text,fields_json,
+                      metadata_json,evidence_refs_json,active,stale,producer_version,created_at,updated_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT(channel_id,record_id,namespace_key) DO UPDATE SET
+                      evidence_version=excluded.evidence_version,text=excluded.text,
+                      fields_json=excluded.fields_json,metadata_json=excluded.metadata_json,
+                      evidence_refs_json=excluded.evidence_refs_json,active=excluded.active,
+                      stale=excluded.stale,producer_version=excluded.producer_version,
+                      updated_at=excluded.updated_at"""
+
+    def replace_recall_records(
+        self,
+        channel_id: str,
+        namespace: MemoryNamespace | dict[str, Any],
+        records: Iterable[RecallRecord],
+    ) -> None:
+        namespace_key = _namespace_sql_key(namespace)
+        values = list(records)
+        for record in values:
+            if record.channel_id != channel_id:
+                raise ValueError("replacement record channel does not match target channel")
+        with self._lock:
+            rows = [self._recall_record_values(record, namespace_key) for record in values]
+            cursor = self._connection.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute(
+                    "DELETE FROM recall_records WHERE channel_id=? AND namespace_key=?",
+                    (channel_id, namespace_key),
+                )
+                cursor.executemany(self._recall_record_upsert_sql(), rows)
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def recall_records(
+        self,
+        channel_id: str,
+        namespace: MemoryNamespace | dict[str, Any],
+        *,
+        search: str | None = None,
+        cursor: int = 0,
+        limit: int = 200,
+        active_only: bool = True,
+    ) -> tuple[list[RecallRecord], int]:
+        namespace_model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+        clauses = ["channel_id=?", "namespace_key=?"]
+        params: list[Any] = [channel_id, _namespace_sql_key(namespace_model)]
+        if active_only:
+            clauses.append("active=1")
+        if search:
+            clauses.append("(LOWER(text) LIKE ? OR LOWER(fields_json) LIKE ?)")
+            needle = f"%{search.lower()}%"
+            params.extend((needle, needle))
+        where = " AND ".join(clauses)
+        total = int(self._connection.execute(
+            f"SELECT COUNT(*) AS n FROM recall_records WHERE {where}", params
+        ).fetchone()["n"])
+        rows = self._connection.execute(
+            f"""SELECT * FROM recall_records WHERE {where}
+                ORDER BY updated_at DESC,record_id LIMIT ? OFFSET ?""",
+            [*params, limit, cursor],
+        ).fetchall()
+        return [
+            RecallRecord(
+                channel_id=str(row["channel_id"]), record_id=str(row["record_id"]),
+                namespace=namespace_model, evidence_version=int(row["evidence_version"]),
+                text=str(row["text"]), evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
+                fields=json.loads(row["fields_json"]), metadata=json.loads(row["metadata_json"]),
+                active=bool(row["active"]), stale=bool(row["stale"]),
+                producer_version=str(row["producer_version"]),
+            )
+            for row in rows
+        ], total
+
+    def recall_channel_counts(
+        self, namespace: MemoryNamespace | dict[str, Any]
+    ) -> dict[str, dict[str, int]]:
+        rows = self._connection.execute(
+            """SELECT channel_id,COUNT(*) AS total,
+                      SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) AS active,
+                      SUM(CASE WHEN stale=1 THEN 1 ELSE 0 END) AS stale
+               FROM recall_records WHERE namespace_key=? GROUP BY channel_id""",
+            (_namespace_sql_key(namespace),),
+        ).fetchall()
+        return {
+            str(row["channel_id"]): {
+                "count": int(row["active"] or 0),
+                "total": int(row["total"] or 0),
+                "stale": int(row["stale"] or 0),
+            }
+            for row in rows
+        }
+
+    def put_extension_state(self, state: ExtensionState) -> None:
+        self._connection.execute(
+            """INSERT INTO extension_state(
+                   extension_id,installed_version,engine_api,storage_revision,
+                   last_projected_seq,status,last_error,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(extension_id) DO UPDATE SET
+                   installed_version=excluded.installed_version,
+                   engine_api=excluded.engine_api,storage_revision=excluded.storage_revision,
+                   last_projected_seq=excluded.last_projected_seq,status=excluded.status,
+                   last_error=excluded.last_error,updated_at=excluded.updated_at""",
+            (
+                state.extension_id, state.installed_version, state.engine_api,
+                state.storage_revision, state.last_projected_seq, state.status,
+                state.last_error, datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self._connection.commit()
+
+    def extension_states(self) -> list[ExtensionState]:
+        return [
+            ExtensionState(
+                extension_id=str(row["extension_id"]),
+                installed_version=str(row["installed_version"]),
+                engine_api=str(row["engine_api"]),
+                storage_revision=int(row["storage_revision"]),
+                last_projected_seq=int(row["last_projected_seq"]),
+                status=str(row["status"]),
+                last_error=row["last_error"],
+            )
+            for row in self._connection.execute(
+                "SELECT * FROM extension_state ORDER BY extension_id"
+            ).fetchall()
+        ]
+
+    @staticmethod
+    def _dependent_delta_ids_uncommitted(
+        cursor: Any, target_ids: Iterable[str]
+    ) -> list[str]:
+        """Return the transitive evidence dependency closure for Recall cleanup."""
+
+        affected = set(target_ids)
+        rows = cursor.execute("SELECT id,evidence_refs_json FROM deltas").fetchall()
+        changed = True
+        while changed:
+            changed = False
+            for row in rows:
+                item_id = str(row["id"])
+                if item_id in affected:
+                    continue
+                if affected & set(json.loads(row["evidence_refs_json"])):
+                    affected.add(item_id)
+                    changed = True
+        return sorted(affected)
+
     def _index_delta_uncommitted(self, cursor: Any, delta: MemoryDelta) -> None:
         """Incrementally maintain disposable lexical/document/graph indexes."""
 
@@ -1273,6 +1507,16 @@ class SQLiteTraceStore:
                 cursor.execute(
                     f"DELETE FROM retrieval_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
                     [*targets, *targets],
+                )
+                affected_recall_ids = self._dependent_delta_ids_uncommitted(cursor, targets)
+                affected_placeholders = ",".join("?" for _ in affected_recall_ids)
+                cursor.execute(
+                    f"""UPDATE recall_records SET active=0,stale=1
+                        WHERE EXISTS (
+                            SELECT 1 FROM json_each(recall_records.evidence_refs_json)
+                            WHERE json_each.value IN ({affected_placeholders})
+                        )""",
+                    affected_recall_ids,
                 )
             return
         if delta.kind not in {"observation", "extraction"} or not delta.text or delta.text == "[REMOVED]":

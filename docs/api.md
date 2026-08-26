@@ -112,6 +112,115 @@ memory = MemoryEngine.open("./memory", query_planner=ProductPlanner())
 
 Implement `RetrievalRoute.name` and `rank(plan, context)`, then add the instance to a `RouteRegistry`. Pass the registry as `retrieval_routes=`. Custom routes return `(item_id, score)` pairs and still go through fusion, confidence checks, Trace grounding, and context limits.
 
+`RetrievalRoute` is the compatibility API for ranking items already present in the built-in candidate index. Use an extension pack when an algorithm needs its own source kind, Formation processor, Recall records, or candidates.
+
+### Extension packs
+
+Extensions are trusted, explicitly supplied Python objects. They are validated and frozen before the engine starts; Trisynapse does not discover or download executable plugins automatically.
+
+```python
+from trisynapse_memory import (
+    BranchResult,
+    ExtensionSpec,
+    MemoryEngine,
+    RecallChannelSpec,
+    RecallRecord,
+    RetrievalBranchSpec,
+    RetrievalCandidate,
+)
+
+class EntityProfiles:
+    spec = RecallChannelSpec(id="example.entities", title="Entity profiles")
+
+    def project(self, batch, writer):
+        evidence = [item for item in batch.deltas if item.kind == "extraction"]
+        if evidence:
+            writer.put(
+                "project-atlas",
+                "Project Atlas entity profile",
+                [item.id for item in evidence],
+                evidence_version=batch.evidence_version,
+                fields={"entity": "Project Atlas"},
+            )
+
+    def rebuild(self, trace, writer):
+        evidence = trace.deltas(kinds=("extraction",))
+        records = [] if not evidence else [RecallRecord(
+            channel_id=self.spec.id,
+            record_id="project-atlas",
+            namespace=trace.namespace,
+            evidence_version=trace.seq_cutoff or 0,
+            text="Project Atlas entity profile",
+            evidence_refs=tuple(item.id for item in evidence),
+            fields={"entity": "Project Atlas"},
+        )]
+        writer.replace(records)
+
+class EntityProfileBranch:
+    spec = RetrievalBranchSpec(
+        name="example.entity_profiles",
+        depends_on=("bm25",),
+        default_weight=1.2,
+    )
+
+    def retrieve(self, plan, context):
+        records, _ = context.recall.records("example.entities", search="atlas", limit=20)
+        return BranchResult(
+            branch=self.spec.name,
+            candidates=tuple(
+                RetrievalCandidate(
+                    id=record.record_id,
+                    branch=self.spec.name,
+                    channel_id=record.channel_id,
+                    kind="recall",
+                    score=1.0,
+                    text=record.text,
+                    evidence_delta_ids=record.evidence_refs,
+                )
+                for record in records
+            ),
+        )
+
+class EntityExtension:
+    spec = ExtensionSpec(
+        id="example.entity_extension",
+        version="0.1.0",
+        engine_api=">=1,<2",
+        storage_revision=1,
+    )
+
+    def register(self, registry):
+        registry.recall_channels.register(EntityProfiles())
+        registry.retrieval_branches.register(EntityProfileBranch())
+
+memory = MemoryEngine.open("./memory", extensions=[EntityExtension()])
+```
+
+Enable the new branch by adding `example.entity_profiles` to `RetrievalConfiguration.enabled_routes`. Its default weight comes from `RetrievalBranchSpec`; a stored `route_weights` value overrides it.
+
+Branch dependencies are selected transitively. `max_candidates` defaults to 200 and `timeout_ms` to 5,000; exceptions and timeouts are recorded in the Query Run while healthy branches continue to fusion.
+
+The main extension contracts exported from `trisynapse_memory` are:
+
+| Contract | Purpose |
+|---|---|
+| `SourceHandler` | Accept and safely prepare a custom `SourceInput.kind`. |
+| `FormationProcessor` / `ProposedDelta` | Produce core-validated, evidence-linked extraction or annotation deltas through durable jobs. |
+| `RecallChannel` / `TraceReader` / `RecallWriter` | Project and atomically rebuild records in namespace-scoped, core-owned storage. |
+| `RetrievalBranch` / `RetrievalCandidate` | Return bounded Trace or Recall candidates with active evidence references. |
+| `FusionStrategy` | Replace weighted RRF explicitly. |
+| `CandidateReranker` | Replace the default semantic/reliability/recency post-fusion ordering. |
+
+`PreparedChunk` from a custom source handler may set `modality`, `source_type`, and `retrieval_fields`; this bypasses the built-in source descriptor mapping while preserving core Trace validation. Custom source kinds are strings rather than a closed enum.
+
+Formation and Recall components are scheduled after an episode commits. Their job kinds are namespaced (`formation:<name>` and `recall:<channel>:project`). Optional component failure does not roll back committed Trace. The catalog reports registered channels, branches, extension versions, projection status, dependencies, and cost tiers.
+
+A persistent Recall channel must implement `rebuild(trace, writer)`. When an installed extension's `storage_revision` changes, opening the store marks it `rebuild_required` and enqueues `extension:<id>:rebuild`. Run the normal worker with `run_jobs()`, or explicitly call `rebuild_extension(id, wait=True)`. Rebuild reads active Trace through a namespace-scoped `TraceReader` and should finish with `writer.replace(records)` so the channel switches atomically.
+
+Recall candidates never enter answer context directly. Each must include active, same-namespace `evidence_delta_ids`; the retriever validates them and grounds back to observation or extraction deltas. Retraction disables dependent generic Recall records, and physical removal deletes them.
+
+`MemoryEngine.open` also accepts `fusion_strategy=` and `candidate_reranker=` for retrieval experiments. Existing `query_planner=` and `retrieval_routes=` arguments remain supported.
+
 Applications with a model-specific local tokenizer can also supply context accounting:
 
 ```python
@@ -331,7 +440,7 @@ The graph and Memory Viewer inspection routes are:
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/api/v1/memory/catalog` | Trace + Recall helpers + retrieval routes (id, kind, health, inspect path) |
+| `GET` | `/api/v1/memory/catalog` | Trace + Recall helpers, retrieval branches, and extension status/health |
 | `GET` | `/api/v1/memory/overview` | Catalog-aligned counts and health |
 | `GET` | `/api/v1/memory/helpers/{id}` | Generic paginated `items[]` for any helper, including unknown ids |
 | `GET` | `/api/v1/memory/documents` | Paginated `retrieval_documents` |

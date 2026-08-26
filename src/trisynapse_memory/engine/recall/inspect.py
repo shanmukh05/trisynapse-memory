@@ -9,6 +9,7 @@ import numpy as np
 from trisynapse_memory.engine.models import (
     CompiledClaim,
     MemoryCatalog,
+    MemoryCatalogExtension,
     MemoryCatalogHelper,
     MemoryCatalogRoute,
     MemoryDocumentPage,
@@ -28,6 +29,7 @@ from trisynapse_memory.engine.models import (
     VectorProjectionPoint,
 )
 from trisynapse_memory.engine.providers.registry import embedding_cache_key
+from trisynapse_memory.engine.extensions import InspectRequest, RecallReader
 from trisynapse_memory.engine.recall.catalog import BUILTIN_RECALL_HELPERS, builtin_helper_ids, helper_spec
 from trisynapse_memory.engine.recall.compilation import compile_claims
 from trisynapse_memory.engine.retrieval.contracts import DEFAULT_ROUTE_WEIGHTS, RouteRegistry, route_weights
@@ -83,7 +85,27 @@ def memory_catalog(engine: Any, namespace: MemoryNamespace) -> MemoryCatalog:
             count=count_by_id.get(spec.id, 0),
             health=health_by_id.get(spec.id, {}),
         ))
-    known = builtin_helper_ids()
+    channel_counts = engine.store.recall_channel_counts(namespace)
+    channels = getattr(getattr(engine, "extensions", None), "recall_channels", None)
+    if channels is not None:
+        reader = RecallReader(engine.store, namespace)
+        for channel in channels.channels:
+            health = channel_counts.get(channel.spec.id, {"count": 0, "total": 0, "stale": 0})
+            if callable(getattr(channel, "health", None)):
+                try:
+                    health = {**health, **dict(channel.health(reader))}
+                except Exception as exc:
+                    health = {**health, "status": "degraded", "error": str(exc)[:500]}
+            helpers.append(MemoryCatalogHelper(
+                id=channel.spec.id,
+                title=channel.spec.title,
+                kind=channel.spec.kind,
+                inspect_path=f"/api/v1/memory/helpers/{channel.spec.id}",
+                playground_seed=channel.spec.playground_seed,
+                count=int(health.get("count", 0)),
+                health=health,
+            ))
+    known = builtin_helper_ids() | ({*channels.names} if channels is not None else set())
     for view_type, extra_count in engine.store.recall_view_type_counts(namespace).items():
         if view_type in known or view_type == "episode_recall":
             continue
@@ -108,7 +130,58 @@ def memory_catalog(engine: Any, namespace: MemoryNamespace) -> MemoryCatalog:
         )
         for name in registry.names
     ]
-    return MemoryCatalog(helpers=helpers, retrieval_routes=routes)
+    branches = getattr(getattr(engine, "extensions", None), "retrieval_branches", None)
+    if branches is not None:
+        extension_states = {
+            state.extension_id: state for state in engine.store.extension_states()
+        }
+        for branch in branches.branches:
+            profile_weight = branch.spec.profile_weights.get(configuration.retrieval_profile)
+            owner = engine.extensions.owner("retrieval", branch.spec.name)
+            state = extension_states.get(owner) if owner else None
+            available = state is None or state.status == "available"
+            routes.append(MemoryCatalogRoute(
+                name=branch.spec.name,
+                title=branch.spec.title or branch.spec.name.replace("_", " "),
+                enabled=branch.spec.name in enabled,
+                weight=float(configuration.route_weights.get(
+                    branch.spec.name,
+                    profile_weight if profile_weight is not None else branch.spec.default_weight,
+                )),
+                dependencies=list(branch.spec.depends_on),
+                cost_tier=branch.spec.cost_tier,
+                available=available,
+            ))
+    known_route_names = {route.name for route in routes}
+    configured_route_names = list(configuration.enabled_routes) + list(
+        configuration.route_weights
+    )
+    for name in dict.fromkeys(configured_route_names):
+        if name in known_route_names:
+            continue
+        routes.append(MemoryCatalogRoute(
+            name=name,
+            title=name.replace("_", " "),
+            enabled=name in enabled,
+            weight=float(configuration.route_weights.get(name, 1.0)),
+            available=False,
+        ))
+    specs = getattr(getattr(engine, "extensions", None), "extensions", {})
+    states = {state.extension_id: state for state in engine.store.extension_states()}
+    extensions = []
+    for extension_id in sorted(set(specs) | set(states)):
+        spec = specs.get(extension_id)
+        state = states.get(extension_id)
+        extensions.append(MemoryCatalogExtension(
+            id=extension_id,
+            version=spec.version if spec else state.installed_version,
+            engine_api=spec.engine_api if spec else state.engine_api,
+            storage_revision=spec.storage_revision if spec else state.storage_revision,
+            status=state.status if spec and state else "unavailable" if spec is None else "available",
+            last_projected_seq=state.last_projected_seq if state else 0,
+            last_error=state.last_error if state else None,
+        ))
+    return MemoryCatalog(helpers=helpers, retrieval_routes=routes, extensions=extensions)
 
 
 def helper_items(
@@ -120,6 +193,43 @@ def helper_items(
     cursor: str | None = None,
     limit: int = 50,
 ) -> MemoryHelperPage:
+    channels = getattr(getattr(engine, "extensions", None), "recall_channels", None)
+    channel = channels.get(helper_id) if channels is not None else None
+    if channel is not None:
+        reader = RecallReader(engine.store, namespace)
+        if callable(getattr(channel, "inspect", None)):
+            return channel.inspect(
+                InspectRequest(search=search, cursor=cursor, limit=limit),
+                reader,
+            )
+        offset = int(cursor or 0)
+        records, total = reader.records(helper_id, search=search, cursor=offset, limit=limit)
+        items = [
+            MemoryHelperItem(
+                id=record.record_id,
+                helper_id=helper_id,
+                kind="recall",
+                title=record.text[:160] or record.record_id,
+                excerpt=record.text[:400],
+                status="stale" if record.stale else "active",
+                data={
+                    "fields": dict(record.fields),
+                    "metadata": dict(record.metadata),
+                    "evidence_refs": list(record.evidence_refs),
+                    "evidence_version": record.evidence_version,
+                    "producer_version": record.producer_version,
+                },
+            )
+            for record in records
+        ]
+        next_cursor = offset + limit if offset + limit < total else None
+        return MemoryHelperPage(
+            helper_id=helper_id,
+            kind=channel.spec.kind,
+            items=items,
+            next_cursor=str(next_cursor) if next_cursor is not None else None,
+            truncated=next_cursor is not None,
+        )
     spec = helper_spec(helper_id)
     offset = int(cursor or 0)
     if helper_id == "trace":

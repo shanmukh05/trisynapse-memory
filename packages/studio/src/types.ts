@@ -5,7 +5,7 @@ export type Namespace = {
   session_id?: string | null;
 };
 
-export type SourceKind = "text" | "file" | "directory" | "archive" | "git" | "url" | "image";
+export type SourceKind = "text" | "file" | "directory" | "archive" | "git" | "url" | "image" | (string & {});
 
 export type Source = {
   id: string;
@@ -215,11 +215,15 @@ export type CatalogRoute = {
   title: string;
   enabled: boolean;
   weight: number;
+  available?: boolean;
+  dependencies?: string[];
+  cost_tier?: string;
 };
 
 export type MemoryCatalog = {
   helpers: CatalogHelper[];
   retrieval_routes: CatalogRoute[];
+  extensions?: Array<{ id: string; version: string; engine_api: string; storage_revision: number; status: string; last_projected_seq: number; last_error?: string | null }>;
 };
 
 export type HelperItem = {

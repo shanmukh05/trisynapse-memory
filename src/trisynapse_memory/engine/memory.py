@@ -85,9 +85,24 @@ from trisynapse_memory.engine.retrieval.engine import HybridRetriever, Retriever
 from trisynapse_memory.engine.retrieval.contracts import QueryPlanner, RouteRegistry
 from trisynapse_memory.engine.trace.store import SQLiteTraceStore
 from trisynapse_memory.engine.retrieval.tokenization import TokenCounter, token_counter_for
-from trisynapse_memory.engine.formation.sources import PreparedChunk, PreparedSource, prepare_source, store_blob
+from trisynapse_memory.engine.formation.sources import BuiltinSourceHandler, PreparedChunk, PreparedSource, store_blob
 from trisynapse_memory.engine.recall.vector_cache import VectorCache, preferred_vector_cache
 from trisynapse_memory.prompts import load_prompt
+from trisynapse_memory.engine.extensions import (
+    EngineExtensionRegistry,
+    ExtensionState,
+    CandidateReranker,
+    FormationContext,
+    FormationEvent,
+    FusionStrategy,
+    MemoryExtension,
+    ProposedDelta,
+    RecallWriter,
+    SourcePreparationContext,
+    TraceReader,
+    TraceChangeBatch,
+    WeightedRRFFusion,
+)
 from trisynapse_memory.engine.utils import __version__
 
 CompletionJSON = Callable[[str, str], dict[str, Any]]
@@ -130,6 +145,9 @@ class MemoryEngine:
         retrieval_routes: RouteRegistry | None = None,
         token_counter: TokenCounter | None = None,
         vector_cache: VectorCache | None = None,
+        extension_registry: EngineExtensionRegistry | None = None,
+        fusion_strategy: FusionStrategy | None = None,
+        candidate_reranker: CandidateReranker | None = None,
         default_namespace: MemoryNamespace | dict[str, Any] | None = None,
         auto_process: bool = True,
         _managed_completion: bool = False,
@@ -148,6 +166,9 @@ class MemoryEngine:
         self._token_counter_override = token_counter is not None
         self.token_counter = token_counter or token_counter_for(completion)
         self.vector_cache = vector_cache or preferred_vector_cache(store)
+        self.extensions = extension_registry or _build_extension_registry(())
+        self.fusion_strategy = fusion_strategy or WeightedRRFFusion()
+        self.candidate_reranker = candidate_reranker
         self.snapshot = SnapshotManager(store)
         self.default_namespace = _namespace(default_namespace)
         self.auto_process = auto_process
@@ -166,6 +187,10 @@ class MemoryEngine:
         embedding_model: str = "all-MiniLM-L6-v2",
         local_files_only: bool = False,
         vector_cache: VectorCache | None = None,
+        extensions: Iterable[MemoryExtension] = (),
+        extension_registry: EngineExtensionRegistry | None = None,
+        fusion_strategy: FusionStrategy | None = None,
+        candidate_reranker: CandidateReranker | None = None,
         query_planner: QueryPlanner | None = None,
         retrieval_routes: RouteRegistry | None = None,
         token_counter: TokenCounter | None = None,
@@ -210,11 +235,21 @@ class MemoryEngine:
             except ProviderError as exc:
                 provider_errors["completion"] = str(exc)
                 completion_callable = None
+        legacy_names = retrieval_routes.names if retrieval_routes else RouteRegistry().names
+        if extension_registry is not None:
+            if tuple(extensions):
+                raise ValueError("pass extensions or extension_registry, not both")
+            registry = _finalize_extension_registry(extension_registry, legacy_names)
+        else:
+            registry = _build_extension_registry(extensions, legacy_route_names=legacy_names)
         engine = cls(
             store,
             embedder=provider,
             completion=completion_callable,
             vector_cache=vector_cache,
+            extension_registry=registry,
+            fusion_strategy=fusion_strategy,
+            candidate_reranker=candidate_reranker,
             query_planner=query_planner,
             retrieval_routes=retrieval_routes,
             token_counter=token_counter,
@@ -225,6 +260,7 @@ class MemoryEngine:
             _provider_errors=provider_errors,
         )
         engine._sync_model_configuration(force=True)
+        engine._sync_extension_state()
         return engine
 
     @classmethod
@@ -749,8 +785,12 @@ class MemoryEngine:
         self.store.put_ingestion_run(run)
         prepared: dict[int, PreparedSource] = {}
         failures: dict[int, str] = {}
+        source_context = SourcePreparationContext(completion=self.completion)
         with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 4, len(inputs)))) as pool:
-            futures = {pool.submit(prepare_source, item, self.completion): index for index, item in enumerate(inputs)}
+            futures = {
+                pool.submit(self.extensions.source_handlers.prepare, item, source_context): index
+                for index, item in enumerate(inputs)
+            }
             for prepared_count, future in enumerate(as_completed(futures), 1):
                 index = futures[future]
                 try:
@@ -1313,6 +1353,21 @@ class MemoryEngine:
             self.retriever_config,
             planner=self.query_planner,
             routes=self.retrieval_routes,
+            branches=self.extensions.retrieval_branches,
+            fusion_strategy=self.fusion_strategy,
+            reranker=self.candidate_reranker,
+            unavailable_branches={
+                name
+                for name in self.extensions.retrieval_branches.names
+                if (
+                    (owner := self.extensions.owner("retrieval", name)) is not None
+                    and (state := next(
+                        (item for item in self.store.extension_states() if item.extension_id == owner),
+                        None,
+                    )) is not None
+                    and state.status != "available"
+                )
+            },
             token_counter=self.token_counter,
         )
         started = time.perf_counter()
@@ -2111,6 +2166,45 @@ class MemoryEngine:
     def list_jobs(self, *, status: str | None = None, limit: int = 100) -> list[MemoryJob]:
         return self.store.list_jobs(status=status, limit=limit)
 
+    def rebuild_extension(self, extension_id: str, *, wait: bool = False) -> MemoryJob:
+        spec = self.extensions.extensions.get(extension_id)
+        if spec is None:
+            raise KeyError(f"extension is not installed: {extension_id}")
+        kind = f"extension:{extension_id}:rebuild"
+        if self.extensions.job_handlers.get(kind) is None:
+            raise ValueError(f"extension has no persistent Recall channels: {extension_id}")
+        evidence_version = self.store.max_seq()
+        job = self.store.enqueue_job(
+            kind,
+            {"extension_id": extension_id, "evidence_version": evidence_version},
+            dedup_key=(
+                f"extension-rebuild:{extension_id}:{spec.storage_revision}:"
+                f"{evidence_version}"
+            ),
+        )
+        previous = next(
+            (item for item in self.store.extension_states() if item.extension_id == extension_id),
+            None,
+        )
+        self.store.put_extension_state(ExtensionState(
+            extension_id=extension_id,
+            installed_version=spec.version,
+            engine_api=spec.engine_api,
+            storage_revision=spec.storage_revision,
+            last_projected_seq=previous.last_projected_seq if previous else 0,
+            status="rebuild_required",
+        ))
+        if wait:
+            for _ in range(1000):
+                current = self.store.get_job(job.id)
+                if current is None or current.status in {"completed", "failed"}:
+                    break
+                self.run_jobs(max_jobs=1)
+            current = self.store.get_job(job.id)
+            if current is not None:
+                return current
+        return job
+
     def run_jobs(self, *, max_jobs: int = 100) -> list[MemoryJob]:
         self._sync_model_configuration()
         completed: list[MemoryJob] = []
@@ -2119,25 +2213,11 @@ class MemoryEngine:
             if job is None:
                 break
             try:
-                namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
-                episode_id = str(job.payload.get("episode_id") or "")
-                if job.kind == "extract_episode":
-                    if self.completion is None:
-                        raise RuntimeError("no completion provider is configured")
-                    self.run_extraction(episode_id=episode_id, namespace=namespace)
-                elif job.kind == "compile_episode":
-                    self.build_episode_recall([episode_id], namespace=namespace)
-                elif job.kind == "rebuild_embeddings":
-                    selection = ProviderSelection.model_validate(job.payload["embedding"])
-                    target_embedder = embedder_from_settings(settings_from_selection(selection))
-                    self._prewarm_embedding_cache(target_embedder)
-                    self.store.activate_pending_embedding(job.id)
-                    self._sync_model_configuration(force=True)
-                elif job.kind == "execute_query":
-                    self.execute_query_run(str(job.payload["query_id"]))
+                self.extensions.job_handlers.run(self, job)
                 completed.append(self.store.finish_job(job.id))
             except Exception as exc:
                 finished = self.store.finish_job(job.id, error=str(exc))
+                self._record_extension_job_failure(job, str(exc))
                 if job.kind == "rebuild_embeddings" and finished.status == "failed":
                     self.store.fail_pending_embedding(job.id, str(exc))
                 if job.kind == "execute_query":
@@ -2149,6 +2229,95 @@ class MemoryEngine:
                         self.store.put_query_run(run)
                 completed.append(finished)
         return completed
+
+    def _record_extension_job_failure(self, job: MemoryJob, error: str) -> None:
+        if job.kind.startswith("formation:"):
+            capability, name = "formation", job.kind.removeprefix("formation:")
+        elif job.kind.startswith("recall:") and job.kind.endswith(":project"):
+            capability, name = "recall", job.kind.removeprefix("recall:").removesuffix(":project")
+        elif job.kind.startswith("extension:") and job.kind.endswith(":rebuild"):
+            extension_id = job.kind.removeprefix("extension:").removesuffix(":rebuild")
+            spec = self.extensions.extensions.get(extension_id)
+            if spec is None:
+                return
+            previous = next(
+                (state for state in self.store.extension_states() if state.extension_id == extension_id),
+                None,
+            )
+            self.store.put_extension_state(ExtensionState(
+                extension_id=extension_id,
+                installed_version=spec.version,
+                engine_api=spec.engine_api,
+                storage_revision=spec.storage_revision,
+                last_projected_seq=previous.last_projected_seq if previous else 0,
+                status="degraded",
+                last_error=error[:1000],
+            ))
+            return
+        else:
+            return
+        owner = self.extensions.owner(capability, name)
+        if owner is None:
+            return
+        spec = self.extensions.extensions[owner]
+        previous = next(
+            (state for state in self.store.extension_states() if state.extension_id == owner),
+            None,
+        )
+        self.store.put_extension_state(ExtensionState(
+            extension_id=owner,
+            installed_version=spec.version,
+            engine_api=spec.engine_api,
+            storage_revision=spec.storage_revision,
+            last_projected_seq=previous.last_projected_seq if previous else 0,
+            status="degraded",
+            last_error=error[:1000],
+        ))
+
+    def _record_extension_success(
+        self, capability: str, name: str, evidence_version: int
+    ) -> None:
+        owner = self.extensions.owner(capability, name)
+        if owner is None:
+            return
+        spec = self.extensions.extensions[owner]
+        self.store.put_extension_state(ExtensionState(
+            extension_id=owner,
+            installed_version=spec.version,
+            engine_api=spec.engine_api,
+            storage_revision=spec.storage_revision,
+            last_projected_seq=evidence_version,
+            status="available",
+        ))
+
+    def _sync_extension_state(self) -> None:
+        existing = {state.extension_id: state for state in self.store.extension_states()}
+        for extension_id, spec in self.extensions.extensions.items():
+            previous = existing.get(extension_id)
+            status = "available"
+            has_persistent_recall = any(
+                channel.spec.persistent
+                and self.extensions.owner("recall", channel.spec.id) == extension_id
+                for channel in self.extensions.recall_channels.channels
+            )
+            revision_changed = bool(
+                previous
+                and previous.storage_revision != spec.storage_revision
+                and has_persistent_recall
+            )
+            if revision_changed:
+                status = "rebuild_required"
+            self.store.put_extension_state(ExtensionState(
+                extension_id=extension_id,
+                installed_version=spec.version,
+                engine_api=spec.engine_api,
+                storage_revision=spec.storage_revision,
+                last_projected_seq=previous.last_projected_seq if previous else 0,
+                status=status,
+                last_error=previous.last_error if previous and status != "available" else None,
+            ))
+            if revision_changed:
+                self.rebuild_extension(extension_id)
 
     def _sync_model_configuration(self, *, force: bool = False) -> None:
         configuration = self.store.get_model_configuration()
@@ -2258,9 +2427,216 @@ class MemoryEngine:
         self.store.enqueue_job(
             "compile_episode", payload, dedup_key=f"compile:{namespace_key}:{episode_id}:{evidence_version}"
         )
+        event = FormationEvent(
+            name="episode_committed",
+            episode_id=episode_id,
+            namespace=namespace,
+            evidence_version=evidence_version,
+        )
+        for processor in self.extensions.formation_processors.scheduled(event):
+            self.store.enqueue_job(
+                f"formation:{processor.spec.name}",
+                {**payload, "processor": processor.spec.name, "evidence_version": evidence_version},
+                dedup_key=f"formation:{processor.spec.name}:{namespace_key}:{episode_id}:{evidence_version}",
+                max_attempts=processor.spec.max_attempts,
+            )
+        for channel in self.extensions.recall_channels.channels:
+            if not callable(getattr(channel, "project", None)):
+                continue
+            self.store.enqueue_job(
+                f"recall:{channel.spec.id}:project",
+                {**payload, "channel_id": channel.spec.id, "evidence_version": evidence_version},
+                dedup_key=f"recall:{channel.spec.id}:{namespace_key}:{episode_id}:{evidence_version}",
+            )
         should_process = process if process is not None else self.auto_process
         if should_process:
             self.run_jobs()
+
+def _build_extension_registry(
+    extensions: Iterable[MemoryExtension],
+    *,
+    legacy_route_names: Iterable[str] = (),
+) -> EngineExtensionRegistry:
+    registry = EngineExtensionRegistry()
+    for extension in extensions:
+        registry.register_extension(extension)
+    return _finalize_extension_registry(registry, legacy_route_names)
+
+
+def _finalize_extension_registry(
+    registry: EngineExtensionRegistry,
+    legacy_route_names: Iterable[str],
+) -> EngineExtensionRegistry:
+    if registry.frozen:
+        return registry
+    if "builtin.sources" not in registry.source_handlers.names:
+        registry.source_handlers.register(BuiltinSourceHandler())
+    for kind, handler in (
+        ("extract_episode", _job_extract_episode),
+        ("compile_episode", _job_compile_episode),
+        ("rebuild_embeddings", _job_rebuild_embeddings),
+        ("execute_query", _job_execute_query),
+    ):
+        if kind not in registry.job_handlers.names:
+            registry.job_handlers.register(handler, kind=kind)
+    for name in registry.formation_processors.names:
+        kind = f"formation:{name}"
+        if kind not in registry.job_handlers.names:
+            registry.job_handlers.register(_job_formation_processor, kind=kind)
+    for channel_id in registry.recall_channels.names:
+        channel = registry.recall_channels.get(channel_id)
+        if channel is not None and callable(getattr(channel, "project", None)):
+            kind = f"recall:{channel_id}:project"
+            if kind not in registry.job_handlers.names:
+                registry.job_handlers.register(_job_recall_projection, kind=kind)
+    for extension_id in registry.extensions:
+        if any(
+            channel.spec.persistent
+            and registry.owner("recall", channel.spec.id) == extension_id
+            for channel in registry.recall_channels.channels
+        ):
+            registry.job_handlers.register(
+                _job_extension_rebuild,
+                kind=f"extension:{extension_id}:rebuild",
+            )
+    registry.validate_and_freeze(legacy_route_names)
+    return registry
+
+
+def _job_extract_episode(engine: MemoryEngine, job: MemoryJob) -> None:
+    if engine.completion is None:
+        raise RuntimeError("no completion provider is configured")
+    namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
+    engine.run_extraction(
+        episode_id=str(job.payload.get("episode_id") or ""), namespace=namespace
+    )
+
+
+def _job_compile_episode(engine: MemoryEngine, job: MemoryJob) -> None:
+    namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
+    engine.build_episode_recall(
+        [str(job.payload.get("episode_id") or "")], namespace=namespace
+    )
+
+
+def _job_rebuild_embeddings(engine: MemoryEngine, job: MemoryJob) -> None:
+    selection = ProviderSelection.model_validate(job.payload["embedding"])
+    target_embedder = embedder_from_settings(settings_from_selection(selection))
+    engine._prewarm_embedding_cache(target_embedder)
+    engine.store.activate_pending_embedding(job.id)
+    engine._sync_model_configuration(force=True)
+
+
+def _job_execute_query(engine: MemoryEngine, job: MemoryJob) -> None:
+    engine.execute_query_run(str(job.payload["query_id"]))
+
+
+def _job_formation_processor(engine: MemoryEngine, job: MemoryJob) -> None:
+    name = str(job.payload.get("processor") or job.kind.removeprefix("formation:"))
+    processor = engine.extensions.formation_processors.get(name)
+    if processor is None:
+        raise RuntimeError(f"formation processor is unavailable: {name}")
+    namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
+    episode_id = str(job.payload.get("episode_id") or "")
+    evidence = engine.store.list_deltas(
+        kinds=processor.spec.input_kinds,
+        namespace=namespace,
+        episode_prefix=episode_id,
+        include_retracted=False,
+    )
+    proposed = processor.process(evidence, FormationContext(
+        namespace=namespace,
+        episode_id=episode_id,
+        evidence_version=int(
+            job.payload.get("evidence_version") or engine.store.max_seq()
+        ),
+        completion=engine.completion,
+    ))
+    available = {item.id: item for item in evidence}
+    for item in proposed:
+        if not isinstance(item, ProposedDelta):
+            raise TypeError(f"formation processor {name} returned a non-ProposedDelta value")
+        if item.kind not in processor.spec.output_kinds:
+            raise ValueError(f"formation processor {name} returned disallowed kind {item.kind}")
+        if not item.evidence_refs or any(ref not in available for ref in item.evidence_refs):
+            raise ValueError(f"formation processor {name} returned invalid evidence references")
+        primary = available[item.evidence_refs[0]]
+        engine.store.append(
+            kind=item.kind,
+            text=item.text,
+            episode_id=episode_id,
+            evidence_refs=item.evidence_refs,
+            confidence=item.confidence,
+            subject=item.subject,
+            relation=item.relation,
+            object=item.object,
+            temporal_anchor=item.temporal_anchor,
+            actor=Actor(type="formation_pipeline", id=name),
+            namespace=namespace,
+            scope=primary.scope,
+            payload={**dict(item.payload), "producer": name},
+            source_ref=item.source_ref if item.source_ref is not None else primary.source_ref,
+            locator=item.locator if item.locator is not None else primary.locator,
+            external_key=item.external_key,
+        )
+    engine._record_extension_success(
+        "formation",
+        name,
+        int(job.payload.get("evidence_version") or engine.store.max_seq()),
+    )
+
+
+def _job_recall_projection(engine: MemoryEngine, job: MemoryJob) -> None:
+    channel_id = str(job.payload.get("channel_id") or "")
+    channel = engine.extensions.recall_channels.get(channel_id)
+    if channel is None:
+        raise RuntimeError(f"recall channel is unavailable: {channel_id}")
+    namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
+    episode_id = str(job.payload.get("episode_id") or "")
+    evidence_version = int(job.payload.get("evidence_version") or engine.store.max_seq())
+    deltas = engine.store.list_deltas(
+        namespace=namespace,
+        episode_prefix=episode_id or None,
+        seq_cutoff=evidence_version,
+        include_retracted=False,
+    )
+    batch = TraceChangeBatch(
+        deltas=tuple(deltas),
+        namespace=namespace,
+        evidence_version=evidence_version,
+        episode_id=episode_id or None,
+    )
+    writer = RecallWriter(engine.store, channel.spec, namespace)
+    channel.project(batch, writer)
+    engine._record_extension_success("recall", channel_id, evidence_version)
+
+
+def _job_extension_rebuild(engine: MemoryEngine, job: MemoryJob) -> None:
+    extension_id = str(job.payload.get("extension_id") or "")
+    spec = engine.extensions.extensions.get(extension_id)
+    if spec is None:
+        raise RuntimeError(f"extension is unavailable: {extension_id}")
+    evidence_version = int(job.payload.get("evidence_version") or engine.store.max_seq())
+    channels = [
+        channel
+        for channel in engine.extensions.recall_channels.channels
+        if channel.spec.persistent
+        and engine.extensions.owner("recall", channel.spec.id) == extension_id
+    ]
+    namespaces = engine.store.namespaces() or [engine.default_namespace]
+    for namespace in namespaces:
+        reader = TraceReader(engine.store, namespace, seq_cutoff=evidence_version)
+        for channel in channels:
+            channel.rebuild(reader, RecallWriter(engine.store, channel.spec, namespace))
+    engine.store.put_extension_state(ExtensionState(
+        extension_id=extension_id,
+        installed_version=spec.version,
+        engine_api=spec.engine_api,
+        storage_revision=spec.storage_revision,
+        last_projected_seq=evidence_version,
+        status="available",
+    ))
+
 
 def _answer_prompt(question: str, hits: list[Any]) -> str:
     query_kind = classify_query(question)
@@ -2291,6 +2667,13 @@ def _source_retrieval_descriptor(
     chunk: PreparedChunk,
 ) -> tuple[str, str, dict[str, Any]]:
     """Map every accepted source to generic modality and searchable fields."""
+
+    if chunk.modality:
+        return (
+            chunk.modality,
+            chunk.source_type or prepared.kind,
+            dict(chunk.retrieval_fields),
+        )
 
     locator = chunk.locator
     chunk_kind = str(locator.get("kind") or "")

@@ -10,8 +10,9 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -48,6 +49,18 @@ from trisynapse_memory.engine.retrieval.tokenization import (
     ApproximateTokenCounter,
     TokenCounter,
     lexical_tokens,
+)
+from trisynapse_memory.engine.extensions import (
+    BranchResult,
+    CandidateReranker,
+    DefaultCandidateReranker,
+    FusionStrategy,
+    RetrievalBranchRegistry,
+    RetrievalCandidate,
+    RetrievalContext,
+    RecallReader,
+    RerankContext,
+    WeightedRRFFusion,
 )
 
 def classify_query(query: str) -> str:
@@ -150,6 +163,10 @@ class HybridRetriever:
         *,
         planner: QueryPlanner | None = None,
         routes: RouteRegistry | None = None,
+        branches: RetrievalBranchRegistry | None = None,
+        fusion_strategy: FusionStrategy | None = None,
+        reranker: CandidateReranker | None = None,
+        unavailable_branches: set[str] | None = None,
         token_counter: TokenCounter | None = None,
     ) -> None:
         self.store = store
@@ -158,6 +175,10 @@ class HybridRetriever:
         self.config = config or RetrieverConfig()
         self.planner = planner or HeuristicQueryPlanner()
         self.routes = routes or RouteRegistry()
+        self.branches = branches or RetrievalBranchRegistry()
+        self.fusion_strategy = fusion_strategy or WeightedRRFFusion()
+        self.reranker = reranker or DefaultCandidateReranker()
+        self.unavailable_branches = unavailable_branches or set()
         self.token_counter = token_counter or ApproximateTokenCounter()
 
     def search(
@@ -270,6 +291,10 @@ class HybridRetriever:
             output={
                 "routes": diagnostics.get("routes", {}),
                 "query_plan": diagnostics.get("query_plan", {}),
+                "branch_errors": diagnostics.get("branch_errors", {}),
+                "unavailable_branches": diagnostics.get("unavailable_branches", []),
+                "fusion_strategy": diagnostics.get("fusion_strategy"),
+                "reranker": diagnostics.get("reranker"),
             },
             candidates=diagnostics.get("candidate_snapshots", []),
             duration_ms=(time.perf_counter() - search_started) * 1000,
@@ -303,6 +328,10 @@ class HybridRetriever:
                     "confident": confident,
                     "routes": diagnostics.get("routes", {}),
                     "query_plan": diagnostics.get("query_plan", {}),
+                    "branch_errors": diagnostics.get("branch_errors", {}),
+                    "unavailable_branches": diagnostics.get("unavailable_branches", []),
+                    "fusion_strategy": diagnostics.get("fusion_strategy"),
+                    "reranker": diagnostics.get("reranker"),
                 },
                 metrics={"top_score": diagnostics.get("top_score", 0), "margin": diagnostics.get("margin")},
                 candidates=diagnostics.get("candidate_snapshots", []),
@@ -334,6 +363,10 @@ class HybridRetriever:
                     "confident": confident,
                     "routes": diagnostics.get("routes", {}),
                     "query_lens_terms": query_lens_terms,
+                    "branch_errors": diagnostics.get("branch_errors", {}),
+                    "unavailable_branches": diagnostics.get("unavailable_branches", []),
+                    "fusion_strategy": diagnostics.get("fusion_strategy"),
+                    "reranker": diagnostics.get("reranker"),
                 },
                 metrics={"top_score": diagnostics.get("top_score", 0), "margin": diagnostics.get("margin")},
                 candidates=diagnostics.get("candidate_snapshots", []),
@@ -523,37 +556,122 @@ class HybridRetriever:
         )
         enabled = self.routes.enabled(plan.routes)
         rankings: dict[str, list[tuple[str, float]]] = {}
-        for route in enabled:
-            if route.name == "graph":
-                continue
-            rankings[route.name] = route.rank(plan, context)
-        context.seed_ids = list(dict.fromkeys(
-            [item_id for item_id, _ in rankings.get("bm25", [])[: self.config.graph_seed_top]]
-            + [item_id for item_id, _ in rankings.get("semantic", [])[: self.config.graph_seed_top]]
-        ))
-        for route in enabled:
-            if route.name == "graph":
+        pending_routes = list(enabled)
+        while pending_routes:
+            ready = [
+                route for route in pending_routes
+                if set(getattr(route, "depends_on", ())).issubset(rankings)
+            ]
+            if not ready:
+                # A disabled dependency produces an empty expansion rather than
+                # silently changing the remaining independent rankings.
+                ready = list(pending_routes)
+            context.seed_ids = list(dict.fromkeys(
+                [item_id for item_id, _ in rankings.get("bm25", [])[: self.config.graph_seed_top]]
+                + [item_id for item_id, _ in rankings.get("semantic", [])[: self.config.graph_seed_top]]
+            ))
+            for route in ready:
                 rankings[route.name] = route.rank(plan, context)
-        weights = route_weights(plan.profile, self.config.route_weights)
-        fused = weighted_rrf_fuse(
-            (
-                (name, [item_id for item_id, score in ranking if score > 0])
-                for name, ranking in rankings.items()
-            ),
-            weights,
+                pending_routes.remove(route)
+
+        branch_results: dict[str, BranchResult] = {
+            name: BranchResult(
+                branch=name,
+                candidates=tuple(
+                    _candidate_from_index(name, item_id, score, index)
+                    for item_id, score in ranking
+                    if item_id in index.items
+                ),
+            )
+            for name, ranking in rankings.items()
+        }
+        branch_errors: dict[str, str] = {}
+        selected_branch_names = tuple(
+            name for name in plan.routes
+            if name in self.branches.names and name not in self.unavailable_branches
         )
-        reranked: list[tuple[str, float]] = []
-        max_fused = max(fused.values(), default=1)
-        for item_id in fused:
-            item = index.items[item_id]
-            semantic_score = cosine_similarity(query_vector, item.embedding)
-            reliability = item.confidence * (0.55 if item.stale else 1)
-            recency = 1 if item.observed_at or item.temporal_anchor else 0.5
-            score = 0.52 * semantic_score + 0.18 * reliability + 0.10 * recency + 0.20 * fused[item_id] / max_fused
-            if item.modality in plan.modalities:
-                score += 0.04
-            reranked.append((item_id, score))
-        reranked.sort(key=lambda pair: pair[1], reverse=True)
+        selected_branch_names = self._with_branch_dependencies(selected_branch_names)
+        for level in self.branches.levels(
+            selected_branch_names, already_resolved=rankings
+        ) if selected_branch_names else []:
+            for branch in level:
+                try:
+                    deadline = time.monotonic() + branch.spec.timeout_ms / 1000
+                    branch_context = RetrievalContext(
+                        namespace=index.namespace,
+                        trace_cutoff=self.store.active_seq_cutoff(),
+                        items=index.items,
+                        recall=RecallReader(self.store, index.namespace),
+                        embedder=self.embedder,
+                        token_counter=self.token_counter,
+                        prior_results=dict(branch_results),
+                        deadline=deadline,
+                    )
+                    executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix=f"retrieval-{branch.spec.name}",
+                    )
+                    future = executor.submit(branch.retrieve, plan, branch_context)
+                    try:
+                        returned = future.result(timeout=branch.spec.timeout_ms / 1000)
+                    except FutureTimeoutError as exc:
+                        future.cancel()
+                        raise TimeoutError(
+                            f"retrieval branch timed out after {branch.spec.timeout_ms} ms"
+                        ) from exc
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    result = returned if isinstance(returned, BranchResult) else BranchResult(
+                        branch=branch.spec.name, candidates=tuple(returned)
+                    )
+                    candidates = _validate_branch_candidates(
+                        branch.spec.name,
+                        result.candidates[: branch.spec.max_candidates],
+                        index,
+                        self.store,
+                    )
+                    branch_results[branch.spec.name] = BranchResult(
+                        branch=branch.spec.name,
+                        candidates=tuple(candidates),
+                        diagnostics=result.diagnostics,
+                    )
+                    rankings[branch.spec.name] = [
+                        (_materialize_candidate(candidate, index), candidate.score)
+                        for candidate in candidates
+                    ]
+                except Exception as exc:
+                    branch_errors[branch.spec.name] = str(exc)[:1000]
+                    rankings[branch.spec.name] = []
+                    branch_results[branch.spec.name] = BranchResult(
+                        branch=branch.spec.name,
+                        candidates=(),
+                        diagnostics={"error": str(exc)[:1000]},
+                    )
+        if any(item.kind == "recall_extension" and not item.embedding for item in index.items.values()):
+            self._embed_items(index.items)
+        weights = route_weights(plan.profile, self.config.route_weights)
+        for branch in self.branches.branches:
+            profile_weight = branch.spec.profile_weights.get(plan.profile)
+            weights.setdefault(
+                branch.spec.name,
+                float(profile_weight if profile_weight is not None else branch.spec.default_weight),
+            )
+        fused = dict(self.fusion_strategy.fuse(
+            {
+                name: [item_id for item_id, score in ranking if score > 0]
+                for name, ranking in rankings.items()
+            },
+            weights,
+        ))
+        reranked = self.reranker.rerank(
+            plan,
+            list(fused.items()),
+            RerankContext(
+                items=index.items,
+                query_vector=query_vector,
+                semantic=cosine_similarity,
+            ),
+        )
         grounded, routing_seeds, drilled_count = _ground_trace(
             query,
             query_vector,
@@ -621,8 +739,33 @@ class HybridRetriever:
                 for name, ranking in rankings.items()
                 for snapshot in _route_snapshots(name, ranking, index)
             ],
+            "branch_errors": branch_errors,
+            "unavailable_branches": sorted(
+                set(plan.routes) & self.unavailable_branches
+            ),
+            "fusion_strategy": self.fusion_strategy.name,
+            "reranker": self.reranker.name,
         }
         return hits, diagnostics
+
+    def _with_branch_dependencies(self, selected: Iterable[str]) -> tuple[str, ...]:
+        names = list(dict.fromkeys(selected))
+        seen = set(names)
+        cursor = 0
+        while cursor < len(names):
+            branch = self.branches.get(names[cursor])
+            cursor += 1
+            if branch is None:
+                continue
+            for dependency in branch.spec.depends_on:
+                if (
+                    dependency in self.branches.names
+                    and dependency not in self.unavailable_branches
+                    and dependency not in seen
+                ):
+                    seen.add(dependency)
+                    names.append(dependency)
+        return tuple(names)
 
     def _is_confident(self, diagnostics: dict[str, Any], hits: list[SearchHit], *, relaxed: bool = False) -> bool:
         if not hits:
@@ -632,6 +775,89 @@ class HybridRetriever:
         top = diagnostics.get("top_score") or 0
         agreement = _evidence_agrees(hits[:5])
         return top > 0.12 and (margin >= threshold or agreement or len(hits) == 1) and all(hit.kind != "episode_recall" for hit in hits)
+
+
+def _candidate_from_index(
+    branch: str,
+    item_id: str,
+    score: float,
+    index: _Index,
+) -> RetrievalCandidate:
+    item = index.items[item_id]
+    is_trace = item.kind in {"observation", "extraction"}
+    return RetrievalCandidate(
+        id=item_id,
+        branch=branch,
+        score=float(score),
+        kind="trace" if is_trace else "recall",
+        evidence_delta_ids=(item_id,) if is_trace else tuple(item.source_delta_ids),
+        text=item.text,
+        source_ref=item.source_ref,
+        locator=item.locator,
+        metadata={"kind": item.kind, "modality": item.modality},
+    )
+
+
+def _validate_branch_candidates(
+    branch: str,
+    candidates: Sequence[RetrievalCandidate],
+    index: _Index,
+    store: SQLiteTraceStore,
+) -> list[RetrievalCandidate]:
+    del store  # Index is already scoped to the active Trace snapshot.
+    result: list[RetrievalCandidate] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, RetrievalCandidate):
+            raise TypeError(f"retrieval branch {branch} returned a non-RetrievalCandidate value")
+        if candidate.branch != branch:
+            raise ValueError(f"retrieval branch {branch} returned a candidate for {candidate.branch}")
+        if candidate.score <= 0:
+            continue
+        evidence = tuple(dict.fromkeys(candidate.evidence_delta_ids))
+        if not evidence or any(
+            item_id not in index.items
+            or index.items[item_id].kind not in {"observation", "extraction"}
+            for item_id in evidence
+        ):
+            raise ValueError(f"retrieval branch {branch} returned invalid active evidence")
+        if candidate.kind == "trace" and len(evidence) != 1:
+            raise ValueError("Trace candidates must identify exactly one evidence delta")
+        if candidate.kind == "recall" and not candidate.text:
+            raise ValueError("Recall candidates require routing text")
+        canonical = candidate.canonical_id
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        result.append(candidate)
+    return result
+
+
+def _materialize_candidate(candidate: RetrievalCandidate, index: _Index) -> str:
+    if candidate.kind == "trace":
+        return candidate.evidence_delta_ids[0]
+    item_id = candidate.canonical_id
+    metadata = dict(candidate.metadata)
+    fields = {
+        str(key): str(value)
+        for key, value in (metadata.get("fields") or {}).items()
+        if value is not None
+    }
+    index.items[item_id] = _Item(
+        id=item_id,
+        kind="recall_extension",
+        text=candidate.text or "",
+        index_text=candidate.text or "",
+        confidence=float(metadata.get("confidence", 0.8)),
+        source_delta_ids=list(candidate.evidence_delta_ids),
+        source_ref=candidate.source_ref,
+        locator=candidate.locator,
+        modality=str(metadata.get("modality") or "text"),
+        source_type=str(metadata.get("source_type") or candidate.channel_id or "recall"),
+        fields=fields,
+        stale=bool(metadata.get("stale", False)),
+    )
+    return item_id
 
 
 def _snapshot(hit: SearchHit, route: str, rank: int) -> QueryCandidateSnapshot:
@@ -708,7 +934,10 @@ def _ground_trace(
     token_counter: TokenCounter,
 ) -> tuple[list[str], list[str], int]:
     ordered = [item_id for item_id, _ in reranked]
-    routing_seeds = [item_id for item_id in ordered if index.items[item_id].kind in {"episode_recall", "compiled"}][:5]
+    routing_seeds = [
+        item_id for item_id in ordered
+        if index.items[item_id].kind in {"episode_recall", "compiled", "recall_extension"}
+    ][:5]
     trace_ids = {
         item_id
         for item_id in ordered[: max(12, context_limit)]
@@ -722,7 +951,7 @@ def _ground_trace(
             for item_id in routing_item.source_delta_ids
             if item_id in index.items and index.items[item_id].kind in {"observation", "extraction"}
         ]
-        if routing_item.kind == "compiled":
+        if routing_item.kind in {"compiled", "recall_extension"}:
             trace_ids.update(item.id for item in source_items)
         else:
             # Episode Recall chooses a region; only its best matching Trace

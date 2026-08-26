@@ -425,7 +425,7 @@ class RemoveRequest(EngineModel):
     namespace: MemoryNamespace | None = None
 
 
-SourceKind = Literal["text", "file", "directory", "archive", "git", "url", "image"]
+SourceKind = str
 
 
 class SourceInput(EngineModel):
@@ -568,11 +568,25 @@ class MemoryCatalogRoute(EngineModel):
     title: str
     enabled: bool = True
     weight: float = 1.0
+    available: bool = True
+    dependencies: list[str] = Field(default_factory=list)
+    cost_tier: str = "local"
+
+
+class MemoryCatalogExtension(EngineModel):
+    id: str
+    version: str
+    engine_api: str
+    storage_revision: int = 0
+    status: str = "available"
+    last_projected_seq: int = 0
+    last_error: str | None = None
 
 
 class MemoryCatalog(EngineModel):
     helpers: list[MemoryCatalogHelper] = Field(default_factory=list)
     retrieval_routes: list[MemoryCatalogRoute] = Field(default_factory=list)
+    extensions: list[MemoryCatalogExtension] = Field(default_factory=list)
 
 
 class MemoryHelperItem(EngineModel):
@@ -668,7 +682,7 @@ class VectorNeighbors(EngineModel):
 
 class MemoryJob(EngineModel):
     id: str
-    kind: Literal["extract_episode", "compile_episode", "rebuild_embeddings", "execute_query"]
+    kind: str
     status: Literal["pending", "running", "completed", "failed"] = "pending"
     payload: dict[str, Any] = Field(default_factory=dict)
     attempts: int = 0

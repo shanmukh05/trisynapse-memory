@@ -71,7 +71,7 @@ export interface QueryResult {
   retrieval_trace: RetrievalTrace;
 }
 
-export type SourceKind = "text" | "file" | "directory" | "archive" | "git" | "url" | "image";
+export type SourceKind = "text" | "file" | "directory" | "archive" | "git" | "url" | "image" | (string & {});
 
 export interface SourceInput {
   kind?: SourceKind;
@@ -545,7 +545,7 @@ export class TrisynapseMemory {
   }
 
   async getMemoryCatalog() {
-    return this.request<{ helpers: Array<{ id: string; title: string; kind: string; count: number; health: Record<string, unknown> }>; retrieval_routes: Array<{ name: string; title: string; enabled: boolean; weight: number }> }>("GET", `/api/v1/memory/catalog?${this.namespaceQuery()}`);
+    return this.request<{ helpers: Array<{ id: string; title: string; kind: string; count: number; health: Record<string, unknown> }>; retrieval_routes: Array<{ name: string; title: string; enabled: boolean; weight: number; available: boolean; dependencies: string[]; cost_tier: string }>; extensions: Array<{ id: string; version: string; engine_api: string; storage_revision: number; status: string; last_projected_seq: number; last_error?: string | null }> }>("GET", `/api/v1/memory/catalog?${this.namespaceQuery()}`);
   }
 
   async getMemoryGraphNeighbors(nodeId: string, view: MemoryGraphPage["view"] = "lineage"): Promise<MemoryGraphPage> {

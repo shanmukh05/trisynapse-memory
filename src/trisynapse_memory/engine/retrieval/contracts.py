@@ -138,8 +138,8 @@ class BM25Route:
     name = "bm25"
 
     def rank(self, plan: QueryPlan, context: RouteContext) -> list[tuple[str, float]]:
-        if context.semantic_candidates is not None:
-            return _sorted_scores(context.semantic_candidates.items())
+        if context.lexical_candidates is not None:
+            return _sorted_scores(context.lexical_candidates.items())
         return _sorted_scores(
             (item.id, context.bm25(plan.query, item.index_text))
             for item in context.items.values()
@@ -150,8 +150,8 @@ class SemanticRoute:
     name = "semantic"
 
     def rank(self, plan: QueryPlan, context: RouteContext) -> list[tuple[str, float]]:
-        if context.lexical_candidates is not None:
-            scores = dict(context.lexical_candidates)
+        if context.semantic_candidates is not None:
+            scores = dict(context.semantic_candidates)
             for item in context.items.values():
                 if item.kind in {"compiled", "episode_recall"}:
                     scores[item.id] = context.bm25(plan.query, item.index_text)
@@ -189,6 +189,7 @@ class TemporalRoute:
 
 class GraphRoute:
     name = "graph"
+    depends_on = ("bm25", "semantic")
 
     def rank(self, plan: QueryPlan, context: RouteContext) -> list[tuple[str, float]]:
         return [(item_id, score) for item_id, score, _ in context.graph_walk(context.seed_ids)]

@@ -485,6 +485,44 @@ Retrieval math has one implementation per formula. SQLite and in-memory BM25 cal
 
 Each extracted fact records the smallest supporting set of stable observation IDs. Those references flow into compiled claims, graph edges, grounding, and citations. This is why a derived fact can route efficiently without becoming a replacement for its original evidence.
 
+### Extensible pipelines
+
+The engine supports trusted, explicitly registered extension packs. A pack can contribute one or more independent capabilities instead of inheriting from one large plugin base class:
+
+```mermaid
+flowchart LR
+    E["Extension pack"] --> S["Source handler"]
+    E --> F["Formation processor"]
+    E --> C["Recall channel"]
+    E --> B["Retrieval branch"]
+    E --> U["Fusion / reranker"]
+    S --> T["Core Trace append"]
+    F --> T
+    T --> C
+    T --> B
+    C --> B
+    B --> G["Core validation + grounding"]
+    G --> T
+```
+
+Registration is frozen before the engine starts. Components receive scoped readers, writers, and model services rather than a raw SQLite connection. The core continues to own ordering, namespaces, evidence validation, context limits, retraction, physical removal, and citations.
+
+The write-side distinction remains important:
+
+- a **source handler** decodes and chunks a new `SourceInput.kind`;
+- a **Formation processor** proposes citable extraction or annotation deltas and must identify supporting evidence;
+- a **Recall channel** creates disposable records that can be rebuilt from Trace.
+
+Recall channels use a generic core-owned record store by default. Records carry a channel ID, namespace, producer/evidence version, searchable text and fields, and supporting Trace IDs. Retraction makes dependent records inactive; physical removal deletes them. Optional projections run through durable jobs and cannot roll back already committed Trace when they fail.
+
+A **retrieval branch** returns explicit `RetrievalCandidate` values rather than IDs assumed to exist in a private index. Trace candidates identify one active delta. Recall candidates include routing text and active, same-namespace evidence IDs. The core rejects invalid candidates, fuses valid branch rankings, and resolves Recall candidates back to Trace before answer context is assembled.
+
+Branch metadata declares dependencies, default/profile weights, cost tier, and a candidate limit. Dependencies form a validated acyclic graph, so Graph-like expansion no longer requires a name-specific execution switch. Weighted RRF remains the default `FusionStrategy`, and the semantic/reliability/recency ordering is an explicit replaceable `CandidateReranker`.
+
+The existing `QueryPlanner`, `RetrievalRoute`, and `RouteRegistry` APIs remain as compatibility surfaces for algorithms that rank the built-in candidate corpus. New end-to-end channels should use extension packs. The memory catalog reports extension versions/status, Recall channel health, retrieval dependencies, and active weights so Studio and external clients remain catalog-driven.
+
+The current engine loads extensions only from Python objects passed to `MemoryEngine.open(extensions=[...])`. Automatic package discovery and untrusted plugin execution are intentionally not part of this boundary.
+
 ### Query runs: the inspectable retrieval record
 
 A query does not become evidence. Instead, Trisynapse stores it in a separate, removable **Query Run** record. This keeps Trace focused on memory while still letting Studio reopen exactly how an answer was found.
@@ -596,12 +634,15 @@ flowchart TD
     DB --> J["Durable jobs + snapshots + removal audit"]
     DB --> R["Retrieval documents + BM25 terms + graph edges"]
     DB --> RC["Episode Recall + SQLite vector fallback"]
+    DB --> EX["Generic Recall records + extension state"]
     DB --> CFG["Model + retrieval configuration + provider catalog"]
     SRC --> O["Content-addressed originals and safe source packages"]
     VC --> V["Embedding tables partitioned by configuration fingerprint"]
 ```
 
 SQLite uses WAL, full synchronous writes, and secure deletion. Trace writes are serialized. Vector storage is only a cache. Backups include SQLite, source blobs, and rebuildable products.
+
+Extension storage revisions use the same Trace-first rule. A revision change disables the pack's branches, schedules a durable extension rebuild across stored namespaces, and returns the pack to `available` only after its persistent channels rebuild successfully through scoped readers and atomic writers.
 
 Source files are permission-restricted but not encrypted. Use an encrypted disk or storage layer when required.
 
@@ -614,6 +655,7 @@ public orchestrator; shared contracts and utilities remain at the engine root.
 engine/
 ├── memory.py                 public orchestration
 ├── models.py                 shared contracts
+├── extensions.py             extension packs and capability registries
 ├── utils.py                  shared numerical and version helpers
 ├── formation/                source preparation and evidence creation
 ├── trace/                    durable ordered evidence
@@ -626,6 +668,7 @@ engine/
 |---|---|---|
 | Public engine | `src/trisynapse_memory/engine/memory.py` | Lifecycle, ingestion runs, retrieval, backups |
 | Shared contracts | `engine/models.py` | Public models used across every architecture component |
+| Extension contracts | `engine/extensions.py` | Packs, source/Formation/Recall/branch registries, fusion and reranking |
 | Shared utilities | `engine/utils.py` | Runtime version lookup, NumPy cosine, shared BM25, weighted reciprocal-rank fusion |
 | Formation pipeline | `engine/formation/pipeline.py` | Observation and evidence-linked extraction writes |
 | Formation sources | `engine/formation/sources.py` | Loaders, safety rules, retained blobs, code/image/archive handling |

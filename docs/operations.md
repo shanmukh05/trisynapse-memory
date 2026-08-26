@@ -104,6 +104,18 @@ store/
 └── .api-key               local administrator key
 ```
 
+## Trusted extensions
+
+The Python engine can load explicit in-process extensions with `MemoryEngine.open(extensions=[...])`. The CLI and REST server do not scan directories, import Python entry points, or download extensions automatically. An application embedding Trisynapse is responsible for constructing the approved extension list.
+
+Treat an extension as application code, not as data. Review it before loading because source handlers and model-backed processors run in the server process. The engine narrows its data capabilities—Recall uses namespace-scoped core storage and retrieval candidates must ground to active Trace—but Python itself is not a sandbox.
+
+Extension-derived generic Recall records live in `trace.sqlite3`, so normal backup, restore, retraction, and removal workflows include them. `extension_state` records the installed version, storage revision, status, last projected Trace sequence, and last error. A missing extension remains inert and appears as unavailable in the memory catalog; its Python code is never persisted in the store.
+
+Changing a pack's `storage_revision` marks its branches unavailable and queues a durable `extension:<id>:rebuild` job. Keep the regular job worker running, or call `memory.rebuild_extension("pack.id", wait=True)` during a controlled upgrade. A successful atomic rebuild restores `available`; a final failure records `degraded` and leaves Trace readable.
+
+Before deploying an extension, run its contract tests for incremental projection versus rebuild, restart/idempotency, namespace isolation, retraction, physical removal, invalid evidence, bounded candidates, and branch failure. Specialized external sidecar indexes are not part of the first extension API because they cannot yet inherit the core backup and deletion guarantees.
+
 Blob directories use mode `0700` and files use `0600` where supported. SQLite enables `secure_delete`, WAL, and full synchronous writes. The store is **not encrypted**. Use an encrypted filesystem/volume if stored sources require encryption at rest.
 
 Trisynapse stores accepted source content, metadata, queries, and feedback as supplied. Sanitize credentials, personal data, and other sensitive values in the application before sending them to the engine or service.
