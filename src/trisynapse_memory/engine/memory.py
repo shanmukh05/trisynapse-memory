@@ -20,14 +20,19 @@ from trisynapse_memory.engine.recall.compilation import (
     build_episode_recall_views,
     compile_claims,
 )
+from trisynapse_memory.engine.recall import inspect as recall_inspect
 from trisynapse_memory.engine.providers.embedding import Embedder, SentenceTransformerEmbedder, UnavailableEmbedder
 from trisynapse_memory.engine.formation.pipeline import extract_episode, ingest_document, ingest_observation
 from trisynapse_memory.engine.models import (
     Actor,
     Citation,
+    CompiledClaim,
     EpisodeInfo,
     EpisodeRecallView,
+    MemoryCatalog,
     MemoryDelta,
+    MemoryDocumentPage,
+    MemoryHelperPage,
     MemoryHistory,
     MemoryGraphEdge,
     MemoryGraphNode,
@@ -50,6 +55,7 @@ from trisynapse_memory.engine.models import (
     RemoveResult,
     MemoryQueryResult,
     MemorySearchResult,
+    MemoryTermPage,
     RecallSnapshot,
     SnapshotDiff,
     SourceIngestionResult,
@@ -58,6 +64,8 @@ from trisynapse_memory.engine.models import (
     SourcePreviewItem,
     SourceRecord,
     StoreValidation,
+    VectorNeighbors,
+    VectorProjection,
 )
 from trisynapse_memory.engine.providers.registry import (
     EmbeddingRebuildRequired,
@@ -1189,10 +1197,11 @@ class MemoryEngine:
         query_id: str | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         on_step: Callable[[QueryStep], None] | None = None,
+        persist: bool = True,
     ) -> MemorySearchResult:
         memory_namespace = self._resolve_namespace(namespace)
         identifier = query_id or f"q_{secrets.token_hex(8)}"
-        run = self._new_query_run(identifier, "search", query, memory_namespace)
+        run = self._new_query_run(identifier, "search", query, memory_namespace, persist=persist)
         if on_step and run.steps:
             on_step(run.steps[0])
         return self._execute_search(
@@ -1202,6 +1211,7 @@ class MemoryEngine:
             scope=scope,
             finish=True,
             on_step=on_step,
+            persist=persist,
         )
 
     def query(
@@ -1241,6 +1251,7 @@ class MemoryEngine:
         namespace: MemoryNamespace,
         *,
         status: str = "running",
+        persist: bool = True,
     ) -> QueryRun:
         configuration = self.get_retrieval_configuration()
         run = QueryRun(
@@ -1259,7 +1270,8 @@ class MemoryEngine:
             )] if status == "running" else [],
             attempt=1 if status == "running" else 0,
         )
-        self.store.put_query_run(run)
+        if persist:
+            self.store.put_query_run(run)
         return run
 
     def _append_query_step(
@@ -1267,12 +1279,15 @@ class MemoryEngine:
         run: QueryRun,
         step: QueryStep,
         on_step: Callable[[QueryStep], None] | None = None,
+        *,
+        persist: bool = True,
     ) -> None:
         run.steps = [item for item in run.steps if item.id != step.id]
         run.steps.append(step)
         run.steps.sort(key=lambda item: item.sequence)
         run.updated_at = datetime.now(timezone.utc)
-        self.store.put_query_run(run)
+        if persist:
+            self.store.put_query_run(run)
         if on_step:
             on_step(step)
 
@@ -1285,6 +1300,7 @@ class MemoryEngine:
         scope: dict[str, Any] | None,
         finish: bool,
         on_step: Callable[[QueryStep], None] | None = None,
+        persist: bool = True,
     ) -> MemorySearchResult:
         self._sync_model_configuration()
         if not self._retriever_override:
@@ -1307,7 +1323,7 @@ class MemoryEngine:
             scope=self._scope(run.namespace, scope),
             namespace=run.namespace,
             query_id=run.id,
-            on_step=lambda step: self._append_query_step(run, step, on_step),
+            on_step=lambda step: self._append_query_step(run, step, on_step, persist=persist),
         )
         run.retrieval_trace = result.retrieval_trace
         if finish:
@@ -1315,7 +1331,8 @@ class MemoryEngine:
             run.completed_at = datetime.now(timezone.utc)
             run.updated_at = run.completed_at
             run.duration_ms = (time.perf_counter() - started) * 1000
-            self.store.put_query_run(run)
+            if persist:
+                self.store.put_query_run(run)
         return result
 
     def _execute_query(
@@ -1756,11 +1773,15 @@ class MemoryEngine:
         cursor: str | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> MemoryGraphPage:
-        if view not in {"knowledge", "lineage", "trace"}:
-            raise ValueError("view must be knowledge, lineage, or trace")
+        if view not in {"knowledge", "lineage", "trace", "retrieval"}:
+            raise ValueError("view must be knowledge, lineage, trace, or retrieval")
         if limit < 1 or limit > 2000:
             raise ValueError("limit must be between 1 and 2000")
         memory_namespace = self._resolve_namespace(namespace)
+        if view == "retrieval":
+            return recall_inspect.retrieval_graph_page(
+                self, memory_namespace, seed_id=source_id or episode_id, limit=limit
+            )
         deltas = self.store.list_deltas(
             namespace=memory_namespace, include_retracted=True
         )
@@ -1924,17 +1945,116 @@ class MemoryEngine:
         limit: int = 500,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> MemoryGraphPage:
+        if view == "retrieval":
+            memory_namespace = self._resolve_namespace(namespace)
+            return recall_inspect.retrieval_graph_page(
+                self, memory_namespace, seed_id=node_id, limit=limit
+            )
         graph = self.memory_graph(view, limit=2000, namespace=namespace)
         edges = [edge for edge in graph.edges if node_id in {edge.source, edge.target}][:limit]
         ids = {node_id}
         for edge in edges:
             ids.update((edge.source, edge.target))
+        nodes = [node for node in graph.nodes if node.id in ids]
         return MemoryGraphPage(
             view=graph.view,
-            nodes=[node for node in graph.nodes if node.id in ids],
+            nodes=nodes,
             edges=edges,
-            counts=graph.counts,
+            counts={key: sum(1 for node in nodes if node.type == key) for key in {item.type for item in nodes}},
             truncated=len(graph.edges) > len(edges),
+        )
+
+    def memory_catalog(
+        self,
+        *,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> MemoryCatalog:
+        return recall_inspect.memory_catalog(self, self._resolve_namespace(namespace))
+
+    def memory_helper_items(
+        self,
+        helper_id: str,
+        *,
+        search: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> MemoryHelperPage:
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        return recall_inspect.helper_items(
+            self, helper_id, self._resolve_namespace(namespace),
+            search=search, cursor=cursor, limit=limit,
+        )
+
+    def memory_documents(
+        self,
+        *,
+        search: str | None = None,
+        modality: str | None = None,
+        cursor: int = 0,
+        limit: int = 50,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> MemoryDocumentPage:
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        return recall_inspect.document_page(
+            self, self._resolve_namespace(namespace),
+            search=search, modality=modality, cursor=cursor, limit=limit,
+        )
+
+    def memory_terms(
+        self,
+        *,
+        search: str | None = None,
+        cursor: int = 0,
+        limit: int = 40,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> MemoryTermPage:
+        if limit < 1 or limit > 200:
+            raise ValueError("limit must be between 1 and 200")
+        return recall_inspect.term_page(
+            self, self._resolve_namespace(namespace), search=search, cursor=cursor, limit=limit,
+        )
+
+    def memory_claims(
+        self,
+        *,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> list[CompiledClaim]:
+        return recall_inspect.compiled_claims(self, self._resolve_namespace(namespace))
+
+    def memory_vector_projection(
+        self,
+        *,
+        sample: int = 500,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> VectorProjection:
+        sample = max(10, min(sample, 1000))
+        return recall_inspect.vector_projection(self, self._resolve_namespace(namespace), sample=sample)
+
+    def memory_vector_neighbors(
+        self,
+        delta_id: str,
+        *,
+        limit: int = 12,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> VectorNeighbors:
+        return recall_inspect.vector_neighbors(
+            self, self._resolve_namespace(namespace), delta_id, limit=max(1, min(limit, 50))
+        )
+
+    def memory_retrieval_graph(
+        self,
+        *,
+        seed_id: str | None = None,
+        edge_kind: str | None = None,
+        limit: int = 400,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> MemoryGraphPage:
+        return recall_inspect.retrieval_graph_page(
+            self, self._resolve_namespace(namespace),
+            seed_id=seed_id, edge_kind=edge_kind, limit=max(1, min(limit, 2000)),
         )
 
     def compile_profile(

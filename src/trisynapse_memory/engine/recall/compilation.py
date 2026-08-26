@@ -70,6 +70,7 @@ def compile_claims(
                 subject=latest.subject,
                 relation=latest.relation,
                 object=latest.object,
+                objects=sorted(item for item in objects if item),
             )
         )
     return result

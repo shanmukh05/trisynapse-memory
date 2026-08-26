@@ -290,7 +290,7 @@ trisynapse-memory serve --studio
 
 The service binds to `127.0.0.1:8765`, runs durable memory jobs, redirects `/` to Studio at `/studio/`, and serves OpenAPI at `/openapi.json`. `init` creates `<store>/.api-key`; enter it in Studio's Connection view. `--no-auth` is for trusted local development only.
 
-Studio's Sources view supports mixed file/link batches and tailored single-source forms. Retained originals can be previewed or downloaded only after namespace authorization; HTML is never executed inline. Queries stream into a clickable retrieval workflow and remain in removable history. Memory Viewer provides knowledge, lineage, and Trace graphs. Configuration manages both model roles, retrieval profiles, and token budgets.
+Studio opens on Memory Viewer. Helper tabs, health chips, and playground route filters come from `GET /api/v1/memory/catalog` — Trace plus every Recall helper and retrieval route the running engine has. Sources remain mixed file/link batches with authorized preview and download; HTML is never executed inline. Queries stream into a clickable retrieval workflow; citation clicks open the matching Trace record. Configuration generates `enabled_routes` and route-weight editors from the catalog. The bearer token stays in browser session storage.
 
 The bearer token stays in browser session storage. Namespace preferences use local storage. When Studio connects to a different origin, that server must allow Studio's origin through CORS; same-origin operation needs no extra configuration.
 

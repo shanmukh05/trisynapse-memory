@@ -517,15 +517,20 @@ Every executed box is stored as a `QueryStep`. Each route keeps at most 20 safe 
 
 `query()` also returns `retrieval_hits`. They are the pre-answer grounded records and remain available when the completion model abstains. `citations` describe what the final answer used; `retrieval_hits` describe what retrieval found. Keeping them separate makes both Studio diagnostics and benchmarks honest.
 
-### The three Memory Viewer graphs
+### Memory Viewer
 
-The graph UI is three views over the same Trace and Recall data:
+Studio's home is Memory Viewer. `GET /api/v1/memory/catalog` lists Trace, every Recall helper, and every retrieval route the running engine actually has. Tabs, health chips, playground route filters, and Configuration's route editors are generated from that catalog — not a hardcoded page list.
+
+Each helper declares a visual family (`timeline`, `table`, `postings`, `embedding`, `cards`, `graph`). Studio registers specialized renderers locally; an unknown helper id still renders the family view from generic `items[]`. Deep links stay stable: `/studio/memory?helper=bm25&id=atlas`.
+
+The Graph tab keeps three architecture views over the same Trace and Recall data, plus the retrieval graph the graph route actually walks:
 
 | View | Starts from | Makes clear |
 |---|---|---|
 | Knowledge | Concepts and compiled claims | What Trisynapse currently knows and which relationship joins two concepts |
 | Lineage | Sources, Trace chunks, extractions, claims, and Episode Recall | Where a derived memory came from and which original evidence grounds it |
-| Trace | Ordered deltas grouped by source or episode | What was written, corrected, retracted, or accessed over time |
+| Retrieval | `followed_by` and `about_same_entity` edges | How the graph route expands candidates |
+| Trace (timeline tab) | Ordered deltas grouped by source or episode | What was written, corrected, retracted, or accessed over time |
 
 ```mermaid
 flowchart TD
@@ -542,12 +547,13 @@ flowchart TD
         LE -->|"summarized by"| LR
     end
 
-    subgraph T["Trace view"]
-        TE["Source or episode"] --> TD1["Delta 1"]
-        TD1 -->|"then"| TD2["Delta 2"]
-        TD2 -->|"then"| TD3["Correction or retraction"]
+    subgraph R["Retrieval graph"]
+        RT1["Trace A"] -->|"followed_by"| RT2["Trace B"]
+        RT1 -->|"about_same_entity"| RT3["Trace C"]
     end
 ```
+
+The retrieval playground runs production `search(persist=false)` from the current selection so inspection does not fill Query history. "Open as Query" is the only path that writes a Query Run.
 
 Large stores open as a bounded overview. Search and neighbor expansion make every visible-namespace node reachable without drawing an unreadable graph all at once.
 

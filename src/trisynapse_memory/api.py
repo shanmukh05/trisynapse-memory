@@ -146,6 +146,7 @@ class SearchRequest(BaseModel):
     episode_prefix: str | None = None
     scope: dict[str, Any] | None = None
     include_diagnostics: bool = False
+    persist: bool = True
     namespace: MemoryNamespace | None = None
 
 
@@ -933,6 +934,7 @@ def create_app(
             episode_prefix=request.episode_prefix,
             scope=request.scope,
             namespace=requested_namespace(request.namespace, allowed),
+            persist=request.persist,
         )
         payload = result.model_dump(mode="json")
         if not request.include_diagnostics:
@@ -1154,7 +1156,7 @@ def create_app(
 
     @app.get("/api/v1/memory-graph", dependencies=auth)
     def memory_graph(
-        view: Literal["knowledge", "lineage", "trace"] = "knowledge",
+        view: Literal["knowledge", "lineage", "trace", "retrieval"] = "knowledge",
         q: str | None = None,
         node_type: list[str] = Query(default=[]),
         source_id: str | None = None,
@@ -1182,7 +1184,7 @@ def create_app(
     @app.get("/api/v1/memory-graph/nodes/{node_id}/neighbors", dependencies=auth)
     def memory_graph_neighbors(
         node_id: str,
-        view: Literal["knowledge", "lineage", "trace"] = "lineage",
+        view: Literal["knowledge", "lineage", "trace", "retrieval"] = "lineage",
         limit: int = Query(default=500, ge=1, le=2000),
         user_id: str | None = None,
         agent_id: str | None = None,
@@ -1196,6 +1198,152 @@ def create_app(
         )
         return memory.memory_graph_neighbors(
             node_id, view=view, limit=limit, namespace=namespace
+        ).model_dump(mode="json")
+
+    def _studio_namespace(
+        user_id: str | None,
+        agent_id: str | None,
+        project_id: str,
+        session_id: str | None,
+        allowed: MemoryNamespace | None,
+    ) -> MemoryNamespace:
+        return requested_namespace(
+            MemoryNamespace(user_id=user_id, agent_id=agent_id, project_id=project_id, session_id=session_id),
+            allowed,
+        )
+
+    @app.get("/api/v1/memory/catalog", dependencies=auth)
+    def memory_catalog(
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        return memory.memory_catalog(namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed)).model_dump(mode="json")
+
+    @app.get("/api/v1/memory/overview", dependencies=auth)
+    def memory_overview(
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        catalog = memory.memory_catalog(namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed))
+        return {"helpers": [item.model_dump(mode="json") for item in catalog.helpers], "retrieval_routes": [item.model_dump(mode="json") for item in catalog.retrieval_routes]}
+
+    @app.get("/api/v1/memory/helpers/{helper_id}", dependencies=auth)
+    def memory_helper_items(
+        helper_id: str,
+        q: str | None = None,
+        cursor: str | None = None,
+        limit: int = Query(default=50, ge=1, le=500),
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        try:
+            return memory.memory_helper_items(
+                helper_id, search=q, cursor=cursor, limit=limit,
+                namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed),
+            ).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/v1/memory/documents", dependencies=auth)
+    def memory_documents(
+        q: str | None = None,
+        modality: str | None = None,
+        cursor: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=500),
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        try:
+            return memory.memory_documents(
+                search=q, modality=modality, cursor=cursor, limit=limit,
+                namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed),
+            ).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/v1/memory/terms", dependencies=auth)
+    def memory_terms(
+        q: str | None = None,
+        cursor: int = Query(default=0, ge=0),
+        limit: int = Query(default=40, ge=1, le=200),
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        try:
+            return memory.memory_terms(
+                search=q, cursor=cursor, limit=limit,
+                namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed),
+            ).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/v1/memory/claims", dependencies=auth)
+    def memory_claims(
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        claims = memory.memory_claims(namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed))
+        return {"claims": [item.model_dump(mode="json") for item in claims]}
+
+    @app.get("/api/v1/memory/vectors/projection", dependencies=auth)
+    def memory_vector_projection(
+        sample: int = Query(default=500, ge=10, le=1000),
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        return memory.memory_vector_projection(
+            sample=sample, namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed)
+        ).model_dump(mode="json")
+
+    @app.get("/api/v1/memory/vectors/neighbors", dependencies=auth)
+    def memory_vector_neighbors(
+        delta_id: str,
+        limit: int = Query(default=12, ge=1, le=50),
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        return memory.memory_vector_neighbors(
+            delta_id, limit=limit, namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed)
+        ).model_dump(mode="json")
+
+    @app.get("/api/v1/memory/retrieval-graph", dependencies=auth)
+    def memory_retrieval_graph(
+        seed_id: str | None = None,
+        edge_kind: str | None = None,
+        limit: int = Query(default=400, ge=1, le=2000),
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str = "default",
+        session_id: str | None = None,
+        allowed: MemoryNamespace | None = Depends(authorize),
+    ) -> dict[str, Any]:
+        return memory.memory_retrieval_graph(
+            seed_id=seed_id, edge_kind=edge_kind, limit=limit,
+            namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed),
         ).model_dump(mode="json")
 
     @app.get("/api/v1/jobs", dependencies=admin_auth)

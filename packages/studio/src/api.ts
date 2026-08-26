@@ -1,7 +1,8 @@
 import type {
-  Connection, GraphPage, IngestionRun, ModelConfigurationState, Namespace,
-  Provider, QueryRun, QueryRunPage, RetrievalConfiguration, SourceInput,
-  SourcePage, SourcePreview,
+  Connection, GraphPage, IngestionRun, MemoryCatalog, HelperPage, MemoryDocument,
+  MemoryPage, MemoryTerm, ModelConfigurationState, Namespace, Provider, QueryRun, Source,
+  QueryRunPage, RetrievalConfiguration, SearchResult, SourceInput, SourcePage,
+  SourcePreview, VectorNeighbors, VectorProjection, CompiledClaim, EpisodeInfo,
 } from "./types";
 
 export class StudioApi {
@@ -42,7 +43,7 @@ export class StudioApi {
     if (filters.cursor) q.set("cursor", String(filters.cursor));
     return this.request<SourcePage>(`/api/v1/sources?${q}`);
   }
-  getSource(id: string) { return this.request(`/api/v1/sources/${encodeURIComponent(id)}?${this.namespaceQuery()}`); }
+  getSource(id: string) { return this.request<Source>(`/api/v1/sources/${encodeURIComponent(id)}?${this.namespaceQuery()}`); }
   sourcePreview(id: string) { return this.request<SourcePreview>(`/api/v1/sources/${encodeURIComponent(id)}/preview?${this.namespaceQuery()}`); }
   async sourceBlob(id: string, disposition: "inline" | "attachment" = "inline") {
     const q = this.namespaceQuery(); q.set("disposition", disposition);
@@ -87,8 +88,66 @@ export class StudioApi {
     }
   }
 
-  graph(view: GraphPage["view"], search = "") { const q = this.namespaceQuery(); q.set("view", view); q.set("limit", "800"); if (search) q.set("q", search); return this.request<GraphPage>(`/api/v1/memory-graph?${q}`); }
+  graph(view: GraphPage["view"], search = "", filters: { nodeType?: string; sourceId?: string; episodeId?: string } = {}) {
+    const q = this.namespaceQuery();
+    q.set("view", view);
+    q.set("limit", "800");
+    if (search) q.set("q", search);
+    if (filters.nodeType) q.append("node_type", filters.nodeType);
+    if (filters.sourceId) q.set("source_id", filters.sourceId);
+    if (filters.episodeId) q.set("episode_id", filters.episodeId);
+    return this.request<GraphPage>(`/api/v1/memory-graph?${q}`);
+  }
   graphNeighbors(id: string, view: GraphPage["view"]) { const q = this.namespaceQuery(); q.set("view", view); return this.request<GraphPage>(`/api/v1/memory-graph/nodes/${encodeURIComponent(id)}/neighbors?${q}`); }
+
+  catalog() { return this.request<MemoryCatalog>(`/api/v1/memory/catalog?${this.namespaceQuery()}`); }
+  helperItems(helperId: string, search = "", cursor = "") {
+    const q = this.namespaceQuery();
+    q.set("limit", "80");
+    if (search) q.set("q", search);
+    if (cursor) q.set("cursor", cursor);
+    return this.request<HelperPage>(`/api/v1/memory/helpers/${encodeURIComponent(helperId)}?${q}`);
+  }
+  memories(cursor?: number) {
+    const q = this.namespaceQuery();
+    q.set("limit", "80");
+    q.set("include_retracted", "true");
+    if (cursor) q.set("cursor", String(cursor));
+    return this.request<MemoryPage>(`/api/v1/memories?${q}`);
+  }
+  documents(search = "", modality = "") {
+    const q = this.namespaceQuery();
+    q.set("limit", "80");
+    if (search) q.set("q", search);
+    if (modality) q.set("modality", modality);
+    return this.request<{ documents: MemoryDocument[]; next_cursor?: number | null; total: number }>(`/api/v1/memory/documents?${q}`);
+  }
+  terms(search = "") {
+    const q = this.namespaceQuery();
+    q.set("limit", "60");
+    if (search) q.set("q", search);
+    return this.request<{ terms: MemoryTerm[]; next_cursor?: number | null; total: number }>(`/api/v1/memory/terms?${q}`);
+  }
+  claims() { return this.request<{ claims: CompiledClaim[] }>(`/api/v1/memory/claims?${this.namespaceQuery()}`); }
+  episodes() { return this.request<{ episodes: EpisodeInfo[] }>(`/api/v1/episodes?${this.namespaceQuery()}`); }
+  vectorProjection() { return this.request<VectorProjection>(`/api/v1/memory/vectors/projection?${this.namespaceQuery()}`); }
+  vectorNeighbors(deltaId: string) {
+    const q = this.namespaceQuery();
+    q.set("delta_id", deltaId);
+    return this.request<VectorNeighbors>(`/api/v1/memory/vectors/neighbors?${q}`);
+  }
+  retrievalGraph(seedId = "", edgeKind = "") {
+    const q = this.namespaceQuery();
+    if (seedId) q.set("seed_id", seedId);
+    if (edgeKind) q.set("edge_kind", edgeKind);
+    return this.request<GraphPage>(`/api/v1/memory/retrieval-graph?${q}`);
+  }
+  search(query: string, persist = false) {
+    return this.request<SearchResult>("/api/v1/search", {
+      method: "POST",
+      body: JSON.stringify({ query, persist, include_diagnostics: true, namespace: this.connection.namespace }),
+    });
+  }
 
   providers() { return this.request<{ providers: Provider[] }>("/api/v1/providers"); }
   modelConfiguration() { return this.request<ModelConfigurationState>("/api/v1/model-configuration"); }

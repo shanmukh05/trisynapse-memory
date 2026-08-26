@@ -152,9 +152,9 @@ Open [http://127.0.0.1:8765/studio/](http://127.0.0.1:8765/studio/). The API tok
 
 Studio gives you five focused views:
 
+- **Memory Viewer** — inspect Trace and every Recall helper, then run live retrieval from the current item.
 - **Sources** — browse, preview, ingest, retry, download, and remove sources.
 - **Queries** — watch retrieval run step by step and reopen past workflows.
-- **Memory Viewer** — explore knowledge, lineage, and chronological Trace graphs.
 - **Configuration** — choose completion, embedding, and retrieval settings.
 - **Connection** — select the server, token, and active namespace.
 

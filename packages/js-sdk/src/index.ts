@@ -295,7 +295,7 @@ export interface SourcePreview {
 
 export interface MemoryGraphNode { id: string; type: "source" | "trace" | "episode" | "recall" | "claim" | "concept"; label: string; subtitle?: string | null; status?: string | null; data: Record<string, unknown>; }
 export interface MemoryGraphEdge { id: string; source: string; target: string; type: string; label?: string | null; weight: number; data: Record<string, unknown>; }
-export interface MemoryGraphPage { view: "knowledge" | "lineage" | "trace"; nodes: MemoryGraphNode[]; edges: MemoryGraphEdge[]; counts: Record<string, number>; truncated: boolean; next_cursor?: string | null; }
+export interface MemoryGraphPage { view: "knowledge" | "lineage" | "trace" | "retrieval"; nodes: MemoryGraphNode[]; edges: MemoryGraphEdge[]; counts: Record<string, number>; truncated: boolean; next_cursor?: string | null; }
 
 export interface ClientOptions {
   baseUrl?: string;
@@ -395,13 +395,14 @@ export class TrisynapseMemory {
     });
   }
 
-  async search(query: string, options: { topK?: number; episodePrefix?: string; scope?: Record<string, unknown>; diagnostics?: boolean } = {}): Promise<SearchResult> {
+  async search(query: string, options: { topK?: number; episodePrefix?: string; scope?: Record<string, unknown>; diagnostics?: boolean; persist?: boolean } = {}): Promise<SearchResult> {
     return this.request("POST", "/api/v1/search", {
       query,
       top_k: options.topK,
       episode_prefix: options.episodePrefix,
       scope: options.scope,
       include_diagnostics: options.diagnostics,
+      persist: options.persist ?? true,
       namespace: this.namespace,
     });
   }
@@ -532,14 +533,19 @@ export class TrisynapseMemory {
     return this.request("POST", "/api/v1/query-runs/remove", { query_ids: queryIds, all_in_namespace: allInNamespace, confirm: true, namespace: this.namespace });
   }
 
-  async getMemoryGraph(view: MemoryGraphPage["view"] = "knowledge", options: { search?: string; sourceId?: string; episodeId?: string; cursor?: string; limit?: number } = {}): Promise<MemoryGraphPage> {
+  async getMemoryGraph(view: MemoryGraphPage["view"] = "knowledge", options: { search?: string; sourceId?: string; episodeId?: string; nodeType?: string; cursor?: string; limit?: number } = {}): Promise<MemoryGraphPage> {
     const query = this.namespaceQuery(); query.set("view", view);
     if (options.search) query.set("q", options.search);
     if (options.sourceId) query.set("source_id", options.sourceId);
     if (options.episodeId) query.set("episode_id", options.episodeId);
+    if (options.nodeType) query.append("node_type", options.nodeType);
     if (options.cursor) query.set("cursor", options.cursor);
     if (options.limit) query.set("limit", String(options.limit));
     return this.request("GET", `/api/v1/memory-graph?${query}`);
+  }
+
+  async getMemoryCatalog() {
+    return this.request<{ helpers: Array<{ id: string; title: string; kind: string; count: number; health: Record<string, unknown> }>; retrieval_routes: Array<{ name: string; title: string; enabled: boolean; weight: number }> }>("GET", `/api/v1/memory/catalog?${this.namespaceQuery()}`);
   }
 
   async getMemoryGraphNeighbors(nodeId: string, view: MemoryGraphPage["view"] = "lineage"): Promise<MemoryGraphPage> {

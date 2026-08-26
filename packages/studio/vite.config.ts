@@ -21,7 +21,7 @@ export default defineConfig({
       output: {
         manualChunks: {
           react: ["react", "react-dom", "react-router-dom", "@tanstack/react-query"],
-          graph: ["cytoscape", "@xyflow/react"],
+          graph: ["@xyflow/react"],
           markdown: ["react-markdown", "remark-gfm"],
         },
       },

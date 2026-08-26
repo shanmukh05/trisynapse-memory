@@ -227,7 +227,7 @@ Use `Authorization: Bearer TOKEN` except for health. The OpenAPI document is at 
 | `GET` | `/api/v1/memories` | Cursor-paginated Trace records |
 | `GET` | `/api/v1/memories/{id}` | Get one record |
 | `GET` | `/api/v1/memories/{id}/history` | Linked lifecycle history |
-| `POST` | `/api/v1/search` | Ranked evidence and diagnostics |
+| `POST` | `/api/v1/search` | Ranked evidence and diagnostics; `persist=false` skips writing a Query Run |
 | `POST` | `/api/v1/query` | Grounded answer and citations |
 | `POST` | `/api/v1/query-runs` | Start a durable live query or search and return `202` |
 | `GET` | `/api/v1/query-runs` | Filtered, cursor-paginated query history |
@@ -327,16 +327,28 @@ REST safeguards are 25 MiB per upload, 250 MiB retained input per run, 100 descr
 
 `QueryStep` contains the stage name, parent IDs, safe input/output metadata, metrics, duration, and bounded candidate snapshots. A failed or interrupted run keeps its completed steps.
 
-The graph routes are:
+The graph and Memory Viewer inspection routes are:
 
 | Method | Route | Purpose |
 |---|---|---|
+| `GET` | `/api/v1/memory/catalog` | Trace + Recall helpers + retrieval routes (id, kind, health, inspect path) |
+| `GET` | `/api/v1/memory/overview` | Catalog-aligned counts and health |
+| `GET` | `/api/v1/memory/helpers/{id}` | Generic paginated `items[]` for any helper, including unknown ids |
+| `GET` | `/api/v1/memory/documents` | Paginated `retrieval_documents` |
+| `GET` | `/api/v1/memory/terms` | BM25 terms ranked by document frequency, with posting lists |
+| `GET` | `/api/v1/memory/claims` | Compiled claims, including `CONTESTED` groups |
+| `GET` | `/api/v1/memory/vectors/projection` | Sampled 2D PCA points (never raw embeddings) |
+| `GET` | `/api/v1/memory/vectors/neighbors` | Nearest neighbors for one embedded Trace id |
+| `GET` | `/api/v1/memory/retrieval-graph` | `followed_by` and `about_same_entity` edges |
 | `GET` | `/api/v1/memory-graph?view=knowledge` | Concepts, claims, and their relationships |
 | `GET` | `/api/v1/memory-graph?view=lineage` | Source-to-Trace-to-Recall provenance |
 | `GET` | `/api/v1/memory-graph?view=trace` | Ordered evidence and lifecycle connections |
+| `GET` | `/api/v1/memory-graph?view=retrieval` | Retrieval-graph neighborhood used by the graph route |
 | `GET` | `/api/v1/memory-graph/nodes/{id}/neighbors` | Expand one node without loading the full store |
 
-Python exposes `get/list/remove_query_runs()`, `create/execute_query_run()`, `get/set_retrieval_configuration()`, `source_preview()`, `source_content_path()`, and `memory_graph()`. The TypeScript SDK mirrors these with typed methods.
+`POST /api/v1/search` accepts `persist` (default `true`). Studio inspection uses `persist=false` so playground searches do not fill query history.
+
+Python exposes `get/list/remove_query_runs()`, `create/execute_query_run()`, `get/set_retrieval_configuration()`, `source_preview()`, `source_content_path()`, `memory_graph()`, `memory_catalog()`, and the Memory Viewer inspect methods. The TypeScript SDK mirrors these with typed methods.
 
 ## TypeScript
 

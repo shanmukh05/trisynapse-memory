@@ -190,12 +190,183 @@ export type GraphEdge = {
 };
 
 export type GraphPage = {
-  view: "knowledge" | "lineage" | "trace";
+  view: "knowledge" | "lineage" | "trace" | "retrieval";
   nodes: GraphNode[];
   edges: GraphEdge[];
   counts: Record<string, number>;
   truncated: boolean;
   next_cursor?: string | null;
+};
+
+export type HelperKind = "timeline" | "table" | "postings" | "embedding" | "cards" | "graph";
+
+export type CatalogHelper = {
+  id: string;
+  title: string;
+  kind: HelperKind;
+  inspect_path: string;
+  playground_seed?: string | null;
+  count: number;
+  health: Record<string, unknown>;
+};
+
+export type CatalogRoute = {
+  name: string;
+  title: string;
+  enabled: boolean;
+  weight: number;
+};
+
+export type MemoryCatalog = {
+  helpers: CatalogHelper[];
+  retrieval_routes: CatalogRoute[];
+};
+
+export type HelperItem = {
+  id: string;
+  helper_id: string;
+  kind: string;
+  title: string;
+  subtitle?: string | null;
+  excerpt?: string | null;
+  status?: string | null;
+  score?: number | null;
+  data: Record<string, unknown>;
+};
+
+export type HelperPage = {
+  helper_id: string;
+  kind: HelperKind | string;
+  items: HelperItem[];
+  next_cursor?: string | null;
+  truncated: boolean;
+};
+
+export type MemoryDocument = {
+  id: string;
+  seq: number;
+  kind: string;
+  modality: string;
+  source_type: string;
+  text: string;
+  token_count: number;
+  active: boolean;
+  episode_id?: string | null;
+  text_hash: string;
+  fields: Record<string, string>;
+  locator?: Record<string, unknown> | string | null;
+};
+
+export type MemoryTermPosting = {
+  delta_id: string;
+  term_frequency: number;
+  excerpt: string;
+  token_count: number;
+};
+
+export type MemoryTerm = {
+  term: string;
+  document_frequency: number;
+  postings: MemoryTermPosting[];
+};
+
+export type VectorPoint = {
+  id: string;
+  x: number;
+  y: number;
+  modality: string;
+  excerpt: string;
+  text_hash: string;
+};
+
+export type VectorProjection = {
+  points: VectorPoint[];
+  model?: string | null;
+  fingerprint?: string | null;
+  embedded: number;
+  searchable: number;
+  sampled: number;
+};
+
+export type VectorNeighbor = { id: string; score: number; excerpt: string; modality: string };
+export type VectorNeighbors = { delta_id: string; neighbors: VectorNeighbor[]; model?: string | null };
+
+export type CompiledClaim = {
+  id: string;
+  claim_key: string;
+  text: string;
+  status: "ACTIVE" | "SUPERSEDED" | "CONTESTED";
+  source_delta_ids: string[];
+  observation_delta_ids: string[];
+  temporal_anchor?: string | null;
+  confidence: number;
+  subject?: string | null;
+  relation?: string | null;
+  object?: string | null;
+  objects?: string[];
+};
+
+export type EpisodeInfo = {
+  episode_id: string;
+  delta_count: number;
+  observation_count: number;
+  extraction_count: number;
+  first_observed_at?: string | null;
+  last_observed_at?: string | null;
+  stale: boolean;
+};
+
+export type SearchHit = {
+  item_id: string;
+  kind: string;
+  text: string;
+  score: number;
+  route: string;
+  episode_id?: string | null;
+  source_delta_ids: string[];
+  locator?: unknown;
+};
+
+export type SearchResult = {
+  query_id: string;
+  hits: SearchHit[];
+  stage: string;
+  confident: boolean;
+  retrieval_trace?: {
+    query_kind?: string;
+    stage?: string;
+    routes?: Record<string, string[]>;
+    top_score?: number;
+    margin?: number | null;
+  };
+};
+
+export type MemoryDelta = {
+  id: string;
+  seq: number;
+  kind: string;
+  text: string;
+  episode_id?: string | null;
+  evidence_refs: string[];
+  locator?: Record<string, unknown> | string | null;
+  source_ref?: unknown;
+  observed_at?: string | null;
+  subject?: string | null;
+  relation?: string | null;
+  object?: string | null;
+};
+
+export type MemoryPage = { items: MemoryDelta[]; next_cursor?: number | null };
+
+export type InspectorRecord = {
+  id: string;
+  helperId: string;
+  kind: string;
+  title: string;
+  subtitle?: string | null;
+  excerpt?: string | null;
+  status?: string | null;
+  data: Record<string, unknown>;
 };
 
 export type Provider = {

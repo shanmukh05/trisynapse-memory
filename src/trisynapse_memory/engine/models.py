@@ -174,6 +174,7 @@ class CompiledClaim(EngineModel):
     subject: str | None = None
     relation: str | None = None
     object: str | None = None
+    objects: list[str] = Field(default_factory=list)
 
 
 class EpisodeRecallView(EngineModel):
@@ -541,12 +542,128 @@ class MemoryGraphEdge(EngineModel):
 
 
 class MemoryGraphPage(EngineModel):
-    view: Literal["knowledge", "lineage", "trace"]
+    view: Literal["knowledge", "lineage", "trace", "retrieval"]
     nodes: list[MemoryGraphNode] = Field(default_factory=list)
     edges: list[MemoryGraphEdge] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
     truncated: bool = False
     next_cursor: str | None = None
+
+
+MemoryHelperKind = Literal["timeline", "table", "postings", "embedding", "cards", "graph"]
+
+
+class MemoryCatalogHelper(EngineModel):
+    id: str
+    title: str
+    kind: MemoryHelperKind
+    inspect_path: str
+    playground_seed: str | None = None
+    count: int = 0
+    health: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryCatalogRoute(EngineModel):
+    name: str
+    title: str
+    enabled: bool = True
+    weight: float = 1.0
+
+
+class MemoryCatalog(EngineModel):
+    helpers: list[MemoryCatalogHelper] = Field(default_factory=list)
+    retrieval_routes: list[MemoryCatalogRoute] = Field(default_factory=list)
+
+
+class MemoryHelperItem(EngineModel):
+    id: str
+    helper_id: str
+    kind: str
+    title: str
+    subtitle: str | None = None
+    excerpt: str | None = None
+    status: str | None = None
+    score: float | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryHelperPage(EngineModel):
+    helper_id: str
+    kind: MemoryHelperKind | str
+    items: list[MemoryHelperItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+    truncated: bool = False
+
+
+class MemoryDocumentRow(EngineModel):
+    id: str
+    seq: int
+    kind: str
+    modality: str
+    source_type: str
+    text: str
+    token_count: int
+    active: bool
+    episode_id: str | None = None
+    text_hash: str
+    fields: dict[str, str] = Field(default_factory=dict)
+    locator: dict[str, Any] | str | None = None
+
+
+class MemoryDocumentPage(EngineModel):
+    documents: list[MemoryDocumentRow] = Field(default_factory=list)
+    next_cursor: int | None = None
+    total: int = 0
+
+
+class MemoryTermPosting(EngineModel):
+    delta_id: str
+    term_frequency: int
+    excerpt: str = ""
+    token_count: int = 0
+
+
+class MemoryTerm(EngineModel):
+    term: str
+    document_frequency: int
+    postings: list[MemoryTermPosting] = Field(default_factory=list)
+
+
+class MemoryTermPage(EngineModel):
+    terms: list[MemoryTerm] = Field(default_factory=list)
+    next_cursor: int | None = None
+    total: int = 0
+
+
+class VectorProjectionPoint(EngineModel):
+    id: str
+    x: float
+    y: float
+    modality: str = "text"
+    excerpt: str = ""
+    text_hash: str = ""
+
+
+class VectorProjection(EngineModel):
+    points: list[VectorProjectionPoint] = Field(default_factory=list)
+    model: str | None = None
+    fingerprint: str | None = None
+    embedded: int = 0
+    searchable: int = 0
+    sampled: int = 0
+
+
+class VectorNeighbor(EngineModel):
+    id: str
+    score: float
+    excerpt: str = ""
+    modality: str = "text"
+
+
+class VectorNeighbors(EngineModel):
+    delta_id: str
+    neighbors: list[VectorNeighbor] = Field(default_factory=list)
+    model: str | None = None
 
 
 class MemoryJob(EngineModel):

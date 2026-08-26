@@ -75,6 +75,11 @@ def _normal_index_entity(value: str | None) -> str:
     return normalized
 
 
+def _namespace_sql_key(namespace: MemoryNamespace | dict[str, Any]) -> str:
+    model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+    return _json(model.model_dump(mode="json", exclude_none=True))
+
+
 class SQLiteTraceStore:
     """Durable ordered Trace with transactional sequence assignment."""
 
@@ -1531,6 +1536,304 @@ class SQLiteTraceStore:
     def clear_embeddings(self) -> None:
         self._connection.execute("DELETE FROM embedding_cache")
         self._connection.commit()
+
+    def retrieval_index_counts(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+    ) -> dict[str, Any]:
+        key = _namespace_sql_key(namespace)
+        documents = self._connection.execute(
+            """SELECT COUNT(*) AS n,
+                      COALESCE(SUM(CASE WHEN active=1 THEN 1 ELSE 0 END), 0) AS active
+               FROM retrieval_documents WHERE namespace_key=?""",
+            (key,),
+        ).fetchone()
+        terms = self._connection.execute(
+            """SELECT COUNT(DISTINCT t.term) AS distinct_terms, COUNT(*) AS postings
+               FROM retrieval_terms t
+               JOIN retrieval_documents d ON d.delta_id=t.delta_id AND d.active=1
+               WHERE t.namespace_key=?""",
+            (key,),
+        ).fetchone()
+        edges: dict[str, int] = {}
+        for row in self._connection.execute(
+            """SELECT e.edge_kind, COUNT(*) AS n
+               FROM retrieval_graph_edges e
+               JOIN retrieval_documents s ON s.delta_id=e.source_id AND s.active=1
+               JOIN retrieval_documents t ON t.delta_id=e.target_id AND t.active=1
+               WHERE e.namespace_key=? GROUP BY e.edge_kind""",
+            (key,),
+        ).fetchall():
+            edges[str(row["edge_kind"])] = int(row["n"])
+        return {
+            "documents": int((documents or {"n": 0})["n"] or 0),
+            "documents_active": int((documents or {"active": 0})["active"] or 0),
+            "distinct_terms": int((terms or {"distinct_terms": 0})["distinct_terms"] or 0),
+            "postings": int((terms or {"postings": 0})["postings"] or 0),
+            "graph_edges": edges,
+        }
+
+    def list_retrieval_documents_page(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+        *,
+        search: str | None = None,
+        modality: str | None = None,
+        cursor: int = 0,
+        limit: int = 50,
+        active_only: bool = True,
+    ) -> tuple[list[dict[str, Any]], int]:
+        key = _namespace_sql_key(namespace)
+        clauses = ["namespace_key=?"]
+        params: list[Any] = [key]
+        if active_only:
+            clauses.append("active=1")
+        if modality:
+            clauses.append("modality=?")
+            params.append(modality)
+        if search:
+            clauses.append("(text LIKE ? OR index_text LIKE ? OR delta_id LIKE ?)")
+            token = f"%{search}%"
+            params.extend((token, token, token))
+        where = " AND ".join(clauses)
+        total = int(self._connection.execute(
+            f"SELECT COUNT(*) AS n FROM retrieval_documents WHERE {where}", params
+        ).fetchone()["n"])
+        rows = self._connection.execute(
+            f"""SELECT delta_id,seq,kind,episode_id,modality,source_type,text_hash,text,
+                       fields_json,metadata_json,token_count,active
+                FROM retrieval_documents WHERE {where}
+                ORDER BY seq LIMIT ? OFFSET ?""",
+            [*params, limit, cursor],
+        ).fetchall()
+        documents = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            documents.append({
+                "id": str(row["delta_id"]),
+                "seq": int(row["seq"]),
+                "kind": str(row["kind"]),
+                "episode_id": row["episode_id"],
+                "modality": str(row["modality"]),
+                "source_type": str(row["source_type"]),
+                "text_hash": str(row["text_hash"]),
+                "text": str(row["text"]),
+                "fields": json.loads(row["fields_json"] or "{}"),
+                "locator": metadata.get("locator"),
+                "token_count": int(row["token_count"]),
+                "active": bool(row["active"]),
+            })
+        return documents, total
+
+    def list_retrieval_terms_page(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+        *,
+        search: str | None = None,
+        cursor: int = 0,
+        limit: int = 40,
+        posting_limit: int = 12,
+    ) -> tuple[list[dict[str, Any]], int]:
+        key = _namespace_sql_key(namespace)
+        clauses = ["t.namespace_key=?"]
+        params: list[Any] = [key]
+        if search:
+            clauses.append("t.term LIKE ?")
+            params.append(f"{search.lower()}%")
+        where = " AND ".join(clauses)
+        total = int(self._connection.execute(
+            f"""SELECT COUNT(*) AS n FROM (
+                    SELECT t.term FROM retrieval_terms t
+                    JOIN retrieval_documents d ON d.delta_id=t.delta_id AND d.active=1
+                    WHERE {where} GROUP BY t.term
+                )""",
+            params,
+        ).fetchone()["n"])
+        term_rows = self._connection.execute(
+            f"""SELECT t.term, COUNT(*) AS df
+                FROM retrieval_terms t
+                JOIN retrieval_documents d ON d.delta_id=t.delta_id AND d.active=1
+                WHERE {where}
+                GROUP BY t.term
+                ORDER BY df DESC, t.term
+                LIMIT ? OFFSET ?""",
+            [*params, limit, cursor],
+        ).fetchall()
+        terms: list[dict[str, Any]] = []
+        for term_row in term_rows:
+            term = str(term_row["term"])
+            postings = self._connection.execute(
+                """SELECT t.delta_id,t.term_frequency,d.text,d.token_count
+                   FROM retrieval_terms t
+                   JOIN retrieval_documents d ON d.delta_id=t.delta_id AND d.active=1
+                   WHERE t.namespace_key=? AND t.term=?
+                   ORDER BY t.term_frequency DESC LIMIT ?""",
+                (key, term, posting_limit),
+            ).fetchall()
+            terms.append({
+                "term": term,
+                "document_frequency": int(term_row["df"]),
+                "postings": [
+                    {
+                        "delta_id": str(item["delta_id"]),
+                        "term_frequency": int(item["term_frequency"]),
+                        "excerpt": str(item["text"])[:240],
+                        "token_count": int(item["token_count"]),
+                    }
+                    for item in postings
+                ],
+            })
+        return terms, total
+
+    def retrieval_documents_by_ids(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+        delta_ids: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        identifiers = list(dict.fromkeys(delta_ids))
+        if not identifiers:
+            return []
+        key = _namespace_sql_key(namespace)
+        placeholders = ",".join("?" for _ in identifiers)
+        rows = self._connection.execute(
+            f"""SELECT delta_id,seq,kind,episode_id,modality,source_type,text_hash,text,
+                       fields_json,metadata_json,token_count,active
+                FROM retrieval_documents
+                WHERE namespace_key=? AND delta_id IN ({placeholders})""",
+            [key, *identifiers],
+        ).fetchall()
+        by_id = {str(row["delta_id"]): row for row in rows}
+        documents = []
+        for identifier in identifiers:
+            row = by_id.get(identifier)
+            if row is None:
+                continue
+            metadata = json.loads(row["metadata_json"] or "{}")
+            documents.append({
+                "id": str(row["delta_id"]),
+                "seq": int(row["seq"]),
+                "kind": str(row["kind"]),
+                "episode_id": row["episode_id"],
+                "modality": str(row["modality"]),
+                "source_type": str(row["source_type"]),
+                "text_hash": str(row["text_hash"]),
+                "text": str(row["text"]),
+                "fields": json.loads(row["fields_json"] or "{}"),
+                "locator": metadata.get("locator"),
+                "token_count": int(row["token_count"]),
+                "active": bool(row["active"]),
+            })
+        return documents
+
+    def retrieval_graph_neighborhood(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+        node_id: str,
+        *,
+        edge_kind: str | None = None,
+        limit: int = 200,
+    ) -> list[tuple[str, str, str, float]]:
+        key = _namespace_sql_key(namespace)
+        clauses = ["e.namespace_key=?", "(e.source_id=? OR e.target_id=?)"]
+        params: list[Any] = [key, node_id, node_id]
+        if edge_kind:
+            clauses.append("e.edge_kind=?")
+            params.append(edge_kind)
+        rows = self._connection.execute(
+            f"""SELECT e.source_id,e.target_id,e.edge_kind,e.weight
+                FROM retrieval_graph_edges e
+                JOIN retrieval_documents s ON s.delta_id=e.source_id AND s.active=1
+                JOIN retrieval_documents t ON t.delta_id=e.target_id AND t.active=1
+                WHERE {' AND '.join(clauses)}
+                LIMIT ?""",
+            [*params, limit],
+        ).fetchall()
+        return [
+            (str(row["source_id"]), str(row["target_id"]), str(row["edge_kind"]), float(row["weight"]))
+            for row in rows
+        ]
+
+    def list_retrieval_graph_edges(
+        self,
+        namespace: MemoryNamespace | dict[str, Any],
+        *,
+        edge_kind: str | None = None,
+        limit: int = 400,
+    ) -> list[tuple[str, str, str, float]]:
+        key = _namespace_sql_key(namespace)
+        clauses = ["e.namespace_key=?"]
+        params: list[Any] = [key]
+        if edge_kind:
+            clauses.append("e.edge_kind=?")
+            params.append(edge_kind)
+        rows = self._connection.execute(
+            f"""SELECT e.source_id,e.target_id,e.edge_kind,e.weight
+                FROM retrieval_graph_edges e
+                JOIN retrieval_documents s ON s.delta_id=e.source_id AND s.active=1
+                JOIN retrieval_documents t ON t.delta_id=e.target_id AND t.active=1
+                WHERE {' AND '.join(clauses)}
+                LIMIT ?""",
+            [*params, limit],
+        ).fetchall()
+        return [
+            (str(row["source_id"]), str(row["target_id"]), str(row["edge_kind"]), float(row["weight"]))
+            for row in rows
+        ]
+
+    def recall_view_type_counts(
+        self,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        rows = self._connection.execute(
+            "SELECT view_type, COUNT(*) AS n FROM recall_cache GROUP BY view_type"
+        ).fetchall()
+        counts = {str(row["view_type"]): int(row["n"]) for row in rows}
+        if namespace is None:
+            return counts
+        requested = (
+            namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+        ).model_dump(exclude_none=True)
+        filtered: dict[str, int] = {}
+        for view_type in counts:
+            matching = 0
+            for row in self._connection.execute(
+                "SELECT payload_json FROM recall_cache WHERE view_type=?",
+                (view_type,),
+            ).fetchall():
+                payload = json.loads(row["payload_json"])
+                ns = payload.get("namespace") or {}
+                if all(ns.get(key) == value for key, value in requested.items()):
+                    matching += 1
+            if matching:
+                filtered[view_type] = matching
+        return filtered
+
+    def recall_cache_items(
+        self,
+        view_type: str,
+        *,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+        cursor: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[dict[str, Any]], int]:
+        rows = self._connection.execute(
+            "SELECT payload_json,stale FROM recall_cache WHERE view_type=? ORDER BY generated_at DESC",
+            (view_type,),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        requested = None
+        if namespace is not None:
+            model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+            requested = model.model_dump(exclude_none=True)
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            payload["stale"] = bool(row["stale"])
+            if requested:
+                ns = payload.get("namespace") or {}
+                if not all(ns.get(key) == value for key, value in requested.items()):
+                    continue
+            items.append(payload)
+        return items[cursor:cursor + limit], len(items)
 
     def write_retrieval_trace(self, trace: RetrievalTrace) -> None:
         self._connection.execute(
