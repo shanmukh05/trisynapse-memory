@@ -307,6 +307,7 @@ Published installers and packages are on [GitHub Releases](https://github.com/sh
 
 | Version | Notes |
 |---|---|
+| [v0.1.3](docs/releases/v0.1.3.md) | Memory Viewer catalog, trusted Python extension packs, non-persistent search, and a starter notebook. |
 | [v0.1.2](docs/releases/v0.1.2.md) | Retrieval profiles, token-aware grounding, store validation, and the `@trisynapse/trisynapse-memory` npm package. Includes breaking CLI, REST, and SDK renames. |
 | [v0.1.1](docs/releases/v0.1.1.md) | Current published release. Installers pin 0.1.1; tagged releases always rebuild and publish. |
 | [v0.1.0](docs/releases/v0.1.0.md) | First public alpha of the Trace & Recall engine. |
