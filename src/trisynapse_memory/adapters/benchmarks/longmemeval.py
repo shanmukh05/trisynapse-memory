@@ -39,13 +39,13 @@ class LongMemEvalAdapter(BenchmarkAdapter):
 
     def ingest_case(self, engine: MemoryEngine, case: BenchmarkCase) -> PreparedCase:
         namespace = MemoryNamespace(project_id=f"benchmark:longmemeval:{case.id}")
-        episode_ids: list[str] = []
+        group_ids: list[str] = []
         session_ids = case.payload.get("haystack_session_ids") or []
         dates = case.payload.get("haystack_dates") or []
         for session_index, turns in enumerate(case.payload.get("haystack_sessions") or []):
             session_id = str(session_ids[session_index] if session_index < len(session_ids) else session_index)
-            episode_id = f"lme:{case.id}:{session_id}"
-            episode_ids.append(episode_id)
+            group_id = f"lme:{case.id}:{session_id}"
+            group_ids.append(group_id)
             date = dates[session_index] if session_index < len(dates) else None
             messages = []
             for turn_index, turn in enumerate(turns):
@@ -57,8 +57,8 @@ class LongMemEvalAdapter(BenchmarkAdapter):
                     "role": turn.get("role"),
                     "content": content,
                 })
-            engine.ingest_messages(messages, episode_id=episode_id, namespace=namespace)
-        return PreparedCase(tuple(episode_ids), namespace, episode_prefix=f"lme:{case.id}:")
+            engine.ingest_messages(messages, group_id=group_id, namespace=namespace)
+        return PreparedCase(tuple(group_ids), namespace, group_prefix=f"lme:{case.id}:")
 
     def result_metadata(
         self,

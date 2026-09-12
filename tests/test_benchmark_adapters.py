@@ -195,7 +195,7 @@ def test_adapters_isolate_each_case_in_a_namespace(tmp_path, suite, expected_nam
     prepared = adapter.ingest_case(engine, case)
 
     assert prepared.namespace.project_id == expected_namespace
-    assert prepared.episode_ids
+    assert prepared.group_ids
 
 
 def test_locomo_preserves_time_and_indexes_captions_separately(tmp_path) -> None:
@@ -205,7 +205,7 @@ def test_locomo_preserves_time_and_indexes_captions_separately(tmp_path) -> None
     engine = MemoryEngine.open(tmp_path / "store", embedder=DeterministicEmbedder(), auto_process=False)
 
     prepared = adapter.ingest_case(engine, case)
-    deltas = engine.store.list_deltas(kinds=["observation"], namespace=prepared.namespace)
+    deltas = engine.store.list_records(kinds=["raw_source"], namespace=prepared.namespace)
 
     assert len(deltas) == 2
     assert all(item.observed_at and item.observed_at.year == 2023 for item in deltas)

@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from trisynapse_memory.engine.models import (
-    CompiledClaim,
+    Claim,
     MemoryCatalog,
     MemoryCatalogExtension,
     MemoryCatalogHelper,
@@ -29,28 +29,28 @@ from trisynapse_memory.engine.models import (
     VectorProjectionPoint,
 )
 from trisynapse_memory.engine.providers.registry import embedding_cache_key
-from trisynapse_memory.engine.extensions import InspectRequest, RecallReader
-from trisynapse_memory.engine.recall.catalog import BUILTIN_RECALL_HELPERS, builtin_helper_ids, helper_spec
-from trisynapse_memory.engine.recall.compilation import compile_claims
+from trisynapse_memory.engine.extensions import InspectRequest, IndexReader
+from trisynapse_memory.engine.indexes.catalog import BUILTIN_INDEX_HELPERS, builtin_helper_ids, helper_spec
+from trisynapse_memory.engine.indexes.claims import compile_claims
 from trisynapse_memory.engine.retrieval.contracts import DEFAULT_ROUTE_WEIGHTS, RouteRegistry, route_weights
 
 
 def memory_catalog(engine: Any, namespace: MemoryNamespace) -> MemoryCatalog:
     counts = engine.store.retrieval_index_counts(namespace)
-    deltas = engine.store.list_deltas(namespace=namespace, include_retracted=True)
-    observations = {item.id: item for item in deltas if item.kind == "observation"}
-    claims = compile_claims([item for item in deltas if item.kind == "extraction"], observations)
-    episodes = engine.store.episode_recall_views(namespace=namespace)
+    deltas = engine.store.list_records(namespace=namespace, include_retracted=True)
+    observations = {item.id: item for item in deltas if item.kind == "raw_source"}
+    claims = compile_claims([item for item in deltas if item.kind == "fact"], observations)
+    groups = engine.store.group_summary_views(namespace=namespace)
     cache_key = str(getattr(engine.embedder, "cache_key", getattr(engine.embedder, "model_name", "")))
     active_docs, _total_docs = _document_hashes(engine, namespace, limit=2_000)
     embedded = 0
     if active_docs:
-        embedded = len(engine.vector_cache.get(list(active_docs.values()), cache_key))
+        embedded = len(engine.embedding_index.get(list(active_docs.values()), cache_key))
     contested = sum(1 for item in claims if item.status == "CONTESTED")
-    stale_episodes = sum(1 for item in episodes if item.stale)
+    stale_groups = sum(1 for item in groups if item.stale)
     helpers: list[MemoryCatalogHelper] = []
     health_by_id = {
-        "trace": {"count": len(deltas), "observations": sum(1 for item in deltas if item.kind == "observation")},
+        "log": {"count": len(deltas), "raw_sources": sum(1 for item in deltas if item.kind == "raw_source")},
         "documents": {
             "count": counts["documents_active"],
             "inactive": counts["documents"] - counts["documents_active"],
@@ -62,20 +62,20 @@ def memory_catalog(engine: Any, namespace: MemoryNamespace) -> MemoryCatalog:
             "coverage": round(embedded / len(active_docs), 3) if active_docs else 0.0,
             "fingerprint": cache_key,
         },
-        "episodes": {"count": len(episodes), "stale": stale_episodes, "fresh": len(episodes) - stale_episodes},
+        "groups": {"count": len(groups), "stale": stale_groups, "fresh": len(groups) - stale_groups},
         "claims": {"count": len(claims), "contested": contested},
         "graph": {"count": sum(counts["graph_edges"].values()), "edges": counts["graph_edges"]},
     }
     count_by_id = {
-        "trace": len(deltas),
+        "log": len(deltas),
         "documents": counts["documents_active"],
         "bm25": counts["distinct_terms"],
         "vectors": embedded,
-        "episodes": len(episodes),
+        "groups": len(groups),
         "claims": len(claims),
         "graph": sum(counts["graph_edges"].values()),
     }
-    for spec in BUILTIN_RECALL_HELPERS:
+    for spec in BUILTIN_INDEX_HELPERS:
         helpers.append(MemoryCatalogHelper(
             id=spec.id,
             title=spec.title,
@@ -86,9 +86,9 @@ def memory_catalog(engine: Any, namespace: MemoryNamespace) -> MemoryCatalog:
             health=health_by_id.get(spec.id, {}),
         ))
     channel_counts = engine.store.recall_channel_counts(namespace)
-    channels = getattr(getattr(engine, "extensions", None), "recall_channels", None)
+    channels = getattr(getattr(engine, "extensions", None), "index_channels", None)
     if channels is not None:
-        reader = RecallReader(engine.store, namespace)
+        reader = IndexReader(engine.store, namespace)
         for channel in channels.channels:
             health = channel_counts.get(channel.spec.id, {"count": 0, "total": 0, "stale": 0})
             if callable(getattr(channel, "health", None)):
@@ -107,7 +107,7 @@ def memory_catalog(engine: Any, namespace: MemoryNamespace) -> MemoryCatalog:
             ))
     known = builtin_helper_ids() | ({*channels.names} if channels is not None else set())
     for view_type, extra_count in engine.store.recall_view_type_counts(namespace).items():
-        if view_type in known or view_type == "episode_recall":
+        if view_type in known or view_type == "group_summary":
             continue
         helpers.append(MemoryCatalogHelper(
             id=view_type,
@@ -193,10 +193,10 @@ def helper_items(
     cursor: str | None = None,
     limit: int = 50,
 ) -> MemoryHelperPage:
-    channels = getattr(getattr(engine, "extensions", None), "recall_channels", None)
+    channels = getattr(getattr(engine, "extensions", None), "index_channels", None)
     channel = channels.get(helper_id) if channels is not None else None
     if channel is not None:
-        reader = RecallReader(engine.store, namespace)
+        reader = IndexReader(engine.store, namespace)
         if callable(getattr(channel, "inspect", None)):
             return channel.inspect(
                 InspectRequest(search=search, cursor=cursor, limit=limit),
@@ -208,7 +208,7 @@ def helper_items(
             MemoryHelperItem(
                 id=record.record_id,
                 helper_id=helper_id,
-                kind="recall",
+                kind="index",
                 title=record.text[:160] or record.record_id,
                 excerpt=record.text[:400],
                 status="stale" if record.stale else "active",
@@ -232,7 +232,7 @@ def helper_items(
         )
     spec = helper_spec(helper_id)
     offset = int(cursor or 0)
-    if helper_id == "trace":
+    if helper_id == "log":
         page = engine.list(namespace=namespace, cursor=offset or None, limit=limit, include_retracted=True)
         items = [
             MemoryHelperItem(
@@ -240,7 +240,7 @@ def helper_items(
                 helper_id=helper_id,
                 kind=item.kind,
                 title=(item.text or item.kind)[:120],
-                subtitle=item.episode_id,
+                subtitle=item.group_id,
                 excerpt=item.text[:400],
                 status="retracted" if item.id in engine.store.retracted_ids() else "active",
                 data={"seq": item.seq, "locator": item.locator, "source_ref": item.source_ref},
@@ -309,16 +309,16 @@ def helper_items(
             next_cursor=str(next_cursor) if next_cursor is not None else None,
             truncated=next_cursor is not None,
         )
-    if helper_id == "episodes":
-        views = engine.store.episode_recall_views(namespace=namespace)
+    if helper_id == "groups":
+        views = engine.store.group_summary_views(namespace=namespace)
         if search:
             term = search.lower()
             views = [item for item in views if term in f"{item.concept_or_topic} {item.summary}".lower()]
         page = views[offset:offset + limit]
         items = [
             MemoryHelperItem(
-                id=item.id, helper_id=helper_id, kind="recall",
-                title=item.concept_or_topic, subtitle=item.episode_id, excerpt=item.summary,
+                id=item.id, helper_id=helper_id, kind="index",
+                title=item.concept_or_topic, subtitle=item.group_id, excerpt=item.summary,
                 status="stale" if item.stale else "fresh",
                 data=item.model_dump(mode="json"),
             )
@@ -421,7 +421,7 @@ def term_page(
     )
 
 
-def compiled_claims(engine: Any, namespace: MemoryNamespace) -> list[CompiledClaim]:
+def compiled_claims(engine: Any, namespace: MemoryNamespace) -> list[Claim]:
     return _claims(engine, namespace)
 
 
@@ -434,21 +434,21 @@ def vector_projection(
     hashes, documents = _document_hashes(engine, namespace, limit=max(sample, 1))
     cache_key = str(getattr(engine.embedder, "cache_key", getattr(engine.embedder, "model_name", "")))
     configuration = engine.get_model_configuration()
-    vectors = engine.vector_cache.get(list(hashes.values()), cache_key) if hashes else {}
+    vectors = engine.embedding_index.get(list(hashes.values()), cache_key) if hashes else {}
     paired: list[tuple[str, str, list[float]]] = []
-    for delta_id, text_hash in hashes.items():
+    for record_id, text_hash in hashes.items():
         vector = vectors.get(text_hash)
         if vector:
-            paired.append((delta_id, text_hash, vector))
+            paired.append((record_id, text_hash, vector))
     sampled = paired[:sample]
     points: list[VectorProjectionPoint] = []
     if sampled:
         matrix = np.array([item[2] for item in sampled], dtype=float)
         coords = _pca_2d(matrix)
-        for index, (delta_id, text_hash, _vector) in enumerate(sampled):
-            document = documents.get(delta_id) or {}
+        for index, (record_id, text_hash, _vector) in enumerate(sampled):
+            document = documents.get(record_id) or {}
             points.append(VectorProjectionPoint(
-                id=delta_id,
+                id=record_id,
                 x=float(coords[index][0]),
                 y=float(coords[index][1]),
                 modality=str(document.get("modality") or "text"),
@@ -471,21 +471,21 @@ def vector_projection(
 def vector_neighbors(
     engine: Any,
     namespace: MemoryNamespace,
-    delta_id: str,
+    record_id: str,
     *,
     limit: int = 12,
 ) -> VectorNeighbors:
-    documents = engine.store.retrieval_documents_by_ids(namespace, [delta_id])
+    documents = engine.store.retrieval_documents_by_ids(namespace, [record_id])
     if not documents:
-        return VectorNeighbors(delta_id=delta_id, neighbors=[])
+        return VectorNeighbors(record_id=record_id, neighbors=[])
     cache_key = str(getattr(engine.embedder, "cache_key", getattr(engine.embedder, "model_name", "")))
     seed_hash = documents[0]["text_hash"]
-    seed_vectors = engine.vector_cache.get([seed_hash], cache_key)
+    seed_vectors = engine.embedding_index.get([seed_hash], cache_key)
     seed = seed_vectors.get(seed_hash)
     configuration = engine.get_model_configuration()
     if not seed:
-        return VectorNeighbors(delta_id=delta_id, neighbors=[], model=configuration.embedding.model)
-    nearest = engine.vector_cache.nearest(seed, cache_key, limit=limit + 8)
+        return VectorNeighbors(record_id=record_id, neighbors=[], model=configuration.embedding.model)
+    nearest = engine.embedding_index.nearest(seed, cache_key, limit=limit + 8)
     hash_to_doc: dict[str, dict[str, Any]] = {}
     hashes, docs = _document_hashes(engine, namespace, limit=2_000)
     inverse = {text_hash: identifier for identifier, text_hash in hashes.items()}
@@ -493,7 +493,7 @@ def vector_neighbors(
     neighbors: list[VectorNeighbor] = []
     for text_hash, score in nearest:
         other_id = inverse.get(text_hash)
-        if other_id is None or other_id == delta_id:
+        if other_id is None or other_id == record_id:
             continue
         document = hash_to_doc.get(text_hash) or {}
         neighbors.append(VectorNeighbor(
@@ -504,7 +504,7 @@ def vector_neighbors(
         ))
         if len(neighbors) >= limit:
             break
-    return VectorNeighbors(delta_id=delta_id, neighbors=neighbors, model=configuration.embedding.model)
+    return VectorNeighbors(record_id=record_id, neighbors=neighbors, model=configuration.embedding.model)
 
 
 def retrieval_graph_page(
@@ -529,7 +529,7 @@ def retrieval_graph_page(
     documents = {item["id"]: item for item in engine.store.retrieval_documents_by_ids(namespace, ids)}
     nodes = [
         MemoryGraphNode(
-            id=item["id"], type="trace", label=item["text"][:90],
+            id=item["id"], type="log", label=item["text"][:90],
             subtitle=item["modality"], status="active" if item["active"] else "inactive",
             data={"seq": item["seq"], "source_type": item["source_type"]},
         )
@@ -555,12 +555,12 @@ def retrieval_graph_page(
     )
 
 
-def _claims(engine: Any, namespace: MemoryNamespace) -> list[CompiledClaim]:
-    deltas = engine.store.list_deltas(
-        kinds=["observation", "extraction"], namespace=namespace, include_retracted=False
+def _claims(engine: Any, namespace: MemoryNamespace) -> list[Claim]:
+    deltas = engine.store.list_records(
+        kinds=["raw_source", "fact"], namespace=namespace, include_retracted=False
     )
-    observations = {item.id: item for item in deltas if item.kind == "observation"}
-    return compile_claims([item for item in deltas if item.kind == "extraction"], observations)
+    observations = {item.id: item for item in deltas if item.kind == "raw_source"}
+    return compile_claims([item for item in deltas if item.kind == "fact"], observations)
 
 
 def _document_hashes(

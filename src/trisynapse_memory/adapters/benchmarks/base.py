@@ -37,9 +37,9 @@ class BenchmarkCase:
 class PreparedCase:
     """The engine-facing context returned after adapter ingestion."""
 
-    episode_ids: tuple[str, ...]
+    group_ids: tuple[str, ...]
     namespace: MemoryNamespace
-    episode_prefix: str | None = None
+    group_prefix: str | None = None
 
 
 class BenchmarkAdapter(ABC):

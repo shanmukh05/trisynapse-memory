@@ -9,7 +9,7 @@ from trisynapse_memory.adapters.agent_events import capture_agent_event
 from trisynapse_memory.api import create_app
 from trisynapse_memory.cli import app
 from trisynapse_memory.engine import MemoryEngine
-from trisynapse_memory.engine.formation.sources import load_document
+from trisynapse_memory.engine.ingest.sources import load_document
 from trisynapse_memory.engine.models import MemoryNamespace
 from trisynapse_memory.engine.providers.registry import ProviderSettings, completion_from_settings, embedder_from_settings
 
@@ -56,8 +56,8 @@ def test_namespaces_isolate_reads_and_search(tmp_path) -> None:
     engine = engine_at(tmp_path)
     alice = MemoryNamespace(user_id="alice", project_id="support")
     bob = MemoryNamespace(user_id="bob", project_id="support")
-    alice_delta = engine.add("Alice prefers email updates.", namespace=alice, episode_id="chat:alice")
-    engine.add("Bob prefers phone calls.", namespace=bob, episode_id="chat:bob")
+    alice_delta = engine.add("Alice prefers email updates.", namespace=alice, group_id="chat:alice")
+    engine.add("Bob prefers phone calls.", namespace=bob, group_id="chat:bob")
 
     assert [item.id for item in engine.list(namespace=alice).items] == [alice_delta.id]
     assert all("Bob" not in hit.text for hit in engine.search("preferred contact", namespace=alice).hits)
@@ -75,7 +75,7 @@ def test_lifecycle_and_remove_remain_consistent_without_content_filtering(tmp_pa
     original = engine.add(
         "Use api_key=super-secret-value and <private>never store this</private>.",
         namespace=namespace,
-        episode_id="manual:secret",
+        group_id="manual:secret",
         source_ref={"authorization": "Bearer abcdefghijklmnopqrstuvwxyz"},
         scope={"metadata": {"client_secret": "also-super-secret"}},
     )
@@ -86,23 +86,23 @@ def test_lifecycle_and_remove_remain_consistent_without_content_filtering(tmp_pa
     assert "abcdefghijklmnopqrstuvwxyz" in serialized
     assert "also-super-secret" in serialized
 
-    correction = engine.correct(delta_id=original.id, text="Use the credential vault instead.", namespace=namespace)
+    correction = engine.correct(record_id=original.id, text="Use the credential vault instead.", namespace=namespace)
     history = engine.history(original.id, namespace=namespace)
     assert correction.id in {item.id for item in history.events}
     engine.search("credential vault", namespace=namespace)
 
-    result = engine.remove(delta_ids=[original.id], reason="credential incident", namespace=namespace)
+    result = engine.remove(record_ids=[original.id], reason="credential incident", namespace=namespace)
     removed = engine.get(original.id, namespace=namespace, include_retracted=True)
     assert removed.text == "[REMOVED]"
-    assert result.removed_delta_ids == [original.id]
-    assert engine.store.episode_recall_views(namespace=namespace) == []
+    assert result.removed_record_ids == [original.id]
+    assert engine.store.group_summary_views(namespace=namespace) == []
     assert engine.validate_store().ok is True
 
 
 def test_jobs_survive_reopen_and_process(tmp_path) -> None:
     namespace = MemoryNamespace(project_id="jobs")
     engine = engine_at(tmp_path, auto_process=False)
-    engine.add("The project uses SQLite.", episode_id="project:one", namespace=namespace)
+    engine.add("The project uses SQLite.", group_id="project:one", namespace=namespace)
     assert engine.list_jobs(status="pending")
     claimed = engine.store.claim_job()
     assert claimed is not None and claimed.status == "running"
@@ -122,11 +122,11 @@ def test_message_batch_schedules_one_compile_job(tmp_path) -> None:
     engine = engine_at(tmp_path, auto_process=False)
     engine.ingest_messages(
         [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
-        episode_id="chat:batch",
+        group_id="chat:batch",
     )
     jobs = engine.list_jobs(status="pending")
     assert len(jobs) == 1
-    assert jobs[0].kind == "compile_episode"
+    assert jobs[0].kind == "summarize_group"
 
 
 def test_html_and_code_file_loaders(tmp_path) -> None:
@@ -196,12 +196,12 @@ def test_rest_lifecycle_scoped_key_and_studio(tmp_path) -> None:
     ))
     auth = {"Authorization": "Bearer alice-token"}
     add = client.post(
-        "/api/v1/memory/observations",
+        "/api/v1/memory/raw-sources",
         headers=auth,
         json={"text": "Alice prefers email.", "namespace": {"user_id": "alice", "project_id": "support"}},
     )
     assert add.status_code == 200
-    memory_id = add.json()["delta_id"]
+    memory_id = add.json()["record_id"]
     listed = client.get("/api/v1/memories?project_id=support", headers=auth)
     history = client.get(f"/api/v1/memories/{memory_id}/history?project_id=support", headers=auth)
     forbidden = client.post(

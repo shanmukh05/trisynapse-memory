@@ -490,7 +490,7 @@ def _image_source(source: SourceInput, raw: bytes, filename: str, title: str, ur
         raise SourceError("image ingestion requires a configured completion model with vision support")
     if getattr(completion, "vision_supported", None) is False:
         raise SourceError("the selected completion model is known not to support image input")
-    prompt = load_prompt("image_extraction")
+    prompt = load_prompt("image_facts")
     payload = completion.complete_multimodal(
         prompt.text,
         "Extract a faithful memory-ready description of this image.",

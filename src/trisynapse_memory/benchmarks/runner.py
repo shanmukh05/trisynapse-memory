@@ -27,7 +27,7 @@ from trisynapse_memory.engine.providers.registry import (
 )
 from trisynapse_memory.prompts import load_prompt, prompt_provenance
 
-_END_TO_END_PROMPTS = ("extraction", "episode_recall", "answer", "benchmark_judge")
+_END_TO_END_PROMPTS = ("facts", "group_summary", "answer", "benchmark_judge")
 
 
 @dataclass(frozen=True)
@@ -230,7 +230,7 @@ def _execute_cases(
             )
             result = engine.query(
                 question.question,
-                episode_prefix=prepared.episode_prefix,
+                group_prefix=prepared.group_prefix,
                 namespace=prepared.namespace,
             )
             context = " ".join(hit.text for hit in result.retrieval_hits)
@@ -362,9 +362,9 @@ def _open_benchmark_engine(
 
 def _prepare_case(engine: MemoryEngine, prepared: PreparedCase, mode: BenchmarkMode) -> None:
     if mode == "end-to-end":
-        for episode_id in prepared.episode_ids:
-            engine.run_extraction(episode_id=episode_id, namespace=prepared.namespace)
-    engine.build_episode_recall(list(prepared.episode_ids), namespace=prepared.namespace)
+        for group_id in prepared.group_ids:
+            engine.run_fact_extraction(group_id=group_id, namespace=prepared.namespace)
+    engine.build_group_summary(list(prepared.group_ids), namespace=prepared.namespace)
 
 
 def _provider_provenance(

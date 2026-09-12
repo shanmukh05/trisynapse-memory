@@ -11,12 +11,12 @@ ns = MemoryNamespace(user_id="maya", project_id="personal")
 memory = MemoryEngine.from_env("~/.trisynapse-memory/store", namespace=ns)
 ```
 
-### Observations and conversations
+### Raw sources and conversations
 
 ```python
 item = memory.add(
     "Maya prefers three-bullet updates.",
-    episode_id="chat:8",
+    group_id="chat:8",
     external_key="personal:maya:message:8:4",
 )
 
@@ -25,16 +25,16 @@ memory.ingest_messages(
         {"id": "m1", "role": "user", "content": "Send the update Friday."},
         {"id": "m2", "role": "assistant", "content": "Understood."},
     ],
-    episode_id="chat:9",
+    group_id="chat:9",
 )
 ```
 
-Use `external_key` when a caller may repeat an observation write. Use `add_batch()` only for text that is already normalized:
+Use `external_key` when a caller may repeat a raw-source write. Use `add_many()` only for text that is already normalized:
 
 ```python
-memory.add_batch([
-    {"text": "First observation", "episode_id": "chat:10"},
-    {"text": "Second observation", "episode_id": "chat:10"},
+memory.add_many([
+    {"text": "First raw source", "group_id": "chat:10"},
+    {"text": "Second raw source", "group_id": "chat:10"},
 ])
 ```
 
@@ -54,7 +54,7 @@ for result in run.results:
     print(result.index, result.status, result.source_id, result.error)
 ```
 
-`ingest_many()` preprocesses at most four sources concurrently and commits valid sources in input order. The optional `on_progress` callback reports durable-run creation, preprocessing, Trace writes, and finalization. The run status is `completed`, `partial`, or `failed`.
+`ingest_many()` preprocesses at most four sources concurrently and commits valid sources in input order. The optional `on_progress` callback reports durable-run creation, preprocessing, Memory-log writes, and finalization. The run status is `completed`, `partial`, or `failed`.
 
 ```python
 memory.list_sources()
@@ -82,10 +82,10 @@ print(answer.answer, answer.abstain)
 for hit in answer.retrieval_hits:  # populated even if answer.abstain is true
     print(hit.score, hit.locator, hit.metadata["modality"], hit.metadata["retrieval_fields"])
 for citation in answer.citations:
-    print(citation.delta_id, citation.source_ref, citation.locator)
+    print(citation.record_id, citation.source_ref, citation.locator)
 ```
 
-`search()` returns ranked evidence for application logic. `query()` returns an answer or abstention with citations and `retrieval_hits`. Retrieval hits are captured before answer generation and remain present after an abstention; citations are only the evidence attached to a completed answer. Both methods accept `on_step`, which receives each durable input, classification, retrieval, confidence, refinement, Deep Recall, grounding, answer, and audit step as it completes. `retrieval_trace` explains routing and grounding.
+`search()` returns ranked evidence for application logic. `query()` returns an answer or abstention with citations and `retrieval_hits`. Retrieval hits are captured before answer generation and remain present after an abstention; citations are only the evidence attached to a completed answer. Both methods accept `on_step`, which receives each durable input, classification, retrieval, confidence, refinement, deep summary, grounding, answer, and audit step as it completes. `retrieval_trace` explains routing and grounding.
 
 Content, query text, metadata, locators, and retrieval fields are accepted as supplied. Sanitize sensitive values in the application before calling Python, REST, or TypeScript ingestion and query methods.
 
@@ -110,9 +110,9 @@ class ProductPlanner:
 memory = MemoryEngine.open("./memory", query_planner=ProductPlanner())
 ```
 
-Implement `RetrievalRoute.name` and `rank(plan, context)`, then add the instance to a `RouteRegistry`. Pass the registry as `retrieval_routes=`. Custom routes return `(item_id, score)` pairs and still go through fusion, confidence checks, Trace grounding, and context limits.
+Implement `RetrievalRoute.name` and `rank(plan, context)`, then add the instance to a `RouteRegistry`. Pass the registry as `retrieval_routes=`. Custom routes return `(item_id, score)` pairs and still go through fusion, confidence checks, memory-log grounding, and context limits.
 
-`RetrievalRoute` is the compatibility API for ranking items already present in the built-in candidate index. Use an extension pack when an algorithm needs its own source kind, Formation processor, Recall records, or candidates.
+`RetrievalRoute` is the compatibility API for ranking items already present in the built-in candidate index. Use an extension pack when an algorithm needs its own source kind, ingest processor, index records, or candidates.
 
 ### Extension packs
 
@@ -123,17 +123,17 @@ from trisynapse_memory import (
     BranchResult,
     ExtensionSpec,
     MemoryEngine,
-    RecallChannelSpec,
-    RecallRecord,
+    IndexChannelSpec,
+    IndexRecord,
     RetrievalBranchSpec,
     RetrievalCandidate,
 )
 
 class EntityProfiles:
-    spec = RecallChannelSpec(id="example.entities", title="Entity profiles")
+    spec = IndexChannelSpec(id="example.entities", title="Entity profiles")
 
     def project(self, batch, writer):
-        evidence = [item for item in batch.deltas if item.kind == "extraction"]
+        evidence = [item for item in batch.records if item.kind == "fact"]
         if evidence:
             writer.put(
                 "project-atlas",
@@ -143,13 +143,13 @@ class EntityProfiles:
                 fields={"entity": "Project Atlas"},
             )
 
-    def rebuild(self, trace, writer):
-        evidence = trace.deltas(kinds=("extraction",))
-        records = [] if not evidence else [RecallRecord(
+    def rebuild(self, reader, writer):
+        evidence = reader.records(kinds=("fact",))
+        records = [] if not evidence else [IndexRecord(
             channel_id=self.spec.id,
             record_id="project-atlas",
-            namespace=trace.namespace,
-            evidence_version=trace.seq_cutoff or 0,
+            namespace=reader.namespace,
+            evidence_version=reader.seq_cutoff or 0,
             text="Project Atlas entity profile",
             evidence_refs=tuple(item.id for item in evidence),
             fields={"entity": "Project Atlas"},
@@ -164,7 +164,7 @@ class EntityProfileBranch:
     )
 
     def retrieve(self, plan, context):
-        records, _ = context.recall.records("example.entities", search="atlas", limit=20)
+        records, _ = context.indexes.records("example.entities", search="atlas", limit=20)
         return BranchResult(
             branch=self.spec.name,
             candidates=tuple(
@@ -172,10 +172,10 @@ class EntityProfileBranch:
                     id=record.record_id,
                     branch=self.spec.name,
                     channel_id=record.channel_id,
-                    kind="recall",
+                    kind="index",
                     score=1.0,
                     text=record.text,
-                    evidence_delta_ids=record.evidence_refs,
+                    evidence_record_ids=record.evidence_refs,
                 )
                 for record in records
             ),
@@ -190,7 +190,7 @@ class EntityExtension:
     )
 
     def register(self, registry):
-        registry.recall_channels.register(EntityProfiles())
+        registry.index_channels.register(EntityProfiles())
         registry.retrieval_branches.register(EntityProfileBranch())
 
 memory = MemoryEngine.open("./memory", extensions=[EntityExtension()])
@@ -205,19 +205,19 @@ The main extension contracts exported from `trisynapse_memory` are:
 | Contract | Purpose |
 |---|---|
 | `SourceHandler` | Accept and safely prepare a custom `SourceInput.kind`. |
-| `FormationProcessor` / `ProposedDelta` | Produce core-validated, evidence-linked extraction or annotation deltas through durable jobs. |
-| `RecallChannel` / `TraceReader` / `RecallWriter` | Project and atomically rebuild records in namespace-scoped, core-owned storage. |
-| `RetrievalBranch` / `RetrievalCandidate` | Return bounded Trace or Recall candidates with active evidence references. |
+| `IngestProcessor` / `ProposedRecord` | Produce core-validated, evidence-linked fact or note records through durable jobs. |
+| `IndexChannel` / `MemoryLogReader` / `IndexWriter` | Project and atomically rebuild records in namespace-scoped, core-owned storage. |
+| `RetrievalBranch` / `RetrievalCandidate` | Return bounded memory-log or index candidates with active evidence references. |
 | `FusionStrategy` | Replace weighted RRF explicitly. |
 | `CandidateReranker` | Replace the default semantic/reliability/recency post-fusion ordering. |
 
-`PreparedChunk` from a custom source handler may set `modality`, `source_type`, and `retrieval_fields`; this bypasses the built-in source descriptor mapping while preserving core Trace validation. Custom source kinds are strings rather than a closed enum.
+`PreparedChunk` from a custom source handler may set `modality`, `source_type`, and `retrieval_fields`; this bypasses the built-in source descriptor mapping while preserving core memory-log validation. Custom source kinds are strings rather than a closed enum.
 
-Formation and Recall components are scheduled after an episode commits. Their job kinds are namespaced (`formation:<name>` and `recall:<channel>:project`). Optional component failure does not roll back committed Trace. The catalog reports registered channels, branches, extension versions, projection status, dependencies, and cost tiers.
+Ingest and index components are scheduled after an record group commits. Their job kinds remain namespaced (`ingest:<name>` and `index:<channel>:project`). Optional component failure does not roll back committed memory-log records. The catalog reports registered channels, branches, extension versions, projection status, dependencies, and cost tiers.
 
-A persistent Recall channel must implement `rebuild(trace, writer)`. When an installed extension's `storage_revision` changes, opening the store marks it `rebuild_required` and enqueues `extension:<id>:rebuild`. Run the normal worker with `run_jobs()`, or explicitly call `rebuild_extension(id, wait=True)`. Rebuild reads active Trace through a namespace-scoped `TraceReader` and should finish with `writer.replace(records)` so the channel switches atomically.
+A persistent Index channel must implement `rebuild(reader, writer)`. When an installed extension's `storage_revision` changes, opening the store marks it `rebuild_required` and enqueues `extension:<id>:rebuild`. Run the normal worker with `run_jobs()`, or explicitly call `rebuild_extension(id, wait=True)`. Rebuild reads active memory-log records through a namespace-scoped `MemoryLogReader` and should finish with `writer.replace(records)` so the channel switches atomically.
 
-Recall candidates never enter answer context directly. Each must include active, same-namespace `evidence_delta_ids`; the retriever validates them and grounds back to observation or extraction deltas. Retraction disables dependent generic Recall records, and physical removal deletes them.
+Index candidates never enter answer context directly. Each must include active, same-namespace `evidence_record_ids`; the retriever validates them and grounds back to raw-source or fact records. Retraction disables dependent generic index records, and physical removal deletes them.
 
 `MemoryEngine.open` also accepts `fusion_strategy=` and `candidate_reranker=` for retrieval experiments. Existing `query_planner=` and `retrieval_routes=` arguments remain supported.
 
@@ -264,21 +264,21 @@ API keys remain environment-only. An independent judge can be selected without c
 
 ```python
 memory.correct(
-    delta_id=item.id,
+    record_id=item.id,
     text="Maya prefers at most three bullets.",
     reason="clarified maximum",
 )
 
-memory.forget(delta_id=item.id, reason="preference expired")
+memory.forget(record_id=item.id, reason="preference expired")
 
 memory.remove(
-    delta_ids=[item.id],
+    record_ids=[item.id],
     reason="approved privacy deletion",
     requested_by="privacy-service",
 )
 ```
 
-`correct()` and `forget()` append events. `remove()` physically redacts selected deltas and returns `RemoveResult` with `remove_id` and `removed_delta_ids`. There is no `purge()` alias.
+`correct()` and `forget()` append events. `remove()` physically redacts selected records and returns `RemoveResult` with `remove_id` and `removed_record_ids`.
 
 Use `memory.validate_store()` for operational validation. It returns `StoreValidation` with SQLite status, delta count, sequence continuity, malformed or broken evidence references, and missing or corrupted retained-source IDs. This is a consistency and corruption check, not proof against an administrator who can rewrite the database.
 
@@ -330,10 +330,10 @@ Use `Authorization: Bearer TOKEN` except for health. The OpenAPI document is at 
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/api/v1/health` | Version, store readiness, pending jobs |
-| `POST` | `/api/v1/memory/observations` | Add one observation |
-| `POST` | `/api/v1/memory/messages` | Add a conversation episode |
-| `POST` | `/api/v1/memories/batch` | Add normalized observations |
-| `GET` | `/api/v1/memories` | Cursor-paginated Trace records |
+| `POST` | `/api/v1/memory/raw-sources` | Add one raw source |
+| `POST` | `/api/v1/memory/messages` | Add messages to a record group |
+| `POST` | `/api/v1/memories/many` | Add normalized raw sources |
+| `GET` | `/api/v1/memories` | Cursor-paginated memory-log records |
 | `GET` | `/api/v1/memories/{id}` | Get one record |
 | `GET` | `/api/v1/memories/{id}/history` | Linked lifecycle history |
 | `POST` | `/api/v1/search` | Ranked evidence and diagnostics; `persist=false` skips writing a Query Run |
@@ -366,7 +366,7 @@ These store-wide routes require the administrator bearer token when authenticati
 
 `PUT` returns `200` for an immediate change, `202` plus `job_id` for an embedding rebuild, and `409` when confirmation or a fresh revision is required. API keys are never accepted or returned.
 
-Retrieval configuration includes `retrieval_profile`, `enabled_routes`, `route_weights`, `max_context_tokens`, and `per_source_context_tokens`, in addition to result count, graph depth, refinement, confidence, Deep Recall, and abstention settings. For example:
+Retrieval configuration includes `retrieval_profile`, `enabled_routes`, `route_weights`, `max_context_tokens`, and `per_source_context_tokens`, in addition to result count, graph depth, refinement, confidence, deep summary, and abstention settings. For example:
 
 ```json
 {
@@ -380,7 +380,7 @@ Retrieval configuration includes `retrieval_profile`, `enabled_routes`, `route_w
   "max_refinement_rounds": 2,
   "graph_hops": 2,
   "confidence_margin": 0.018,
-  "deep_recall_enabled": true,
+  "deep_summary_enabled": true,
   "answer_abstain_threshold": 0.1,
   "revision": 0
 }
@@ -403,7 +403,7 @@ Model selection uses a separate request body (the REST wrapper also accepts the 
 |---|---|---|
 | `POST` | `/api/v1/sources/ingest` | Accept up to 100 descriptors; return `202` and durable run |
 | `GET` | `/api/v1/sources` | Search, filter, sort, and paginate source cards with facets |
-| `GET` | `/api/v1/sources/{source_id}` | Inspect versions, metadata, and delta IDs |
+| `GET` | `/api/v1/sources/{source_id}` | Inspect versions, metadata, and record IDs |
 | `GET` | `/api/v1/sources/{source_id}/preview` | Safe structured, locator-aware preview items |
 | `GET` | `/api/v1/sources/{source_id}/content` | Authorized inline-safe content or original download |
 | `POST` | `/api/v1/sources/{source_id}/remove` | Delete source and derived memory |
@@ -440,12 +440,12 @@ The graph and Memory Viewer inspection routes are:
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/api/v1/memory/catalog` | Trace + Recall helpers, retrieval branches, and extension status/health |
+| `GET` | `/api/v1/memory/catalog` | Trace + index helpers, retrieval branches, and extension status/health |
 | `GET` | `/api/v1/memory/overview` | Catalog-aligned counts and health |
 | `GET` | `/api/v1/memory/helpers/{id}` | Generic paginated `items[]` for any helper, including unknown ids |
 | `GET` | `/api/v1/memory/documents` | Paginated `retrieval_documents` |
 | `GET` | `/api/v1/memory/terms` | BM25 terms ranked by document frequency, with posting lists |
-| `GET` | `/api/v1/memory/claims` | Compiled claims, including `CONTESTED` groups |
+| `GET` | `/api/v1/memory/claims` | Claims, including `CONTESTED` groups |
 | `GET` | `/api/v1/memory/vectors/projection` | Sampled 2D PCA points (never raw embeddings) |
 | `GET` | `/api/v1/memory/vectors/neighbors` | Nearest neighbors for one embedded Trace id |
 | `GET` | `/api/v1/memory/retrieval-graph` | `followed_by` and `about_same_entity` edges |

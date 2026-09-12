@@ -59,7 +59,7 @@ class LoCoMoAdapter(BenchmarkAdapter):
     def ingest_case(self, engine: MemoryEngine, case: BenchmarkCase) -> PreparedCase:
         namespace = MemoryNamespace(project_id=f"benchmark:locomo:{case.id}")
         conversation = case.payload.get("conversation") or {}
-        episode_ids: list[str] = []
+        group_ids: list[str] = []
         session_keys = sorted(
             (
                 key for key, value in conversation.items()
@@ -69,8 +69,8 @@ class LoCoMoAdapter(BenchmarkAdapter):
         )
         for key in session_keys:
             turns = conversation[key]
-            episode_id = f"locomo:{case.id}:{key}"
-            episode_ids.append(episode_id)
+            group_id = f"locomo:{case.id}:{key}"
+            group_ids.append(group_id)
             raw_observed = conversation.get(f"{key}_date_time")
             observed = _normalize_locomo_timestamp(raw_observed)
             for index, turn in enumerate(turns):
@@ -82,9 +82,9 @@ class LoCoMoAdapter(BenchmarkAdapter):
                     "session": key,
                     "raw_timestamp": raw_observed,
                 }
-                engine.ingest_observation(
+                engine.ingest_raw_source(
                     text,
-                    episode_id=episode_id,
+                    group_id=group_id,
                     observed_at=observed,
                     source_ref=source_ref,
                     locator={"kind": "dialog", "dia_id": dialog_id, "turn_index": index},
@@ -98,9 +98,9 @@ class LoCoMoAdapter(BenchmarkAdapter):
                 )
                 caption = str(turn.get("blip_caption") or "").strip()
                 if caption:
-                    engine.ingest_observation(
+                    engine.ingest_raw_source(
                         f"Image shared by {turn.get('speaker', 'speaker')}: {caption}",
-                        episode_id=episode_id,
+                        group_id=group_id,
                         observed_at=observed,
                         source_ref=source_ref,
                         locator={"kind": "image_caption", "dia_id": dialog_id, "turn_index": index},
@@ -112,7 +112,7 @@ class LoCoMoAdapter(BenchmarkAdapter):
                         process=False,
                         schedule=False,
                     )
-        return PreparedCase(tuple(episode_ids), namespace)
+        return PreparedCase(tuple(group_ids), namespace)
 
     def result_metadata(
         self,

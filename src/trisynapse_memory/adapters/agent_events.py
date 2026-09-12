@@ -36,7 +36,7 @@ def capture_agent_event(engine: MemoryEngine, event: AgentEvent | dict[str, Any]
         project_id=value.project_id,
         session_id=value.session_id,
     )
-    episode_id = f"agent:{value.agent_id}:{value.session_id}"
+    group_id = f"agent:{value.agent_id}:{value.session_id}"
     if value.type in {"session_start", "pre_compact"}:
         query = value.content or "current project decisions, constraints, preferences, failures, and next steps"
         profile = engine.compile_profile(namespace=namespace, query=query)
@@ -45,18 +45,18 @@ def capture_agent_event(engine: MemoryEngine, event: AgentEvent | dict[str, Any]
     text = _event_text(value)
     if not text:
         return {"captured": False, "reason": "event contains no durable content"}
-    delta = engine.ingest_observation(
+    delta = engine.ingest_raw_source(
         text,
-        episode_id=episode_id,
+        group_id=group_id,
         source_ref={"type": "agent_event", "agent_id": value.agent_id, "session_id": value.session_id},
         locator={"event_type": value.type, "tool_name": value.tool_name},
         scope={"event_type": value.type, **value.metadata},
         namespace=namespace,
         external_key=value.metadata.get("event_id"),
     )
-    response: dict[str, Any] = {"captured": True, "delta_id": delta.id}
+    response: dict[str, Any] = {"captured": True, "record_id": delta.id}
     if value.type in {"stop", "session_end"}:
-        engine.build_episode_recall([episode_id], namespace=namespace)
+        engine.build_group_summary([group_id], namespace=namespace)
         response["context"] = engine.compile_profile(namespace=namespace)
     return response
 

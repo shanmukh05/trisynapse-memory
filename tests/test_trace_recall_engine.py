@@ -43,17 +43,17 @@ def make_engine(tmp_path) -> MemoryEngine:
 
 def test_trace_is_ordered_idempotent_and_retractable(tmp_path) -> None:
     engine = make_engine(tmp_path)
-    first = engine.ingest_observation(
+    first = engine.ingest_raw_source(
         "Caroline attended an LGBTQ support group on May 7, 2023.",
-        episode_id="chat:one",
+        group_id="chat:one",
         external_key="message:one",
     )
-    duplicate = engine.ingest_observation(
+    duplicate = engine.ingest_raw_source(
         "Caroline attended an LGBTQ support group on May 7, 2023.",
-        episode_id="chat:one",
+        group_id="chat:one",
         external_key="message:one",
     )
-    second = engine.ingest_observation("The meeting was helpful.", episode_id="chat:one")
+    second = engine.ingest_raw_source("The meeting was helpful.", group_id="chat:one")
 
     assert duplicate.id == first.id
     assert second.seq == first.seq + 1
@@ -62,17 +62,17 @@ def test_trace_is_ordered_idempotent_and_retractable(tmp_path) -> None:
     assert "prev_hash" not in second.model_dump()
     assert engine.validate_store().ok is True
 
-    tombstone = engine.retract(delta_id=first.id, reason="remove imported message")
+    tombstone = engine.retract(record_id=first.id, reason="remove imported message")
     assert tombstone.kind == "retraction"
-    assert first.id not in {item.id for item in engine.store.list_deltas()}
-    assert first.id in {item.id for item in engine.store.list_deltas(include_retracted=True)}
+    assert first.id not in {item.id for item in engine.store.list_records()}
+    assert first.id in {item.id for item in engine.store.list_records(include_retracted=True)}
     assert engine.validate_store().ok is True
 
 
 def test_store_validation_reports_sequence_gaps_and_broken_evidence_links(tmp_path) -> None:
     engine = make_engine(tmp_path)
-    first = engine.ingest_observation("First observation")
-    second = engine.ingest_observation("Second observation")
+    first = engine.ingest_raw_source("First observation")
+    second = engine.ingest_raw_source("Second observation")
     engine.store._connection.execute(
         "UPDATE deltas SET evidence_refs_json=? WHERE id=?",
         ('["missing-delta"]', first.id),
@@ -89,16 +89,16 @@ def test_store_validation_reports_sequence_gaps_and_broken_evidence_links(tmp_pa
     assert validation.broken_evidence_refs == [f"{first.id}->missing-delta"]
 
 
-def test_episode_recall_routes_but_never_grounds_answer(tmp_path) -> None:
+def test_group_summary_routes_but_never_grounds_answer(tmp_path) -> None:
     engine = make_engine(tmp_path)
     engine.ingest_messages(
         [
             {"id": "m1", "role": "user", "content": "Caroline attended an LGBTQ support group on May 7, 2023."},
             {"id": "m2", "role": "assistant", "content": "She described the meeting as helpful."},
         ],
-        episode_id="chat:caroline",
+        group_id="chat:caroline",
     )
-    views = engine.build_episode_recall()
+    views = engine.build_group_summary()
     result = engine.query("When did Caroline attend the support group?")
 
     assert len(views) == 1
@@ -106,8 +106,8 @@ def test_episode_recall_routes_but_never_grounds_answer(tmp_path) -> None:
     assert "May 7, 2023" in result.answer
     assert result.citations
     assert result.retrieval_trace.routing_seeds
-    assert result.retrieval_trace.episode_recall_in_answer_context == 0
-    assert all(engine.get_delta(item.delta_id).kind in {"observation", "extraction"} for item in result.citations)
+    assert result.retrieval_trace.group_summary_in_answer_context == 0
+    assert all(engine.get_record(item.record_id).kind in {"raw_source", "fact"} for item in result.citations)
 
 
 def test_query_reports_durable_retrieval_steps_as_they_complete(tmp_path) -> None:
@@ -128,15 +128,15 @@ def test_query_reports_durable_retrieval_steps_as_they_complete(tmp_path) -> Non
 
 def test_snapshots_are_recall_windows_not_trace_mutations(tmp_path) -> None:
     engine = make_engine(tmp_path)
-    first = engine.ingest_observation("The project uses SQLite.", episode_id="project:one")
+    first = engine.ingest_raw_source("The project uses SQLite.", group_id="project:one")
     before = engine.snapshot.create("before vector store")
-    second = engine.ingest_observation("The vector cache uses LanceDB.", episode_id="project:one")
+    second = engine.ingest_raw_source("The vector cache uses LanceDB.", group_id="project:one")
     after = engine.snapshot.create("after vector store")
 
     diff = engine.snapshot.diff(before.id, after.id)
     rolled_back = engine.snapshot.rollback(before.id)
 
-    assert diff.added_delta_ids == [second.id]
+    assert diff.added_record_ids == [second.id]
     assert rolled_back.seq_cutoff == first.seq
     assert engine.store.max_seq() == second.seq
     assert engine.validate_store().ok is True
@@ -146,20 +146,20 @@ def test_rest_smoke_ingest_compile_search_and_query(tmp_path) -> None:
     engine = make_engine(tmp_path)
     client = TestClient(create_app(tmp_path, engine=engine))
 
-    add = client.post("/api/v1/memory/observations", json={
+    add = client.post("/api/v1/memory/raw-sources", json={
         "text": "Melanie read The Left Hand of Darkness.",
-        "episode_id": "chat:books",
+        "group_id": "chat:books",
         "source_ref": {"type": "chat", "id": "books"},
         "modality": "conversation",
         "source_type": "chat",
         "retrieval_fields": {"speaker": "Melanie", "message": "read The Left Hand of Darkness"},
     })
-    compile_response = client.post("/api/v1/memory/episodes/compile", json={})
+    compile_response = client.post("/api/v1/memory/groups/summarize", json={})
     search = client.post("/api/v1/search", json={"query": "What book did Melanie read?", "top_k": 3})
     query = client.post("/api/v1/query", json={"question": "What book did Melanie read?", "top_k": 3})
 
     assert add.status_code == 200
-    added_delta = engine.get(add.json()["delta_id"])
+    added_delta = engine.get(add.json()["record_id"])
     assert added_delta.payload["modality"] == "conversation"
     assert added_delta.payload["retrieval_fields"]["speaker"] == "Melanie"
     assert compile_response.status_code == 200
@@ -173,10 +173,10 @@ def test_rest_smoke_ingest_compile_search_and_query(tmp_path) -> None:
 def test_entity_graph_restores_multi_hop_bridges(tmp_path) -> None:
     engine = make_engine(tmp_path)
     one = engine.store.append(
-        kind="extraction", text="Maya adopted Comet", subject="Maya", relation="adopted", object="Comet"
+        kind="fact", text="Maya adopted Comet", subject="Maya", relation="adopted", object="Comet"
     )
     two = engine.store.append(
-        kind="extraction", text="Comet needs daily medication", subject="Comet", relation="needs", object="medication"
+        kind="fact", text="Comet needs daily medication", subject="Comet", relation="needs", object="medication"
     )
     graph = engine.store.retrieval_graph(MemoryNamespace())
 
@@ -206,14 +206,14 @@ def test_extraction_records_only_model_selected_observation_ids(tmp_path) -> Non
         completion=EvidenceCompletion(),
         auto_process=False,
     )
-    selected = engine.ingest_observation(
-        "Maya adopted Comet.", episode_id="chat:pets", locator={"dia_id": "D1:1"}, schedule=False,
+    selected = engine.ingest_raw_source(
+        "Maya adopted Comet.", group_id="chat:pets", locator={"dia_id": "D1:1"}, schedule=False,
     )
-    engine.ingest_observation(
-        "Jordan bought a bicycle.", episode_id="chat:pets", locator={"dia_id": "D1:2"}, schedule=False,
+    engine.ingest_raw_source(
+        "Jordan bought a bicycle.", group_id="chat:pets", locator={"dia_id": "D1:2"}, schedule=False,
     )
 
-    extraction = engine.run_extraction(episode_id="chat:pets")[0]
+    extraction = engine.run_fact_extraction(group_id="chat:pets")[0]
 
     assert extraction.evidence_refs == [selected.id]
     assert extraction.locator == {"dia_id": "D1:1"}
@@ -233,12 +233,12 @@ def test_answer_model_selects_the_smallest_citation_set(tmp_path) -> None:
         completion=CitationCompletion(),
         auto_process=False,
     )
-    selected = engine.ingest_observation("Maya prefers tea.", schedule=False)
-    engine.ingest_observation("Maya owns a bicycle.", schedule=False)
+    selected = engine.ingest_raw_source("Maya prefers tea.", schedule=False)
+    engine.ingest_raw_source("Maya owns a bicycle.", schedule=False)
 
     answer = engine.query("What does Maya prefer?")
 
-    assert [citation.delta_id for citation in answer.citations] == [selected.id]
+    assert [citation.record_id for citation in answer.citations] == [selected.id]
     assert len(answer.retrieval_hits) > len(answer.citations)
 
 
@@ -270,13 +270,13 @@ def test_query_planner_and_route_registry_are_replaceable(tmp_path) -> None:
         auto_process=False,
     )
     engine.retriever_config = RetrieverConfig(
-        enabled_routes=("custom",), max_refinement_rounds=0, deep_recall_enabled=False
+        enabled_routes=("custom",), max_refinement_rounds=0, deep_summary_enabled=False
     )
     engine._retriever_override = True
-    wanted = engine.ingest_observation(
+    wanted = engine.ingest_raw_source(
         "needle implementation", modality="code", retrieval_fields={"symbol": "needle"}, schedule=False
     )
-    engine.ingest_observation("unrelated prose", schedule=False)
+    engine.ingest_raw_source("unrelated prose", schedule=False)
 
     result = engine.search("anything", top_k=1)
 
@@ -288,14 +288,14 @@ def test_query_planner_and_route_registry_are_replaceable(tmp_path) -> None:
 
 def test_source_aware_routes_and_multi_field_index(tmp_path) -> None:
     engine = make_engine(tmp_path)
-    code = engine.ingest_observation(
+    code = engine.ingest_raw_source(
         "def authenticate(request): pass",
         modality="code",
         source_type="python",
         retrieval_fields={"symbol": "authenticate", "path": "api/security.py", "language": "python"},
         schedule=False,
     )
-    engine.ingest_observation(
+    engine.ingest_raw_source(
         "Authentication guidance for operators.",
         modality="document",
         retrieval_fields={"title": "Operations", "section": "Security"},
@@ -315,10 +315,10 @@ def test_source_aware_routes_and_multi_field_index(tmp_path) -> None:
 def test_lexical_and_graph_indexes_persist_and_update_incrementally(tmp_path) -> None:
     engine = make_engine(tmp_path)
     first = engine.store.append(
-        kind="extraction", text="Comet is Maya's dog", subject="Comet", relation="owner", object="Maya"
+        kind="fact", text="Comet is Maya's dog", subject="Comet", relation="owner", object="Maya"
     )
     second = engine.store.append(
-        kind="extraction", text="Comet needs medication", subject="Comet", relation="needs", object="medication"
+        kind="fact", text="Comet needs medication", subject="Comet", relation="needs", object="medication"
     )
     stats_before = engine.store.retrieval_index_statistics(MemoryNamespace())
     graph_before = engine.store.retrieval_graph(MemoryNamespace())
@@ -336,9 +336,9 @@ def test_lexical_and_graph_indexes_persist_and_update_incrementally(tmp_path) ->
 
 def test_token_budgeted_context_balances_sources() -> None:
     items = {
-        "a1": _Item(id="a1", kind="observation", text="a" * 120, index_text="a", confidence=1, source_ref={"id": "a"}),
-        "a2": _Item(id="a2", kind="observation", text="b" * 120, index_text="b", confidence=1, source_ref={"id": "a"}),
-        "b1": _Item(id="b1", kind="observation", text="c" * 120, index_text="c", confidence=1, source_ref={"id": "b"}),
+        "a1": _Item(id="a1", kind="raw_source", text="a" * 120, index_text="a", confidence=1, source_ref={"id": "a"}),
+        "a2": _Item(id="a2", kind="raw_source", text="b" * 120, index_text="b", confidence=1, source_ref={"id": "a"}),
+        "b1": _Item(id="b1", kind="raw_source", text="c" * 120, index_text="c", confidence=1, source_ref={"id": "b"}),
     }
     index = _Index(items=items, adjacency={}, df={}, avgdl=1)
 
@@ -368,7 +368,7 @@ def test_query_records_the_effective_token_counter(tmp_path) -> None:
         token_counter=WordCounter(),
         auto_process=False,
     )
-    engine.ingest_observation("Maya prefers green tea", schedule=False)
+    engine.ingest_raw_source("Maya prefers green tea", schedule=False)
 
     result = engine.search("What tea does Maya prefer?", top_k=1)
     grounding = next(

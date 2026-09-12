@@ -34,8 +34,8 @@ class RecordingCompletion:
         self.prompt_names: list[str] = []
 
     def __call__(self, system: str, user: str) -> dict:
-        if system == load_prompt("extraction").text:
-            self.prompt_names.append("extraction")
+        if system == load_prompt("facts").text:
+            self.prompt_names.append("facts")
             return {
                 "facts": [{
                     "subject": "Caroline",
@@ -46,8 +46,8 @@ class RecordingCompletion:
                     "confidence": 0.95,
                 }]
             }
-        if system == load_prompt("episode_recall").text:
-            self.prompt_names.append("episode_recall")
+        if system == load_prompt("group_summary").text:
+            self.prompt_names.append("group_summary")
             return {
                 "concept_or_topic": "Caroline support group",
                 "summary": "Caroline attended a support group on 7 May 2023.",
@@ -90,13 +90,13 @@ def _locomo_fixture(path) -> None:
 
 
 def test_packaged_prompts_are_versioned_and_hashed() -> None:
-    names = ["extraction", "episode_recall", "answer", "benchmark_judge"]
+    names = ["facts", "group_summary", "answer", "benchmark_judge"]
     provenance = prompt_provenance(names)
 
     assert [item["name"] for item in provenance] == names
     assert [item["version"] for item in provenance] == [
         "extraction-v2",
-        "episode-recall-v1",
+        "group-summary-v1",
         "answer-v2",
         "benchmark-judge-v1",
     ]
@@ -110,19 +110,19 @@ def test_engine_uses_packaged_prompts_and_records_extraction_version(tmp_path) -
     engine = MemoryEngine.open(
         tmp_path, embedder=DeterministicEmbedder(), completion=completion, auto_process=False
     )
-    engine.ingest_observation(
+    engine.ingest_raw_source(
         "Caroline attended the support group on 7 May 2023.",
-        episode_id="chat:one",
+        group_id="chat:one",
         schedule=False,
     )
 
-    extraction = engine.run_extraction(episode_id="chat:one")
-    engine.build_episode_recall(["chat:one"])
+    extraction = engine.run_fact_extraction(group_id="chat:one")
+    engine.build_group_summary(["chat:one"])
     answer = engine.query("When did Caroline attend the support group?")
 
-    assert extraction[0].actor.prompt_version == load_prompt("extraction").version
+    assert extraction[0].actor.prompt_version == load_prompt("facts").version
     assert answer.answer == "7 May 2023"
-    assert completion.prompt_names == ["extraction", "episode_recall", "answer"]
+    assert completion.prompt_names == ["facts", "group_summary", "answer"]
 
 
 @pytest.mark.parametrize("mode", ["retrieval", "end-to-end"])
@@ -157,11 +157,11 @@ def test_benchmark_modes_record_provider_and_prompt_provenance(tmp_path, monkeyp
     else:
         assert artifact["providers"]["completion"]["model"] == completion.model
         assert [item["name"] for item in artifact["prompts"]] == [
-            "extraction", "episode_recall", "answer", "benchmark_judge"
+            "facts", "group_summary", "answer", "benchmark_judge"
         ]
         assert artifact["summary"]["mean_judge_score"] == 1.0
         assert set(completion.prompt_names) == {
-            "extraction", "episode_recall", "answer", "benchmark_judge"
+            "facts", "group_summary", "answer", "benchmark_judge"
         }
 
 

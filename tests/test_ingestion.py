@@ -18,7 +18,7 @@ from typer.testing import CliRunner
 from trisynapse_memory.api import create_app
 from trisynapse_memory.cli import app
 from trisynapse_memory.engine import MemoryEngine, SourceInput
-from trisynapse_memory.engine.formation.sources import SourceError, _validate_public_url, prepare_source
+from trisynapse_memory.engine.ingest.sources import SourceError, _validate_public_url, prepare_source
 from trisynapse_memory.engine.models import (
     IngestionRun,
     MemoryNamespace,
@@ -67,7 +67,7 @@ def test_code_directory_has_symbol_chunks_manifest_and_skips(tmp_path) -> None:
     engine = memory_at(tmp_path / "store")
     result = engine.ingest(SourceInput(kind="directory", path=str(repository), source_key="repo"))
     source = engine.get_source(result.source_id)
-    deltas = [engine.get(delta_id) for delta_id in source.delta_ids]
+    deltas = [engine.get(delta_id) for delta_id in source.record_ids]
 
     assert deltas[0].locator["kind"] == "manifest"
     symbol = next(item for item in deltas if item.locator["kind"] == "code_symbol")
@@ -120,13 +120,13 @@ def test_source_dedup_version_replacement_and_physical_removal(tmp_path) -> None
     second_record = engine.get_source(second.source_id)
     assert first_record.status == "superseded"
     assert second_record.version == 2
-    assert engine.get(first.delta_ids[0], include_retracted=True).text == "Version one"
+    assert engine.get(first.record_ids[0], include_retracted=True).text == "Version one"
 
     blob = engine.store.root / second_record.blob_path
     assert blob.is_file()
     removed = engine.remove_source(second_record.id, reason="test deletion")
-    assert removed.removed_delta_ids == second_record.delta_ids
-    assert engine.get(second_record.delta_ids[0], include_retracted=True).text == "[REMOVED]"
+    assert removed.removed_record_ids == second_record.record_ids
+    assert engine.get(second_record.record_ids[0], include_retracted=True).text == "[REMOVED]"
     assert not blob.exists()
     assert engine.validate_store().ok
 
@@ -220,7 +220,7 @@ def test_image_uses_multimodal_provider_and_stores_extracted_text(tmp_path) -> N
     engine = memory_at(tmp_path / "store", completion=Vision())
     encoded = __import__("base64").b64encode(b"not-a-real-image-but-provider-is-mocked").decode()
     result = engine.ingest(SourceInput(kind="image", content_base64=encoded, filename="status.png"))
-    delta = engine.get(result.delta_ids[0])
+    delta = engine.get(result.record_ids[0])
     assert "super-secret-value" in delta.text
     assert "Status OK" in delta.text
     assert delta.privacy_scope == {}
@@ -243,10 +243,10 @@ def test_source_rest_contract_and_breaking_remove_route(tmp_path) -> None:
     assert client.get(f"/api/v1/sources/{source_id}").status_code == 200
     assert client.post("/api/v1/memory/purge", json={}).status_code == 404
 
-    memory_id = run.json()["results"][0]["delta_ids"][0]
-    removed = client.post("/api/v1/memory/remove", json={"delta_ids": [memory_id], "reason": "test", "confirm": True})
+    memory_id = run.json()["results"][0]["record_ids"][0]
+    removed = client.post("/api/v1/memory/remove", json={"record_ids": [memory_id], "reason": "test", "confirm": True})
     assert removed.status_code == 200
-    assert removed.json()["removed_delta_ids"] == [memory_id]
+    assert removed.json()["removed_record_ids"] == [memory_id]
     source_record = engine.get_source(source_id)
     assert source_record.status == "active"
     assert (engine.store.root / source_record.blob_path).exists()
@@ -281,18 +281,18 @@ def test_office_and_notebook_locators(tmp_path) -> None:
 
     engine = memory_at(tmp_path / "store")
     run = engine.ingest_many([SourceInput(kind="file", path=str(path)) for path in (docx_path, pptx_path, xlsx_path, notebook)])
-    locators = [engine.get(result.delta_ids[0]).locator for result in run.results]
+    locators = [engine.get(result.record_ids[0]).locator for result in run.results]
     assert locators[0]["kind"] == "paragraph"
     assert locators[1]["kind"] == "slide"
     assert locators[2]["sheet"] == "Owners" and locators[2]["row"] == 1
     assert locators[2]["cells"] == ["A1", "B1"]
     assert locators[3]["kind"] == "notebook_cell" and locators[3]["cell_index"] == 0
-    modalities = [engine.get(result.delta_ids[0]).payload["modality"] for result in run.results]
+    modalities = [engine.get(result.record_ids[0]).payload["modality"] for result in run.results]
     assert modalities == ["document", "document", "table", "code"]
 
 
 def test_mocked_public_git_snapshot_records_commit_and_manifest(tmp_path, monkeypatch) -> None:
-    from trisynapse_memory.engine.formation import sources as source_module
+    from trisynapse_memory.engine.ingest import sources as source_module
 
     def fake_run(command, **kwargs):
         if "clone" in command:
@@ -312,7 +312,7 @@ def test_mocked_public_git_snapshot_records_commit_and_manifest(tmp_path, monkey
 
 
 def test_private_network_urls_and_images_without_vision_are_rejected(tmp_path, monkeypatch) -> None:
-    from trisynapse_memory.engine.formation import sources as source_module
+    from trisynapse_memory.engine.ingest import sources as source_module
 
     monkeypatch.setattr(source_module.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 6, "", ("127.0.0.1", 80))])
     with pytest.raises(SourceError, match="private"):
@@ -381,7 +381,7 @@ def test_cli_non_tty_help_version_and_json_contract() -> None:
     help_result = runner.invoke(app, ["--help"])
     version = runner.invoke(app, ["--version"])
     assert no_args.exit_code == 0
-    assert "Store traces. Recall meaning." in no_args.output
+    assert "Ingest sources. Index memory." in no_args.output
     assert "●──" not in no_args.output
     assert "validate" in help_result.output
     assert "verify" not in help_result.output

@@ -153,7 +153,7 @@ class SemanticRoute:
         if context.semantic_candidates is not None:
             scores = dict(context.semantic_candidates)
             for item in context.items.values():
-                if item.kind in {"compiled", "episode_recall"}:
+                if item.kind in {"claim", "group_summary"}:
                     scores[item.id] = context.bm25(plan.query, item.index_text)
             return _sorted_scores(scores.items())
         return _sorted_scores(

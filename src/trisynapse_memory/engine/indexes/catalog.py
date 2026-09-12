@@ -1,4 +1,4 @@
-"""Registered Recall helpers that Studio inspects without a closed tab enum."""
+"""Registered index helpers that Studio inspects without a closed tab enum."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from trisynapse_memory.engine.models import MemoryHelperKind
 
 
 @dataclass(frozen=True)
-class RecallHelperSpec:
+class IndexHelperSpec:
     id: str
     title: str
     kind: MemoryHelperKind
@@ -16,50 +16,50 @@ class RecallHelperSpec:
     playground_seed: str | None = None
 
 
-BUILTIN_RECALL_HELPERS: tuple[RecallHelperSpec, ...] = (
-    RecallHelperSpec(
-        id="trace",
-        title="Trace",
+BUILTIN_INDEX_HELPERS: tuple[IndexHelperSpec, ...] = (
+    IndexHelperSpec(
+        id="log",
+        title="Memory log",
         kind="timeline",
         inspect_path="/api/v1/memories",
         playground_seed="excerpt",
     ),
-    RecallHelperSpec(
+    IndexHelperSpec(
         id="documents",
         title="Documents",
         kind="table",
         inspect_path="/api/v1/memory/documents",
         playground_seed="excerpt",
     ),
-    RecallHelperSpec(
+    IndexHelperSpec(
         id="bm25",
         title="BM25",
         kind="postings",
         inspect_path="/api/v1/memory/terms",
         playground_seed="term",
     ),
-    RecallHelperSpec(
+    IndexHelperSpec(
         id="vectors",
-        title="Vectors",
+        title="Embedding index",
         kind="embedding",
         inspect_path="/api/v1/memory/vectors/projection",
         playground_seed="excerpt",
     ),
-    RecallHelperSpec(
-        id="episodes",
-        title="Episode Recall",
+    IndexHelperSpec(
+        id="groups",
+        title="Group summaries",
         kind="cards",
-        inspect_path="/api/v1/episodes",
+        inspect_path="/api/v1/groups",
         playground_seed="summary",
     ),
-    RecallHelperSpec(
+    IndexHelperSpec(
         id="claims",
         title="Claims",
         kind="table",
         inspect_path="/api/v1/memory/claims",
         playground_seed="text",
     ),
-    RecallHelperSpec(
+    IndexHelperSpec(
         id="graph",
         title="Graph",
         kind="graph",
@@ -70,8 +70,8 @@ BUILTIN_RECALL_HELPERS: tuple[RecallHelperSpec, ...] = (
 
 
 def builtin_helper_ids() -> set[str]:
-    return {item.id for item in BUILTIN_RECALL_HELPERS}
+    return {item.id for item in BUILTIN_INDEX_HELPERS}
 
 
-def helper_spec(helper_id: str) -> RecallHelperSpec | None:
-    return next((item for item in BUILTIN_RECALL_HELPERS if item.id == helper_id), None)
+def helper_spec(helper_id: str) -> IndexHelperSpec | None:
+    return next((item for item in BUILTIN_INDEX_HELPERS if item.id == helper_id), None)

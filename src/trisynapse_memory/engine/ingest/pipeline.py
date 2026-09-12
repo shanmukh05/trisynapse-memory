@@ -1,4 +1,4 @@
-"""Append-only formation helpers."""
+"""Append-only ingest helpers."""
 
 from __future__ import annotations
 
@@ -7,16 +7,16 @@ import re
 from datetime import datetime
 from typing import Any, Callable
 
-from trisynapse_memory.engine.models import Actor, MemoryDelta, MemoryNamespace
-from trisynapse_memory.engine.trace.store import SQLiteTraceStore
+from trisynapse_memory.engine.models import Actor, MemoryRecord, MemoryNamespace
+from trisynapse_memory.engine.memory_log.store import SQLiteMemoryLogStore
 from trisynapse_memory.prompts import load_prompt
 
 
-def ingest_observation(
-    store: SQLiteTraceStore,
+def ingest_raw_source(
+    store: SQLiteMemoryLogStore,
     text: str,
     *,
-    episode_id: str | None,
+    group_id: str | None,
     observed_at: datetime | str | None = None,
     source_ref: dict[str, Any] | str | None = None,
     locator: dict[str, Any] | str | None = None,
@@ -26,16 +26,16 @@ def ingest_observation(
     modality: str = "text",
     namespace: MemoryNamespace | dict[str, Any] | None = None,
     payload_extra: dict[str, Any] | None = None,
-) -> MemoryDelta:
+) -> MemoryRecord:
     if not text or not text.strip():
         raise ValueError("observation text must not be empty")
     content = text.strip()
     payload = {"content_hash": hashlib.sha256(content.encode()).hexdigest(), "modality": modality}
     payload.update(payload_extra or {})
     return store.append(
-        kind="observation",
+        kind="raw_source",
         text=content,
-        episode_id=episode_id,
+        group_id=group_id,
         observed_at=observed_at,
         source_ref=source_ref,
         locator=locator,
@@ -49,7 +49,7 @@ def ingest_observation(
 
 
 def ingest_document(
-    store: SQLiteTraceStore,
+    store: SQLiteMemoryLogStore,
     text: str,
     *,
     document_id: str,
@@ -59,17 +59,17 @@ def ingest_document(
     observed_at: datetime | str | None = None,
     namespace: MemoryNamespace | dict[str, Any] | None = None,
     payload_extra: dict[str, Any] | None = None,
-) -> list[MemoryDelta]:
+) -> list[MemoryRecord]:
     if chunk_chars < 256:
         raise ValueError("chunk_chars must be at least 256")
     chunks = chunk_document(text, chunk_chars=chunk_chars)
-    episode_id = f"item:{document_id}"
+    group_id = f"item:{document_id}"
     source_ref = {"type": "item", "id": document_id, "title": title or document_id}
     return [
-        ingest_observation(
+        ingest_raw_source(
             store,
             chunk,
-            episode_id=episode_id,
+            group_id=group_id,
             observed_at=observed_at,
             source_ref=source_ref,
             locator={"kind": "chunk", "index": index},
@@ -91,19 +91,19 @@ def ingest_document(
     ]
 
 
-def extract_episode(
-    store: SQLiteTraceStore,
-    episode_id: str,
+def extract_facts(
+    store: SQLiteMemoryLogStore,
+    group_id: str,
     complete_json: Callable[[str, str], dict[str, Any]],
     *,
     namespace: MemoryNamespace | dict[str, Any] | None = None,
-) -> list[MemoryDelta]:
+) -> list[MemoryRecord]:
     observations = [
-        item for item in store.list_deltas(kinds=["observation"], episode_prefix=episode_id, namespace=namespace)
-        if item.episode_id == episode_id
+        item for item in store.list_records(kinds=["raw_source"], group_prefix=group_id, namespace=namespace)
+        if item.group_id == group_id
     ]
     if not observations:
-        raise KeyError(f"episode has no observations: {episode_id}")
+        raise KeyError(f"record group has no raw sources: {group_id}")
     timestamp = next((item.observed_at for item in observations if item.observed_at), None)
     prompt_lines = []
     for item in observations:
@@ -115,13 +115,13 @@ def extract_episode(
                 text=item.text,
             )
         )
-    prompt = f"Episode: {episode_id}\nEpisode timestamp: {timestamp or 'unknown'}\n\n" + "\n".join(prompt_lines)
-    extraction_prompt = load_prompt("extraction")
-    payload = complete_json(extraction_prompt.text, prompt)
+    prompt = f"Batch: {group_id}\nBatch timestamp: {timestamp or 'unknown'}\n\n" + "\n".join(prompt_lines)
+    facts_prompt = load_prompt("facts")
+    payload = complete_json(facts_prompt.text, prompt)
     facts = payload.get("facts") or []
     if not isinstance(facts, list):
         raise ValueError("extraction response field 'facts' must be a list")
-    result: list[MemoryDelta] = []
+    result: list[MemoryRecord] = []
     for index, fact in enumerate(facts):
         text = str(fact.get("text") or "").strip()
         if not text:
@@ -132,9 +132,9 @@ def extract_episode(
         primary = evidence[0]
         result.append(
             store.append(
-                kind="extraction",
+                kind="fact",
                 text=text,
-                episode_id=episode_id,
+                group_id=group_id,
                 observed_at=evidence_time,
                 evidence_refs=[item.id for item in evidence],
                 subject=_optional(fact.get("subject")),
@@ -143,10 +143,10 @@ def extract_episode(
                 temporal_anchor=temporal,
                 confidence=float(fact.get("confidence", 0.7)),
                 actor=Actor(
-                    type="formation_pipeline",
+                    type="ingest_pipeline",
                     id="extraction",
                     model=getattr(complete_json, "model", None),
-                    prompt_version=extraction_prompt.version,
+                    prompt_version=facts_prompt.version,
                 ),
                 namespace=observations[0].namespace,
                 scope=observations[0].scope,
@@ -164,22 +164,21 @@ def extract_episode(
                     "generation": {
                         "provider": getattr(getattr(complete_json, "settings", None), "provider", "custom"),
                         "model": getattr(complete_json, "model", None),
-                        "prompt": extraction_prompt.provenance(),
+                        "prompt": facts_prompt.provenance(),
                     }
                 },
-                external_key=f"extraction:{episode_id}:{index}:{hashlib.sha256(text.encode()).hexdigest()[:16]}",
+                external_key=f"extraction:{group_id}:{index}:{hashlib.sha256(text.encode()).hexdigest()[:16]}",
             )
         )
     return result
 
 
-def _fact_evidence(fact: dict[str, Any], observations: list[MemoryDelta]) -> list[MemoryDelta]:
-    """Resolve model evidence IDs and provide a narrow legacy fallback.
+def _fact_evidence(fact: dict[str, Any], observations: list[MemoryRecord]) -> list[MemoryRecord]:
+    """Resolve model evidence IDs to raw sources.
 
-    New extraction prompts require immutable observation IDs. Older/custom
-    completion providers may omit them, so we select the smallest set of
-    observations with direct lexical support instead of assigning an entire
-    episode to every fact.
+    Facts prompts require immutable source IDs. If the completion omits them,
+    select the smallest set of raw sources with direct lexical support instead
+    of assigning an entire record group to every fact.
     """
 
     by_id = {item.id: item for item in observations}
@@ -199,7 +198,7 @@ def _fact_evidence(fact: dict[str, Any], observations: list[MemoryDelta]) -> lis
         for key in ("subject", "relation", "object", "text", "temporal_expression")
     )
     wanted = _evidence_tokens(fact_text)
-    ranked: list[tuple[float, MemoryDelta]] = []
+    ranked: list[tuple[float, MemoryRecord]] = []
     for observation in observations:
         available = _evidence_tokens(observation.text)
         overlap = len(wanted & available) / max(len(wanted), 1)

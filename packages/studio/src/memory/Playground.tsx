@@ -44,7 +44,7 @@ export function Playground({ routes, record, onJump }: { routes: CatalogRoute[];
         <small>{result.hits.length} hits · {result.stage} · {result.confident ? "confident" : "low confidence"}</small>
         {result.retrieval_trace?.routes && <div className="route-results">{Object.entries(result.retrieval_trace.routes).map(([name, ids]) => <span key={name}>{name} {ids.length}</span>)}</div>}
         {result.hits.slice(0, 8).map(hit => (
-          <button key={`${hit.route}:${hit.item_id}`} onClick={() => onJump("trace", hit.item_id)}>
+          <button key={`${hit.route}:${hit.item_id}`} onClick={() => onJump("log", hit.item_id)}>
             <header><span>{hit.route}</span><strong>{hit.score.toFixed(3)}</strong></header>
             <p>{hit.text.slice(0, 180)}</p>
           </button>

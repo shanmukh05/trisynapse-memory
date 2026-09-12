@@ -21,15 +21,15 @@ from trisynapse_memory.engine.models import MemoryNamespace, ProviderRole, Provi
 
 _T = TypeVar("_T")
 CONTEXT = {"help_option_names": ["-h", "--help"]}
-app = typer.Typer(name="trisynapse-memory", help="Store traces. Recall meaning.", invoke_without_command=True, no_args_is_help=False, context_settings=CONTEXT)
-add_app = typer.Typer(help="Append normalized observations or compatibility documents.")
+app = typer.Typer(name="trisynapse-memory", help="Ingest sources. Index memory.", invoke_without_command=True, no_args_is_help=False, context_settings=CONTEXT)
+add_app = typer.Typer(help="Append raw sources or compatibility documents.")
 jobs_app = typer.Typer(help="Inspect or run persistent memory jobs.")
 sources_app = typer.Typer(help="List, inspect, and remove retained sources.")
 runs_app = typer.Typer(help="Inspect and retry durable ingestion runs.")
 remove_app = typer.Typer(help="Physically redact memory or a complete source.")
-episodes_app = typer.Typer(help="Inspect and compile episodes.")
+groups_app = typer.Typer(help="Inspect record groups and rebuild group summaries.")
 graph_app = typer.Typer(help="Export the derived knowledge graph.")
-snapshot_app = typer.Typer(help="Manage recall-window snapshots.")
+snapshot_app = typer.Typer(help="Manage index-window snapshots.")
 bench_app = typer.Typer(help="Run benchmark adapters and release gates.")
 models_app = typer.Typer(help="Discover and select completion and embedding models.")
 app.add_typer(add_app, name="add")
@@ -37,7 +37,7 @@ app.add_typer(jobs_app, name="jobs")
 app.add_typer(sources_app, name="sources")
 app.add_typer(runs_app, name="runs")
 app.add_typer(remove_app, name="remove")
-app.add_typer(episodes_app, name="episodes")
+app.add_typer(groups_app, name="groups")
 app.add_typer(graph_app, name="graph")
 app.add_typer(snapshot_app, name="snapshot")
 app.add_typer(bench_app, name="bench")
@@ -206,12 +206,12 @@ def initialize(ctx: typer.Context, force_key: bool = typer.Option(False, "--forc
     engine.close()
 
 
-@add_app.command("observation")
-def add_observation(ctx: typer.Context, text: str, episode: str = "manual:default", topic: str | None = None, source: str | None = None) -> None:
+@add_app.command("raw-source")
+def add_raw_source(ctx: typer.Context, text: str, group: str = typer.Option("manual:default", "--group"), topic: str | None = None, source: str | None = None) -> None:
     state = _state(ctx)
     engine = state.engine()
-    delta = engine.ingest_observation(text, episode_id=episode, source_ref={"type": "manual", **({"id": source} if source else {})}, scope={"topic_ids": [topic]} if topic else None, namespace=state.namespace)
-    _emit(ctx, {"delta_id": delta.id, "seq": delta.seq})
+    record = engine.ingest_raw_source(text, group_id=group, source_ref={"type": "manual", **({"id": source} if source else {})}, scope={"topic_ids": [topic]} if topic else None, namespace=state.namespace)
+    _emit(ctx, {"record_id": record.id, "seq": record.seq})
     engine.close()
 
 
@@ -321,7 +321,7 @@ def remove_memory(ctx: typer.Context, memory_id: list[str] = typer.Argument(...)
     result = _run_with_status(
         ctx,
         f"Removing {len(memory_id)} memory record{'s' if len(memory_id) != 1 else ''}",
-        lambda: engine.remove(delta_ids=memory_id, reason=reason, namespace=state.namespace),
+        lambda: engine.remove(record_ids=memory_id, reason=reason, namespace=state.namespace),
     )
     _emit(ctx, result)
     engine.close()
@@ -374,7 +374,7 @@ def history(ctx: typer.Context, memory_id: str) -> None:
 def correct(ctx: typer.Context, memory_id: str, text: str, reason: str = "user correction") -> None:
     state = _state(ctx)
     engine = state.engine()
-    _emit(ctx, engine.correct(delta_id=memory_id, text=text, reason=reason, namespace=state.namespace))
+    _emit(ctx, engine.correct(record_id=memory_id, text=text, reason=reason, namespace=state.namespace))
     engine.close()
 
 
@@ -382,31 +382,31 @@ def correct(ctx: typer.Context, memory_id: str, text: str, reason: str = "user c
 def forget(ctx: typer.Context, memory_id: str, reason: str = typer.Option(..., "--reason")) -> None:
     state = _state(ctx)
     engine = state.engine()
-    _emit(ctx, engine.forget(delta_id=memory_id, reason=reason, namespace=state.namespace))
+    _emit(ctx, engine.forget(record_id=memory_id, reason=reason, namespace=state.namespace))
     engine.close()
 
 
 @app.command("search")
-def search(ctx: typer.Context, query: str, top_k: int = 12, episode_prefix: str | None = None) -> None:
+def search(ctx: typer.Context, query: str, top_k: int = 12, group_prefix: str | None = None) -> None:
     state = _state(ctx)
     engine = state.engine()
     result = _run_with_status(
         ctx,
         "Searching memory",
-        lambda: engine.search(query, top_k=top_k, episode_prefix=episode_prefix, namespace=state.namespace),
+        lambda: engine.search(query, top_k=top_k, group_prefix=group_prefix, namespace=state.namespace),
     )
     _emit(ctx, result)
     engine.close()
 
 
 @app.command("query")
-def query(ctx: typer.Context, question: str, top_k: int = 12, episode_prefix: str | None = None) -> None:
+def query(ctx: typer.Context, question: str, top_k: int = 12, group_prefix: str | None = None) -> None:
     state = _state(ctx)
     engine = state.engine()
     result = _run_with_status(
         ctx,
         "Running grounded query",
-        lambda: engine.query(question, top_k=top_k, episode_prefix=episode_prefix, namespace=state.namespace),
+        lambda: engine.query(question, top_k=top_k, group_prefix=group_prefix, namespace=state.namespace),
     )
     _emit(ctx, result)
     engine.close()
@@ -459,24 +459,25 @@ def jobs_run(ctx: typer.Context, limit: int = 100) -> None:
     engine.close()
 
 
-@episodes_app.command("list")
-def episodes_list(ctx: typer.Context) -> None:
+@groups_app.command("list")
+def groups_list(ctx: typer.Context) -> None:
     state = _state(ctx)
     engine = state.engine()
-    _emit(ctx, {"episodes": engine.list_episodes(namespace=state.namespace)})
+    batches = engine.list_groups(namespace=state.namespace)
+    _emit(ctx, {"groups": batches})
     engine.close()
 
 
-@episodes_app.command("compile")
-def episodes_compile(ctx: typer.Context, episode: list[str] = typer.Option(None, "--episode")) -> None:
+@groups_app.command("summarize")
+def groups_summarize(ctx: typer.Context, group: list[str] = typer.Option(None, "--group")) -> None:
     state = _state(ctx)
     engine = state.engine()
     entries = _run_with_status(
         ctx,
-        "Compiling episode Recall",
-        lambda: engine.build_episode_recall(episode or None, namespace=state.namespace),
+        "Building group summaries",
+        lambda: engine.build_group_summary(group or None, namespace=state.namespace),
     )
-    _emit(ctx, {"episode_recall_entries": entries})
+    _emit(ctx, {"group_summary_entries": entries})
     engine.close()
 
 

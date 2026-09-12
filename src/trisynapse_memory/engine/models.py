@@ -1,4 +1,4 @@
-"""Data contracts for the append-only Trace & Recall engine."""
+"""Data contracts for the ingest, memory-log, and index engine."""
 
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ class ConnectionTestResult(EngineModel):
 
 
 class Actor(EngineModel):
-    type: Literal["user", "formation_pipeline", "compilation_job", "external_api"] = "external_api"
+    type: Literal["user", "ingest_pipeline", "claims_job", "external_api"] = "external_api"
     id: str = "local"
     model: str | None = None
     prompt_version: str | None = None
@@ -134,17 +134,17 @@ class MemoryNamespace(EngineModel):
         }
 
 
-class MemoryDelta(EngineModel):
-    """One ordered piece of source-grounded evidence."""
+class MemoryRecord(EngineModel):
+    """One ordered piece of source-grounded evidence in the memory log."""
 
     id: str
     seq: int
     written_at: datetime = Field(default_factory=utc_now)
     observed_at: datetime | None = None
-    kind: Literal["observation", "extraction", "annotation", "access", "retraction"]
+    kind: Literal["raw_source", "fact", "note", "access", "retraction"]
     actor: Actor = Field(default_factory=Actor)
     namespace: MemoryNamespace = Field(default_factory=MemoryNamespace)
-    episode_id: str | None = None
+    group_id: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.7, ge=0, le=1)
     # Serialized legacy field retained for store compatibility.
@@ -162,13 +162,13 @@ class MemoryDelta(EngineModel):
     external_key: str | None = None
 
 
-class CompiledClaim(EngineModel):
+class Claim(EngineModel):
     id: str
     claim_key: str
     text: str
     status: Literal["ACTIVE", "SUPERSEDED", "CONTESTED"] = "ACTIVE"
-    source_delta_ids: list[str] = Field(default_factory=list)
-    observation_delta_ids: list[str] = Field(default_factory=list)
+    source_record_ids: list[str] = Field(default_factory=list)
+    raw_source_ids: list[str] = Field(default_factory=list)
     temporal_anchor: str | None = None
     confidence: float = Field(default=0.5, ge=0, le=1)
     subject: str | None = None
@@ -177,13 +177,13 @@ class CompiledClaim(EngineModel):
     objects: list[str] = Field(default_factory=list)
 
 
-class EpisodeRecallView(EngineModel):
+class GroupSummaryView(EngineModel):
     id: str
-    episode_id: str
+    group_id: str
     concept_or_topic: str
     summary: str
     alt_phrasings: list[str] = Field(default_factory=list)
-    source_trace_ids: list[str] = Field(default_factory=list)
+    source_log_ids: list[str] = Field(default_factory=list)
     observed_at: datetime | None = None
     stale: bool = False
     build_version: int = 1
@@ -195,14 +195,14 @@ class EpisodeRecallView(EngineModel):
 
 class SearchHit(EngineModel):
     item_id: str
-    kind: Literal["observation", "extraction", "compiled", "episode_recall"]
+    kind: Literal["raw_source", "fact", "claim", "group_summary"]
     text: str
     score: float
     route: str = "fused"
-    episode_id: str | None = None
+    group_id: str | None = None
     observed_at: datetime | None = None
     temporal_anchor: str | None = None
-    source_delta_ids: list[str] = Field(default_factory=list)
+    source_record_ids: list[str] = Field(default_factory=list)
     source_ref: dict[str, Any] | str | None = None
     locator: dict[str, Any] | str | None = None
     confidence: float = 0.7
@@ -214,14 +214,14 @@ class RetrievalTrace(EngineModel):
     query: str
     namespace: MemoryNamespace = Field(default_factory=MemoryNamespace)
     query_kind: Literal["fact", "temporal", "list", "inference", "multi_hop"]
-    stage: Literal["fast", "refine_1", "refine_2", "deep_recall", "cold"]
+    stage: Literal["fast", "refine_1", "refine_2", "deep_summary", "cold"]
     confident: bool
     escalated: bool = False
     refined_query: str | None = None
     routes: dict[str, list[str]] = Field(default_factory=dict)
     routing_seeds: list[str] = Field(default_factory=list)
-    drilled_trace_count: int = 0
-    episode_recall_in_answer_context: int = 0
+    drilled_log_count: int = 0
+    group_summary_in_answer_context: int = 0
     top_score: float = 0
     margin: float | None = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -236,7 +236,7 @@ class QueryCandidateSnapshot(EngineModel):
     rank: int = Field(ge=1)
     score: float
     excerpt: str
-    source_delta_ids: list[str] = Field(default_factory=list)
+    source_record_ids: list[str] = Field(default_factory=list)
     source_ref: dict[str, Any] | str | None = None
     locator: dict[str, Any] | str | None = None
 
@@ -267,7 +267,7 @@ class RetrievalConfiguration(EngineModel):
     max_refinement_rounds: int = Field(default=2, ge=0, le=2)
     graph_hops: int = Field(default=2, ge=0, le=4)
     confidence_margin: float = Field(default=0.018, ge=0, le=1)
-    deep_recall_enabled: bool = True
+    deep_summary_enabled: bool = True
     answer_abstain_threshold: float = Field(default=0.10, ge=0, le=1)
     retrieval_profile: Literal[
         "auto", "balanced", "precise", "broad", "mixed", "code", "table",
@@ -339,7 +339,7 @@ class MemorySearchResult(EngineModel):
 
 
 class Citation(EngineModel):
-    delta_id: str
+    record_id: str
     source_ref: dict[str, Any] | str | None = None
     locator: dict[str, Any] | str | None = None
     excerpt: str
@@ -358,11 +358,11 @@ class MemoryQueryResult(EngineModel):
     retrieval_trace: RetrievalTrace
 
 
-class EpisodeInfo(EngineModel):
-    episode_id: str
-    delta_count: int
-    observation_count: int
-    extraction_count: int
+class RecordGroupInfo(EngineModel):
+    group_id: str
+    record_count: int
+    raw_source_count: int
+    fact_count: int
     first_observed_at: datetime | None = None
     last_observed_at: datetime | None = None
     stale: bool = True
@@ -373,17 +373,17 @@ class StoreValidation(EngineModel):
 
     ok: bool
     database_ok: bool
-    delta_count: int
+    record_count: int
     sequence_contiguous: bool
     source_blobs_checked: int = 0
     missing_source_ids: list[str] = Field(default_factory=list)
     corrupted_source_ids: list[str] = Field(default_factory=list)
-    malformed_delta_ids: list[str] = Field(default_factory=list)
+    malformed_record_ids: list[str] = Field(default_factory=list)
     broken_evidence_refs: list[str] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
 
 
-class RecallSnapshot(EngineModel):
+class IndexSnapshot(EngineModel):
     id: str
     label: str | None = None
     seq_cutoff: int
@@ -394,31 +394,31 @@ class RecallSnapshot(EngineModel):
 class SnapshotDiff(EngineModel):
     from_snapshot: str
     to_snapshot: str
-    added_delta_ids: list[str] = Field(default_factory=list)
-    removed_delta_ids: list[str] = Field(default_factory=list)
+    added_record_ids: list[str] = Field(default_factory=list)
+    removed_record_ids: list[str] = Field(default_factory=list)
     from_seq: int
     to_seq: int
 
 
 class MemoryPage(EngineModel):
-    items: list[MemoryDelta] = Field(default_factory=list)
+    items: list[MemoryRecord] = Field(default_factory=list)
     next_cursor: int | None = None
 
 
 class MemoryHistory(EngineModel):
     memory_id: str
-    events: list[MemoryDelta] = Field(default_factory=list)
+    events: list[MemoryRecord] = Field(default_factory=list)
 
 
 class RemoveResult(EngineModel):
     remove_id: str
-    removed_delta_ids: list[str] = Field(default_factory=list)
+    removed_record_ids: list[str] = Field(default_factory=list)
     requested_by: str
     created_at: datetime = Field(default_factory=utc_now)
 
 
 class RemoveRequest(EngineModel):
-    delta_ids: list[str] = Field(min_length=1, max_length=1000)
+    record_ids: list[str] = Field(min_length=1, max_length=1000)
     reason: str
     requested_by: str = "user"
     confirm: bool = False
@@ -477,7 +477,7 @@ class SourceRecord(EngineModel):
     status: Literal["active", "superseded", "removed"] = "active"
     namespace: MemoryNamespace = Field(default_factory=MemoryNamespace)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    delta_ids: list[str] = Field(default_factory=list)
+    record_ids: list[str] = Field(default_factory=list)
     previous_source_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     removed_at: datetime | None = None
@@ -489,8 +489,8 @@ class SourceIngestionResult(EngineModel):
     source_key: str | None = None
     kind: SourceKind
     status: Literal["success", "skipped", "failed"]
-    episode_id: str | None = None
-    delta_ids: list[str] = Field(default_factory=list)
+    group_id: str | None = None
+    record_ids: list[str] = Field(default_factory=list)
     skipped_paths: list[str] = Field(default_factory=list)
     error: str | None = None
 
@@ -506,7 +506,7 @@ class IngestionRun(EngineModel):
 
 
 class SourcePreviewItem(EngineModel):
-    delta_id: str
+    record_id: str
     kind: str
     text: str
     locator: dict[str, Any] | str | None = None
@@ -524,7 +524,7 @@ class SourcePreview(EngineModel):
 
 class MemoryGraphNode(EngineModel):
     id: str
-    type: Literal["source", "trace", "episode", "recall", "claim", "concept"]
+    type: Literal["source", "log", "group", "index", "claim", "concept"]
     label: str
     subtitle: str | None = None
     status: str | None = None
@@ -542,7 +542,7 @@ class MemoryGraphEdge(EngineModel):
 
 
 class MemoryGraphPage(EngineModel):
-    view: Literal["knowledge", "lineage", "trace", "retrieval"]
+    view: Literal["knowledge", "lineage", "log", "retrieval"]
     nodes: list[MemoryGraphNode] = Field(default_factory=list)
     edges: list[MemoryGraphEdge] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
@@ -618,7 +618,7 @@ class MemoryDocumentRow(EngineModel):
     text: str
     token_count: int
     active: bool
-    episode_id: str | None = None
+    group_id: str | None = None
     text_hash: str
     fields: dict[str, str] = Field(default_factory=dict)
     locator: dict[str, Any] | str | None = None
@@ -631,7 +631,7 @@ class MemoryDocumentPage(EngineModel):
 
 
 class MemoryTermPosting(EngineModel):
-    delta_id: str
+    record_id: str
     term_frequency: int
     excerpt: str = ""
     token_count: int = 0
@@ -675,7 +675,7 @@ class VectorNeighbor(EngineModel):
 
 
 class VectorNeighbors(EngineModel):
-    delta_id: str
+    record_id: str
     neighbors: list[VectorNeighbor] = Field(default_factory=list)
     model: str | None = None
 

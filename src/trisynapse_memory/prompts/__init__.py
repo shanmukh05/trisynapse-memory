@@ -23,11 +23,11 @@ class PromptSpec:
 
 
 _PROMPTS: dict[str, tuple[str, str]] = {
-    "extraction": ("extraction-v2", "extraction.md"),
-    "episode_recall": ("episode-recall-v1", "episode_recall.md"),
+    "facts": ("extraction-v2", "facts.md"),
+    "group_summary": ("group-summary-v1", "group_summary.md"),
     "answer": ("answer-v2", "answer.md"),
     "benchmark_judge": ("benchmark-judge-v1", "benchmark_judge.md"),
-    "image_extraction": ("image-extraction-v1", "image_extraction.md"),
+    "image_facts": ("image-extraction-v1", "image_facts.md"),
 }
 
 

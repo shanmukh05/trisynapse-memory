@@ -9,17 +9,17 @@ from trisynapse_memory import (
     BranchResult,
     EngineExtensionRegistry,
     ExtensionSpec,
-    FormationProcessorSpec,
+    IngestProcessorSpec,
     MemoryEngine,
-    ProposedDelta,
-    RecallChannelSpec,
-    RecallRecord,
+    ProposedRecord,
+    IndexChannelSpec,
+    IndexRecord,
     RetrievalConfiguration,
     RetrievalBranchSpec,
     RetrievalCandidate,
     SourceInput,
 )
-from trisynapse_memory.engine.formation.sources import PreparedChunk, PreparedSource
+from trisynapse_memory.engine.ingest.sources import PreparedChunk, PreparedSource
 from trisynapse_memory.engine.retrieval.contracts import BM25Route, QueryPlan, RouteContext, SemanticRoute
 from trisynapse_memory.engine.retrieval.engine import RetrieverConfig
 
@@ -40,10 +40,10 @@ class DeterministicEmbedder:
 
 
 class EntityChannel:
-    spec = RecallChannelSpec(id="test.entities", title="Entity profiles")
+    spec = IndexChannelSpec(id="test.entities", title="Entity profiles")
 
     def project(self, batch, writer):
-        observations = [item for item in batch.deltas if item.kind == "observation"]
+        observations = [item for item in batch.records if item.kind == "raw_source"]
         if observations:
             writer.put(
                 "atlas",
@@ -54,10 +54,10 @@ class EntityChannel:
             )
 
     def rebuild(self, reader, writer):
-        observations = reader.deltas(kinds=("observation",))
+        observations = reader.records(kinds=("raw_source",))
         records = []
         if observations:
-            records.append(RecallRecord(
+            records.append(IndexRecord(
                 channel_id=self.spec.id,
                 record_id="atlas",
                 namespace=reader.namespace,
@@ -78,7 +78,7 @@ class EntityBranch:
     )
 
     def retrieve(self, plan, context):
-        records, _ = context.recall.records("test.entities", search="atlas", limit=20)
+        records, _ = context.indexes.records("test.entities", search="atlas", limit=20)
         return BranchResult(
             branch=self.spec.name,
             candidates=tuple(
@@ -86,10 +86,10 @@ class EntityBranch:
                     id=record.record_id,
                     branch=self.spec.name,
                     channel_id=record.channel_id,
-                    kind="recall",
+                    kind="index",
                     score=1.0,
                     text=record.text,
-                    evidence_delta_ids=record.evidence_refs,
+                    evidence_record_ids=record.evidence_refs,
                     metadata={"fields": record.fields},
                 )
                 for record in records
@@ -106,7 +106,7 @@ class EntityExtension:
     )
 
     def register(self, registry):
-        registry.recall_channels.register(EntityChannel())
+        registry.index_channels.register(EntityChannel())
         registry.retrieval_branches.register(EntityBranch())
 
 
@@ -146,16 +146,16 @@ class AcronymExtension:
 
 
 class FactProcessor:
-    spec = FormationProcessorSpec(name="test.fact_processor")
+    spec = IngestProcessorSpec(name="test.fact_processor")
 
     def should_schedule(self, event):
-        return event.episode_id is not None
+        return event.group_id is not None
 
     def process(self, episode, context):
         del context
         first = episode[0]
-        return [ProposedDelta(
-            kind="extraction",
+        return [ProposedRecord(
+            kind="fact",
             text="Project Atlas is active.",
             evidence_refs=(first.id,),
             subject="Project Atlas",
@@ -165,11 +165,11 @@ class FactProcessor:
         )]
 
 
-class FormationExtension:
+class IngestExtension:
     spec = ExtensionSpec(id="test.formation_extension", version="1.0.0")
 
     def register(self, registry):
-        registry.formation_processors.register(FactProcessor())
+        registry.ingest_processors.register(FactProcessor())
 
 
 def test_extension_registry_rejects_duplicates_and_freezes() -> None:
@@ -179,7 +179,7 @@ def test_extension_registry_rejects_duplicates_and_freezes() -> None:
         registry.register_extension(EntityExtension())
     registry.validate_and_freeze(("bm25",))
     with pytest.raises(RuntimeError, match="frozen"):
-        registry.recall_channels.register(EntityChannel())
+        registry.index_channels.register(EntityChannel())
 
 
 def test_custom_source_handler_controls_retrieval_fields(tmp_path) -> None:
@@ -192,43 +192,43 @@ def test_custom_source_handler_controls_retrieval_fields(tmp_path) -> None:
     result = engine.ingest(SourceInput(
         kind="acronym", text="RRF means reciprocal rank fusion.", source_key="rrf"
     ))
-    delta = engine.get_delta(result.delta_ids[0])
+    delta = engine.get_record(result.record_ids[0])
 
     assert delta.payload["modality"] == "document"
     assert delta.payload["source_type"] == "acronym"
     assert delta.payload["retrieval_fields"] == {"acronym": "RRF"}
 
 
-def test_formation_processor_runs_through_durable_registry(tmp_path) -> None:
+def test_ingest_processor_runs_through_durable_registry(tmp_path) -> None:
     engine = MemoryEngine.open(
         tmp_path,
         embedder=DeterministicEmbedder(),
-        extensions=[FormationExtension()],
+        extensions=[IngestExtension()],
     )
-    observation = engine.ingest_observation(
-        "Project Atlas launched.", episode_id="atlas"
+    observation = engine.ingest_raw_source(
+        "Project Atlas launched.", group_id="atlas"
     )
-    extractions = engine.store.list_deltas(kinds=["extraction"])
+    extractions = engine.store.list_records(kinds=["fact"])
 
     assert len(extractions) == 1
     assert extractions[0].evidence_refs == [observation.id]
     assert extractions[0].actor.id == "test.fact_processor"
-    assert any(job.kind == "formation:test.fact_processor" for job in engine.list_jobs())
+    assert any(job.kind == "ingest:test.fact_processor" for job in engine.list_jobs())
 
 
-def test_recall_channel_and_branch_ground_back_to_trace(tmp_path) -> None:
+def test_index_channel_and_branch_ground_back_to_memory_log(tmp_path) -> None:
     engine = MemoryEngine.open(
         tmp_path,
         embedder=DeterministicEmbedder(),
         extensions=[EntityExtension()],
     )
-    evidence = engine.ingest_observation(
-        "Project Atlas launched on Monday.", episode_id="atlas"
+    evidence = engine.ingest_raw_source(
+        "Project Atlas launched on Monday.", group_id="atlas"
     )
     engine.retriever_config = RetrieverConfig(
         enabled_routes=("bm25", "test.entity_profiles"),
         max_refinement_rounds=0,
-        deep_recall_enabled=False,
+        deep_summary_enabled=False,
     )
     engine._retriever_override = True
 
@@ -243,7 +243,7 @@ def test_recall_channel_and_branch_ground_back_to_trace(tmp_path) -> None:
     assert any(item.id == "test.entity_extension" for item in catalog.extensions)
     assert page.items[0].data["evidence_refs"] == [evidence.id]
 
-    engine.remove(delta_ids=[evidence.id], reason="privacy request")
+    engine.remove(record_ids=[evidence.id], reason="privacy request")
     records, total = engine.store.recall_records("test.entities", engine.default_namespace)
     assert records == [] and total == 0
 
@@ -267,11 +267,11 @@ def test_failed_custom_branch_does_not_break_healthy_routes(tmp_path) -> None:
         extensions=[BrokenExtension()],
         auto_process=False,
     )
-    wanted = engine.ingest_observation("Maya owns Project Atlas.", schedule=False)
+    wanted = engine.ingest_raw_source("Maya owns Project Atlas.", schedule=False)
     engine.retriever_config = RetrieverConfig(
         enabled_routes=("bm25", "test.broken"),
         max_refinement_rounds=0,
-        deep_recall_enabled=False,
+        deep_summary_enabled=False,
     )
     engine._retriever_override = True
 
@@ -304,11 +304,11 @@ def test_slow_custom_branch_times_out_without_breaking_healthy_routes(tmp_path) 
         extensions=[SlowExtension()],
         auto_process=False,
     )
-    wanted = engine.ingest_observation("Maya owns Project Atlas.", schedule=False)
+    wanted = engine.ingest_raw_source("Maya owns Project Atlas.", schedule=False)
     engine.retriever_config = RetrieverConfig(
         enabled_routes=("bm25", "test.slow"),
         max_refinement_rounds=0,
-        deep_recall_enabled=False,
+        deep_summary_enabled=False,
     )
     engine._retriever_override = True
 
@@ -363,7 +363,7 @@ def test_storage_revision_schedules_and_completes_rebuild(tmp_path) -> None:
         embedder=DeterministicEmbedder(),
         extensions=[EntityExtension()],
     )
-    engine.ingest_observation("Project Atlas launched.", episode_id="atlas")
+    engine.ingest_raw_source("Project Atlas launched.", group_id="atlas")
     engine.close()
 
     class EntityExtensionV2(EntityExtension):
@@ -395,14 +395,14 @@ def test_recall_lifecycle_follows_transitive_evidence_dependencies(tmp_path) -> 
     engine = MemoryEngine.open(
         tmp_path, embedder=DeterministicEmbedder(), auto_process=False
     )
-    observation = engine.ingest_observation("Sensitive source fact.", schedule=False)
+    observation = engine.ingest_raw_source("Sensitive source fact.", schedule=False)
     extraction = engine.store.append(
-        kind="extraction",
+        kind="fact",
         text="Derived sensitive fact.",
         evidence_refs=[observation.id],
         namespace=engine.default_namespace,
     )
-    engine.store.put_recall_record(RecallRecord(
+    engine.store.put_recall_record(IndexRecord(
         channel_id="test.transitive",
         record_id="derived",
         namespace=engine.default_namespace,
@@ -411,7 +411,7 @@ def test_recall_lifecycle_follows_transitive_evidence_dependencies(tmp_path) -> 
         evidence_refs=(extraction.id,),
     ))
 
-    engine.retract(delta_id=observation.id, reason="expired")
+    engine.retract(record_id=observation.id, reason="expired")
     records, total = engine.store.recall_records(
         "test.transitive", engine.default_namespace
     )

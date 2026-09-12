@@ -32,11 +32,11 @@ test("switches Recall helper tabs on Memory Viewer", async ({ page }, testInfo) 
   await tabs.getByRole("tab", { name: "BM25" }).click();
   await expect(page).toHaveURL(/helper=bm25/);
   await expect(page.getByPlaceholder("Look up a term")).toBeVisible();
-  await tabs.getByRole("tab", { name: "Vectors" }).click();
+  await tabs.getByRole("tab", { name: "Embedding index" }).click();
   await expect(page.getByText(/embedded \/|No embeddings yet/)).toBeVisible();
   await tabs.getByRole("tab", { name: "Claims" }).click();
   await expect(page).toHaveURL(/helper=claims/);
-  await expect(page.getByText(/No compiled claims|Claims unavailable/)).toBeVisible();
+  await expect(page.getByText(/No claims|No compiled claims|Claims unavailable/)).toBeVisible();
   const results = await new AxeBuilder({ page }).exclude(".react-flow").exclude(".vector-canvas").analyze();
   expect(results.violations, `${testInfo.project.name} accessibility violations`).toEqual([]);
 });

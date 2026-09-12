@@ -11,6 +11,7 @@ import { useApi } from "../context";
 import { Empty, Loading, Meta, Modal, PageHeader } from "../ui";
 import { formatBytes, formatDate, json, locatorLabel } from "../util";
 import type { IngestionRun, PreviewItem, Source, SourceInput, SourcePreview } from "../types";
+import { recordId } from "../types";
 
 const sourceIcons: Record<string, typeof File> = {
   text: FileText, file: File, image: FileImage, git: FolderGit2,
@@ -78,7 +79,7 @@ function SourceTab({ tab, source, preview }: { tab: string; source: Source; prev
   if (tab === "metadata") return <dl className="metadata-list"><Meta label="Source ID" value={source.id} /><Meta label="Source key" value={source.source_key} /><Meta label="Type" value={source.preview_type || source.kind} /><Meta label="Media type" value={source.media_type} /><Meta label="Size" value={formatBytes(source.byte_size)} /><Meta label="SHA-256" value={source.content_hash} /><Meta label="Created" value={formatDate(source.created_at)} /><Meta label="URI" value={source.uri || "Local upload"} /><Meta label="Extra metadata" value={json(source.metadata)} /></dl>;
   if (tab === "versions") return <div className="timeline"><div><CircleCheck size={17} /><span><strong>Version {source.version}</strong><small>{source.status} · {formatDate(source.created_at)}</small></span></div>{source.previous_source_id && <div><Clock3 size={17} /><span><strong>Previous version</strong><small>{source.previous_source_id}</small></span></div>}</div>;
   if (tab === "activity") return <div className="activity-panel"><h3>Ingestion activity</h3><p>{source.chunk_count} chunks created from this source. {source.skipped_count ? `${source.skipped_count} paths were safely skipped.` : "No paths were skipped."}</p>{source.ingestion_run_id && <code>{source.ingestion_run_id}</code>}</div>;
-  if (tab === "derived memory") return <div className="preview-items">{preview.items.map(item => <PreviewBlock key={item.delta_id} item={item} showId />)}</div>;
+  if (tab === "derived memory") return <div className="preview-items">{preview.items.map(item => <PreviewBlock key={recordId(item)} item={item} showId />)}</div>;
   return <SourcePreviewView source={source} preview={preview} />;
 }
 
@@ -94,7 +95,7 @@ function SourcePreviewView({ source, preview }: { source: Source; preview: Sourc
     {objectUrl && source.media_type.startsWith("image/") && <div className="image-preview"><img src={objectUrl} alt={source.title} /></div>}
     {objectUrl && source.media_type === "application/pdf" && <iframe src={objectUrl} title={`PDF preview of ${source.title}`} />}
     {!!preview.manifest.length && <div className="manifest"><h3>Accepted files</h3>{preview.manifest.map(path => <div key={path}><File size={14} />{path}</div>)}</div>}
-    <div className="preview-items">{preview.items.map(item => <PreviewBlock key={item.delta_id} item={item} />)}</div>
+    <div className="preview-items">{preview.items.map(item => <PreviewBlock key={recordId(item)} item={item} />)}</div>
   </div>;
 }
 
@@ -104,7 +105,7 @@ function PreviewBlock({ item, showId = false }: { item: PreviewItem; showId?: bo
   const markdown = item.kind === "text" || item.kind === "paragraph";
   return <article className="preview-block">
     <header><span>{item.kind.replaceAll("_", " ")}</span><code>{locatorLabel(item.locator)}</code></header>
-    {showId && <small>{item.delta_id} <button className="quiet" onClick={() => navigate(`/memory?helper=trace&id=${encodeURIComponent(item.delta_id)}`)}>View in Memory</button></small>}
+    {showId && <small>{recordId(item)} <button className="quiet" onClick={() => navigate(`/memory?helper=log&id=${encodeURIComponent(recordId(item))}`)}>View in Memory</button></small>}
     {code ? <pre><code>{item.text}</code></pre> : markdown ? <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown></div> : <p className="preserve">{item.text}</p>}
   </article>;
 }

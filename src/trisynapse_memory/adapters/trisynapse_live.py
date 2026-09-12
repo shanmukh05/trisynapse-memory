@@ -30,9 +30,9 @@ def item_to_deltas(engine: MemoryEngine, item: dict[str, Any], text: str) -> lis
 def chat_message_to_delta(engine: MemoryEngine, message: dict[str, Any]) -> Any:
     _require_enabled()
     session_id = str(message["session_id"])
-    return engine.ingest_observation(
+    return engine.ingest_raw_source(
         f"{message.get('role', 'user')}: {message.get('content', '')}",
-        episode_id=f"chat:{session_id}",
+        group_id=f"chat:{session_id}",
         source_ref={"type": "chat", "id": session_id},
         locator={"kind": "message_index", "message_id": message.get("id")},
         scope={"topic_ids": message.get("topic_ids", []), "session_surfaces": ["main"]},
@@ -46,8 +46,8 @@ def wiki_compile_to_deltas(engine: MemoryEngine, *, slug: str, sections: list[di
     result = []
     for index, section in enumerate(sections):
         result.append(
-            engine.ingest_observation(
-                section["text"], episode_id=f"wiki:{slug}",
+            engine.ingest_raw_source(
+                section["text"], group_id=f"wiki:{slug}",
                 source_ref={"type": "wiki", "id": slug},
                 locator={"kind": "markdown_heading", "heading": section.get("heading"), "index": index},
                 scope={"topic_ids": topic_ids, "article_slug": slug},
@@ -60,10 +60,10 @@ def wiki_compile_to_deltas(engine: MemoryEngine, *, slug: str, sections: list[di
 def instruction_rule_to_delta(engine: MemoryEngine, rule: dict[str, Any]) -> Any:
     _require_enabled()
     return engine.store.append(
-        kind="annotation", text=str(rule["text"]),
-        episode_id=f"core:instruction:{rule['id']}",
+        kind="note", text=str(rule["text"]),
+        group_id=f"core:instruction:{rule['id']}",
         scope={"topic_ids": rule.get("topic_ids", [])},
-        payload={"annotation_type": "instruction_rule", "enabled": rule.get("enabled", True)},
+        payload={"note_type": "instruction_rule", "enabled": rule.get("enabled", True)},
         external_key=f"instruction:{rule['id']}:{rule.get('updated_at', '')}",
         confidence=1.0,
     )

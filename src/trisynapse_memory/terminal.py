@@ -444,7 +444,7 @@ class MemoryTerminal(App[None]):
     """Grounded query prompt plus operational slash commands."""
 
     TITLE = "Trisynapse Memory"
-    SUB_TITLE = "Store traces. Recall meaning."
+    SUB_TITLE = "Ingest sources. Index memory."
     CSS = """
     Screen { layout: vertical; background: $surface; }
     #header { height: 16; padding: 0 1; }
@@ -704,9 +704,9 @@ class MemoryTerminal(App[None]):
                 )
             )
             identity = Text.assemble(("  delta ", "dim"), (item.id, "cyan"))
-            if item.episode_id:
-                identity.append(" · episode ", style="dim")
-                identity.append(item.episode_id, style="cyan")
+            if item.group_id:
+                identity.append(" · group ", style="dim")
+                identity.append(item.group_id, style="cyan")
             log.write(identity)
 
     def _render_jobs(self, jobs: list[Any]) -> None:
@@ -745,7 +745,7 @@ class MemoryTerminal(App[None]):
             "routes": "Evaluating retrieval confidence",
             "confidence": "Refining or grounding evidence",
             "refinement": "Checking refined evidence",
-            "deep_recall": "Grounding Deep Recall results",
+            "deep_summary": "Grounding Deep Recall results",
             "grounding": "Generating grounded answer",
             "answer": "Recording citation access",
             "audit": "Finishing response",
@@ -769,7 +769,7 @@ class MemoryTerminal(App[None]):
         log.write(Text(result.answer))
         for citation in result.citations:
             location = f" · {citation.locator}" if citation.locator else ""
-            log.write(Text(f"[{citation.delta_id}]{location}", style="dim"))
+            log.write(Text(f"[{citation.record_id}]{location}", style="dim"))
         log.write("")
         self._finish_operation()
 
@@ -978,7 +978,7 @@ class MemoryTerminal(App[None]):
             self._start_operation("Writing memory correction")
             self._run_command(
                 lambda: self.engine.correct(
-                    delta_id=args[0],
+                    record_id=args[0],
                     text=" ".join(args[1:]),
                     namespace=self.namespace,
                 ),
@@ -990,7 +990,7 @@ class MemoryTerminal(App[None]):
             self._start_operation("Retracting memory")
             self._run_command(
                 lambda: self.engine.forget(
-                    delta_id=args[0],
+                    record_id=args[0],
                     reason=" ".join(args[1:]),
                     namespace=self.namespace,
                 ),
@@ -999,13 +999,13 @@ class MemoryTerminal(App[None]):
         elif command == "/remove":
             if "--yes" not in args:
                 raise ValueError("physical removal cannot be undone; use /remove ID... --yes")
-            delta_ids = [item for item in args if item != "--yes"]
-            if not delta_ids:
+            record_ids = [item for item in args if item != "--yes"]
+            if not record_ids:
                 raise ValueError("usage: /remove ID... --yes")
-            self._start_operation(f"Removing {len(delta_ids)} memory record(s)")
+            self._start_operation(f"Removing {len(record_ids)} memory record(s)")
             self._run_command(
                 lambda: self.engine.remove(
-                    delta_ids=delta_ids,
+                    record_ids=record_ids,
                     reason="interactive removal",
                     namespace=self.namespace,
                 ),

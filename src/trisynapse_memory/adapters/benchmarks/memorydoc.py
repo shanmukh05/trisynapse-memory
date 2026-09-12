@@ -13,7 +13,7 @@ from trisynapse_memory.adapters.benchmarks.base import (
     PreparedCase,
 )
 from trisynapse_memory.engine import MemoryEngine
-from trisynapse_memory.engine.formation.pipeline import chunk_document
+from trisynapse_memory.engine.ingest.pipeline import chunk_document
 from trisynapse_memory.engine.models import MemoryNamespace
 
 
@@ -46,16 +46,16 @@ class MemoryDocAdapter(BenchmarkAdapter):
     def ingest_case(self, engine: MemoryEngine, case: BenchmarkCase) -> PreparedCase:
         namespace = MemoryNamespace(project_id=f"benchmark:memorydoc:{case.id}")
         prefix = f"mwd:{case.id}:"
-        episode_ids: list[str] = []
+        group_ids: list[str] = []
         for document in case.payload.get("documents") or []:
             document_id = str(document.get("document_id") or document.get("id"))
-            episode_id = f"{prefix}doc:{document_id}"
-            episode_ids.append(episode_id)
+            group_id = f"{prefix}doc:{document_id}"
+            group_ids.append(group_id)
             text = str(document.get("text") or document.get("content") or "")
             for chunk_index, chunk in enumerate(chunk_document(text, chunk_chars=3500)):
-                engine.ingest_observation(
+                engine.ingest_raw_source(
                     chunk,
-                    episode_id=episode_id,
+                    group_id=group_id,
                     source_ref={"type": "document", "id": document_id},
                     locator={"kind": "chunk", "index": chunk_index},
                     external_key=f"mwd:{case.id}:doc:{document_id}:{chunk_index}",
@@ -65,8 +65,8 @@ class MemoryDocAdapter(BenchmarkAdapter):
                 )
         for session in case.payload.get("conversations") or case.payload.get("sessions") or []:
             session_id = str(session.get("session_id") or session.get("event_id") or session.get("id"))
-            episode_id = f"{prefix}chat:{session_id}"
-            episode_ids.append(episode_id)
+            group_id = f"{prefix}chat:{session_id}"
+            group_ids.append(group_id)
             utterances = session.get("utterances") or session.get("messages") or []
             engine.ingest_messages(
                 [
@@ -77,7 +77,7 @@ class MemoryDocAdapter(BenchmarkAdapter):
                     }
                     for index, utterance in enumerate(utterances)
                 ],
-                episode_id=episode_id,
+                group_id=group_id,
                 namespace=namespace,
             )
-        return PreparedCase(tuple(episode_ids), namespace, episode_prefix=prefix)
+        return PreparedCase(tuple(group_ids), namespace, group_prefix=prefix)

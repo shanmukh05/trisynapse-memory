@@ -9,7 +9,7 @@
 
   <h1>Trisynapse Memory</h1>
 
-  <p><strong>Store traces. Recall meaning.</strong></p>
+  <p><strong>Ingest sources. Index memory.</strong></p>
   <p>Evidence-first memory for AI agents: ingest many kinds of data, retrieve the useful parts, and answer with citations.</p>
 
   <p>
@@ -33,7 +33,7 @@
 
 ---
 
-Trisynapse Memory is a local-first memory engine for assistants, agents, and applications. It preserves source evidence in an ordered **Trace**, builds searchable **Recall** views, and drills back to the evidence before returning an answer.
+Trisynapse Memory is a local-first memory engine for assistants, agents, and applications. It preserves source evidence in an ordered **memory log**, builds searchable **indexes**, and drills back to the evidence before returning an answer.
 
 Use it when your application needs to remember conversations, documents, code, web pages, tables, images, or structured records—and you need to see where an answer came from.
 
@@ -42,7 +42,7 @@ Use it when your application needs to remember conversations, documents, code, w
 | Capability | What it means |
 |---|---|
 | **Source-aware** | Keeps pages, sections, rows, cells, files, symbols, line ranges, speakers, and timestamps. |
-| **Grounded** | Answers from Trace evidence and returns citations—or abstains when confidence is too low. |
+| **Grounded** | Answers from the memory log evidence and returns citations—or abstains when confidence is too low. |
 | **Inspectable** | Saves retrieval stages, candidates, decisions, timings, and model provenance as query runs. |
 | **Local-first** | Runs with local embeddings and no completion API key by default. Add a provider only when you need generation or image understanding. |
 | **One engine** | Python, CLI, REST, Studio, and TypeScript share the same store and namespace model. |
@@ -78,7 +78,7 @@ Python 3.11 or newer is required. The first semantic search may download the def
 
 ```bash
 trisynapse-memory init
-trisynapse-memory add observation "Maya prefers three-bullet weekly updates."
+trisynapse-memory add raw-source "Maya prefers three-bullet weekly updates."
 trisynapse-memory query "How should I update Maya?"
 ```
 
@@ -123,7 +123,7 @@ namespace = MemoryNamespace(user_id="maya", project_id="assistant")
 memory = MemoryEngine.from_env(namespace=namespace)
 
 try:
-    memory.add("Maya prefers short weekly updates.", episode_id="chat:1")
+    memory.add("Maya prefers short weekly updates.", group_id="chat:1")
 
     memory.ingest_many([
         SourceInput(kind="file", path="./handbook.pdf"),
@@ -134,12 +134,12 @@ try:
     answer = memory.query("How should I write Maya's update?")
     print(answer.answer)
     for citation in answer.citations:
-        print(citation.delta_id, citation.locator)
+        print(citation.record_id, citation.locator)
 finally:
     memory.close()
 ```
 
-Use `add()` and `add_batch()` for text that is already normalized. Use `ingest()` and `ingest_many()` for files, directories, URLs, repositories, archives, images, and mixed batches.
+Use `add()` and `add_many()` for text that is already normalized. Use `ingest()` and `ingest_many()` for files, directories, URLs, repositories, archives, images, and mixed batches.
 
 ### REST and Memory Studio
 
@@ -152,7 +152,7 @@ Open [http://127.0.0.1:8765/studio/](http://127.0.0.1:8765/studio/). The API tok
 
 Studio gives you five focused views:
 
-- **Memory Viewer** — inspect Trace and every Recall helper, then run live retrieval from the current item.
+- **Memory Viewer** — inspect the memory log and every index helper, then run live retrieval from the current item.
 - **Sources** — browse, preview, ingest, retry, download, and remove sources.
 - **Queries** — watch retrieval run step by step and reopen past workflows.
 - **Configuration** — choose completion, embedding, and retrieval settings.
@@ -197,22 +197,22 @@ The client also covers mixed ingestion, source previews, query runs, memory grap
 
 ```mermaid
 flowchart LR
-    S["Sources"] --> F["Formation<br/>load and structure"]
-    F --> T["Trace<br/>ordered evidence"]
-    T --> R["Recall<br/>searchable views"]
+    S["Sources"] --> F["Ingest<br/>load and structure"]
+    F --> T["Memory log<br/>ordered evidence"]
+    T --> R["Indexes<br/>searchable views"]
     Q["Question"] --> P["Retrieval<br/>plan and route"]
     R --> P
-    P --> G["Ground in Trace"]
+    P --> G["Ground in the memory log"]
     G --> A["Answer or abstain<br/>with citations"]
 ```
 
-1. **Formation** loads a source and keeps its useful structure.
-2. **Trace** stores the resulting evidence in order with provenance and lifecycle state.
-3. **Recall** builds replaceable indexes, graph connections, episode views, and compiled claims.
-4. **Retrieval** searches several routes, fuses candidates, and drills back to Trace.
+1. **Ingest** loads a source and keeps its useful structure.
+2. **Memory log** stores the resulting evidence in order with provenance and lifecycle state.
+3. **Indexes** build replaceable search structures, graph connections, group summaries, and claims.
+4. **Retrieval** searches several routes, fuses candidates, and drills back to the memory log.
 5. **Grounding** creates an answer with citations or abstains.
 
-Trace is an application data store, not a cryptographic ledger. `validate` checks SQLite consistency, sequence continuity, evidence references, and retained source blobs. Recall data can be rebuilt; cited evidence always comes from Trace.
+The memory log is an application data store, not a cryptographic ledger. `validate` checks SQLite consistency, sequence continuity, evidence references, and retained source blobs. index data can be rebuilt; cited evidence always comes from the memory log.
 
 [Read the architecture guide →](docs/architecture.md)
 
@@ -246,7 +246,7 @@ Every query run can retain executed steps, route candidates, scores, decisions, 
 
 ## Models are optional
 
-The default setup uses local SentenceTransformers embeddings and no completion provider. Add completion when you want generated answers, richer extraction and Recall, or image understanding.
+The default setup uses local SentenceTransformers embeddings and no completion provider. Add completion when you want generated answers, richer extraction and indexes, or image understanding.
 
 ```bash
 export ANTHROPIC_API_KEY="your-key"
@@ -294,7 +294,8 @@ Namespaces isolate memory by project and optionally by user, agent, and session.
 
 | Read this | When you need to… |
 |---|---|
-| [Architecture](docs/architecture.md) | Understand Formation, Trace, Recall, retrieval, graphs, and storage |
+| [Architecture](docs/architecture.md) | Understand Ingest, memory log, indexes, retrieval, graphs, and storage |
+| [Algorithms](docs/algorithms.md) | Study mathematical formulas, RRF, confidence margin, and grounding |
 | [API and interfaces](docs/api.md) | Use Python, REST, SSE, TypeScript, or CLI contracts |
 | [Operations](docs/operations.md) | Configure providers, deploy Studio, back up, restore, or troubleshoot |
 | [Release notes](docs/releases/) | See what changed in each version |
@@ -307,10 +308,11 @@ Published installers and packages are on [GitHub Releases](https://github.com/sh
 
 | Version | Notes |
 |---|---|
+| [v0.2.0](docs/releases/v0.2.0.md) | Memory Log and Indexes architecture refactoring, formal algorithmic specifications, group summaries, evidence-grounded facts, and multi-item ingestion APIs. |
 | [v0.1.3](docs/releases/v0.1.3.md) | Memory Viewer catalog, trusted Python extension packs, non-persistent search, and a starter notebook. |
 | [v0.1.2](docs/releases/v0.1.2.md) | Retrieval profiles, token-aware grounding, store validation, and the `@trisynapse/trisynapse-memory` npm package. Includes breaking CLI, REST, and SDK renames. |
-| [v0.1.1](docs/releases/v0.1.1.md) | Current published release. Installers pin 0.1.1; tagged releases always rebuild and publish. |
-| [v0.1.0](docs/releases/v0.1.0.md) | First public alpha of the Trace & Recall engine. |
+| [v0.1.1](docs/releases/v0.1.1.md) | Installers pin 0.1.1; tagged releases always rebuild and publish. |
+| [v0.1.0](docs/releases/v0.1.0.md) | First public alpha of the memory log and index engine. |
 
 ## Development and benchmarks
 

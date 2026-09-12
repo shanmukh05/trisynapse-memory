@@ -16,12 +16,12 @@ from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
-from trisynapse_memory.engine.recall.compilation import compile_claims
+from trisynapse_memory.engine.indexes.claims import compile_claims
 from trisynapse_memory.engine.providers.embedding import Embedder
 from trisynapse_memory.engine.models import (
-    CompiledClaim,
-    EpisodeRecallView,
-    MemoryDelta,
+    Claim,
+    GroupSummaryView,
+    MemoryRecord,
     MemoryNamespace,
     MemorySearchResult,
     QueryCandidateSnapshot,
@@ -29,8 +29,8 @@ from trisynapse_memory.engine.models import (
     RetrievalTrace,
     SearchHit,
 )
-from trisynapse_memory.engine.trace.store import SQLiteTraceStore
-from trisynapse_memory.engine.recall.vector_cache import VectorCache
+from trisynapse_memory.engine.memory_log.store import SQLiteMemoryLogStore
+from trisynapse_memory.engine.indexes.embedding_index import EmbeddingIndex
 from trisynapse_memory.engine.retrieval.contracts import (
     HeuristicQueryPlanner,
     QueryPlanner,
@@ -58,7 +58,7 @@ from trisynapse_memory.engine.extensions import (
     RetrievalBranchRegistry,
     RetrievalCandidate,
     RetrievalContext,
-    RecallReader,
+    IndexReader,
     RerankContext,
     WeightedRRFFusion,
 )
@@ -107,10 +107,10 @@ class _Item:
     text: str
     index_text: str
     confidence: float
-    episode_id: str | None = None
+    group_id: str | None = None
     observed_at: Any = None
     temporal_anchor: str | None = None
-    source_delta_ids: list[str] = field(default_factory=list)
+    source_record_ids: list[str] = field(default_factory=list)
     source_ref: Any = None
     locator: Any = None
     subject: str | None = None
@@ -144,7 +144,7 @@ class RetrieverConfig:
     margin_threshold: float = 0.018
     max_refinement_rounds: int = 2
     similar_threshold: float = 0.58
-    deep_recall_enabled: bool = True
+    deep_summary_enabled: bool = True
     retrieval_profile: str = "auto"
     enabled_routes: tuple[str, ...] = (
         "bm25", "semantic", "temporal", "graph", "code", "table", "image",
@@ -156,9 +156,9 @@ class RetrieverConfig:
 class HybridRetriever:
     def __init__(
         self,
-        store: SQLiteTraceStore,
+        store: SQLiteMemoryLogStore,
         embedder: Embedder,
-        vector_cache: VectorCache,
+        embedding_index: EmbeddingIndex,
         config: RetrieverConfig | None = None,
         *,
         planner: QueryPlanner | None = None,
@@ -171,7 +171,7 @@ class HybridRetriever:
     ) -> None:
         self.store = store
         self.embedder = embedder
-        self.vector_cache = vector_cache
+        self.embedding_index = embedding_index
         self.config = config or RetrieverConfig()
         self.planner = planner or HeuristicQueryPlanner()
         self.routes = routes or RouteRegistry()
@@ -186,7 +186,7 @@ class HybridRetriever:
         query: str,
         *,
         top_k: int | None = None,
-        episode_prefix: str | None = None,
+        group_prefix: str | None = None,
         scope: dict[str, Any] | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         query_id: str,
@@ -232,19 +232,19 @@ class HybridRetriever:
 
         index_started = time.perf_counter()
         cutoff = self.store.active_seq_cutoff()
-        deltas = self.store.list_deltas(
-            kinds=["observation", "extraction", "annotation"], episode_prefix=episode_prefix,
+        deltas = self.store.list_records(
+            kinds=["raw_source", "fact", "note"], group_prefix=group_prefix,
             scope=scope, seq_cutoff=cutoff,
             namespace=namespace,
         )
-        observations = {item.id: item for item in deltas if item.kind == "observation"}
-        extractions = [item for item in deltas if item.kind == "extraction"]
+        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
+        extractions = [item for item in deltas if item.kind == "fact"]
         claims = compile_claims(extractions, observations)
-        episodes = [
-            view for view in self.store.episode_recall_views(namespace=namespace)
-            if (not episode_prefix or view.episode_id.startswith(episode_prefix))
+        groups = [
+            view for view in self.store.group_summary_views(namespace=namespace)
+            if (not group_prefix or view.group_id.startswith(group_prefix))
         ]
-        index = self._build_index(deltas, claims, episodes, memory_namespace)
+        index = self._build_index(deltas, claims, groups, memory_namespace)
         initial_plan = self.planner.plan(
             query,
             available_modalities={item.modality for item in index.items.values()},
@@ -262,7 +262,7 @@ class HybridRetriever:
                 "routes": list(initial_plan.routes),
                 "trace_items": len(deltas),
                 "compiled_claims": len(claims),
-                "episode_recall_views": len(episodes),
+                "group_summary_views": len(groups),
                 "index_items": len(index.items),
                 "seq_cutoff": cutoff,
             },
@@ -340,8 +340,8 @@ class HybridRetriever:
             )
 
         force_bridge_recall = initial_plan.query_kind == "multi_hop"
-        if (not confident or force_bridge_recall) and self.config.deep_recall_enabled:
-            stage = "deep_recall"
+        if (not confident or force_bridge_recall) and self.config.deep_summary_enabled:
+            stage = "deep_summary"
             escalated = True
             deep_limit = max(
                 limit,
@@ -356,7 +356,7 @@ class HybridRetriever:
             diagnostics["query_lens_terms"] = query_lens_terms
             confident = self._is_confident(diagnostics, hits, relaxed=True)
             confidence_id = emit(
-                "deep_recall",
+                "deep_summary",
                 "Escalate to Deep Recall",
                 input={"query": query, "limit": deep_limit, "graph_hops": self.config.graph_hops + 1},
                 output={
@@ -380,7 +380,7 @@ class HybridRetriever:
             output={
                 "hit_ids": [hit.item_id for hit in hits[:limit]],
                 "routing_seeds": diagnostics.get("routing_seeds", []),
-                "drilled_trace_count": diagnostics.get("drilled_trace_count", 0),
+                "drilled_log_count": diagnostics.get("drilled_log_count", 0),
                 "context_tokens": diagnostics.get("context_tokens", 0),
                 "token_counter": diagnostics.get("token_counter", {}),
             },
@@ -399,8 +399,8 @@ class HybridRetriever:
             refined_query=refined,
             routes=diagnostics.get("routes", {}),
             routing_seeds=diagnostics.get("routing_seeds", []),
-            drilled_trace_count=diagnostics.get("drilled_trace_count", 0),
-            episode_recall_in_answer_context=sum(1 for hit in hits if hit.kind == "episode_recall"),
+            drilled_log_count=diagnostics.get("drilled_log_count", 0),
+            group_summary_in_answer_context=sum(1 for hit in hits if hit.kind == "group_summary"),
             top_score=diagnostics.get("top_score", 0),
             margin=diagnostics.get("margin"),
         )
@@ -409,14 +409,14 @@ class HybridRetriever:
 
     def _build_index(
         self,
-        deltas: list[MemoryDelta],
-        claims: list[CompiledClaim],
-        episode_views: list[EpisodeRecallView],
+        deltas: list[MemoryRecord],
+        claims: list[Claim],
+        group_views: list[GroupSummaryView],
         namespace: MemoryNamespace,
     ) -> _Index:
         items: dict[str, _Item] = {}
         for delta in deltas:
-            if delta.kind not in {"observation", "extraction"} or not delta.text:
+            if delta.kind not in {"raw_source", "fact"} or not delta.text:
                 continue
             raw_fields = delta.payload.get("retrieval_fields") or {}
             fields = {
@@ -432,8 +432,8 @@ class HybridRetriever:
             )
             items[delta.id] = _Item(
                 id=delta.id, kind=delta.kind, text=delta.text, index_text=document.index_text, confidence=delta.confidence,
-                episode_id=delta.episode_id, observed_at=delta.observed_at, temporal_anchor=delta.temporal_anchor,
-                source_delta_ids=list(dict.fromkeys([delta.id, *delta.evidence_refs])),
+                group_id=delta.group_id, observed_at=delta.observed_at, temporal_anchor=delta.temporal_anchor,
+                source_record_ids=list(dict.fromkeys([delta.id, *delta.evidence_refs])),
                 source_ref=delta.source_ref, locator=delta.locator,
                 subject=delta.subject, relation=delta.relation, object=delta.object,
                 modality=modality, source_type=source_type, fields=fields,
@@ -441,17 +441,17 @@ class HybridRetriever:
             )
         for claim in claims:
             items[claim.id] = _Item(
-                id=claim.id, kind="compiled", text=claim.text, index_text=claim.text, confidence=claim.confidence,
+                id=claim.id, kind="claim", text=claim.text, index_text=claim.text, confidence=claim.confidence,
                 temporal_anchor=claim.temporal_anchor,
-                source_delta_ids=list(dict.fromkeys(claim.observation_delta_ids + claim.source_delta_ids)),
+                source_record_ids=list(dict.fromkeys(claim.raw_source_ids + claim.source_record_ids)),
                 subject=claim.subject, relation=claim.relation, object=claim.object,
             )
-        for view in episode_views:
+        for view in group_views:
             items[view.id] = _Item(
-                id=view.id, kind="episode_recall", text=view.summary,
+                id=view.id, kind="group_summary", text=view.summary,
                 index_text=" ".join([view.summary, view.concept_or_topic, *view.alt_phrasings]),
-                confidence=0.95 if not view.stale else 0.55, episode_id=view.episode_id, observed_at=view.observed_at,
-                source_delta_ids=view.source_trace_ids, stale=view.stale,
+                confidence=0.95 if not view.stale else 0.55, group_id=view.group_id, observed_at=view.observed_at,
+                source_record_ids=view.source_log_ids, stale=view.stale,
             )
 
         self._embed_items(items)
@@ -461,7 +461,7 @@ class HybridRetriever:
         # Compiled claims and Recall views are routing hints, not persisted
         # Trace documents, so merge their statistics into the durable index.
         df, persisted_avgdl, persisted_n = self.store.retrieval_index_statistics(namespace)
-        dynamic = [item for item in items.values() if item.kind in {"compiled", "episode_recall"}]
+        dynamic = [item for item in items.values() if item.kind in {"claim", "group_summary"}]
         for item in dynamic:
             df.update(set(tokenize(item.index_text)))
         total_tokens = persisted_avgdl * persisted_n + sum(len(tokenize(item.index_text)) for item in dynamic)
@@ -474,7 +474,7 @@ class HybridRetriever:
         namespace: MemoryNamespace,
         adjacency: dict[str, list[tuple[str, float, str]]],
     ) -> None:
-        trace_items = [item for item in items.values() if item.kind in {"observation", "extraction"}]
+        trace_items = [item for item in items.values() if item.kind in {"raw_source", "fact"}]
         if len(trace_items) < 2:
             return
         existing = {
@@ -504,14 +504,14 @@ class HybridRetriever:
     def _embed_items(self, items: dict[str, _Item]) -> None:
         hashes = {item.id: hashlib.sha256(item.index_text.encode()).hexdigest() for item in items.values()}
         cache_key = str(getattr(self.embedder, "cache_key", self.embedder.model_name))
-        cached = self.vector_cache.get(list(hashes.values()), cache_key)
+        cached = self.embedding_index.get(list(hashes.values()), cache_key)
         missing_ids = [item_id for item_id, text_hash in hashes.items() if text_hash not in cached]
         if missing_ids:
             vectors = self.embedder.encode([items[item_id].index_text for item_id in missing_ids])
             if len(vectors) != len(missing_ids):
                 raise RuntimeError("embedding provider returned the wrong number of vectors")
             new_values = {hashes[item_id]: vector for item_id, vector in zip(missing_ids, vectors)}
-            self.vector_cache.put(new_values, cache_key)
+            self.embedding_index.put(new_values, cache_key)
             cached.update(new_values)
         for item_id, text_hash in hashes.items():
             items[item_id].embedding = cached[text_hash]
@@ -525,7 +525,7 @@ class HybridRetriever:
             requested_profile=self.config.retrieval_profile,
         )
         semantic_candidates: dict[str, float] | None = None
-        nearest = getattr(self.vector_cache, "nearest", None)
+        nearest = getattr(self.embedding_index, "nearest", None)
         if callable(nearest):
             cache_key = str(getattr(self.embedder, "cache_key", self.embedder.model_name))
             nearest_hashes = nearest(
@@ -599,9 +599,9 @@ class HybridRetriever:
                     deadline = time.monotonic() + branch.spec.timeout_ms / 1000
                     branch_context = RetrievalContext(
                         namespace=index.namespace,
-                        trace_cutoff=self.store.active_seq_cutoff(),
+                        seq_cutoff=self.store.active_seq_cutoff(),
                         items=index.items,
-                        recall=RecallReader(self.store, index.namespace),
+                        indexes=IndexReader(self.store, index.namespace),
                         embedder=self.embedder,
                         token_counter=self.token_counter,
                         prior_results=dict(branch_results),
@@ -647,7 +647,7 @@ class HybridRetriever:
                         candidates=(),
                         diagnostics={"error": str(exc)[:1000]},
                     )
-        if any(item.kind == "recall_extension" and not item.embedding for item in index.items.values()):
+        if any(item.kind == "index_extension" and not item.embedding for item in index.items.values()):
             self._embed_items(index.items)
         weights = route_weights(plan.profile, self.config.route_weights)
         for branch in self.branches.branches:
@@ -691,15 +691,15 @@ class HybridRetriever:
             prior = next((value for candidate, value in reranked if candidate == item_id), 0)
             grounding_score = 1.0 - grounded_rank / max(len(grounded), 1)
             score = 0.65 * prior + 0.35 * grounding_score
-            score += 0.06 if item.kind == "observation" else 0.04
+            score += 0.06 if item.kind == "raw_source" else 0.04
             scored.append((item_id, score))
         scored.sort(key=lambda pair: pair[1], reverse=True)
         hits = [
             SearchHit(
                 item_id=item_id, kind=index.items[item_id].kind, text=index.items[item_id].text, score=score,
-                route="grounded_trace", episode_id=index.items[item_id].episode_id,
+                route="grounded_trace", group_id=index.items[item_id].group_id,
                 observed_at=index.items[item_id].observed_at, temporal_anchor=index.items[item_id].temporal_anchor,
-                source_delta_ids=index.items[item_id].source_delta_ids, source_ref=index.items[item_id].source_ref,
+                source_record_ids=index.items[item_id].source_record_ids, source_ref=index.items[item_id].source_ref,
                 locator=index.items[item_id].locator, confidence=index.items[item_id].confidence,
                 metadata={
                     "modality": index.items[item_id].modality,
@@ -726,7 +726,7 @@ class HybridRetriever:
                 "route_weights": weights,
             },
             "routing_seeds": routing_seeds,
-            "drilled_trace_count": drilled_count,
+            "drilled_log_count": drilled_count,
             "top_score": round(top, 6),
             "margin": round(top - second, 6) if reranked else None,
             "context_tokens": sum(self.token_counter.count(hit.text) for hit in hits),
@@ -774,7 +774,7 @@ class HybridRetriever:
         margin = diagnostics.get("margin") or 0
         top = diagnostics.get("top_score") or 0
         agreement = _evidence_agrees(hits[:5])
-        return top > 0.12 and (margin >= threshold or agreement or len(hits) == 1) and all(hit.kind != "episode_recall" for hit in hits)
+        return top > 0.12 and (margin >= threshold or agreement or len(hits) == 1) and all(hit.kind != "group_summary" for hit in hits)
 
 
 def _candidate_from_index(
@@ -784,13 +784,13 @@ def _candidate_from_index(
     index: _Index,
 ) -> RetrievalCandidate:
     item = index.items[item_id]
-    is_trace = item.kind in {"observation", "extraction"}
+    is_trace = item.kind in {"raw_source", "fact"}
     return RetrievalCandidate(
         id=item_id,
         branch=branch,
         score=float(score),
-        kind="trace" if is_trace else "recall",
-        evidence_delta_ids=(item_id,) if is_trace else tuple(item.source_delta_ids),
+        kind="log" if is_trace else "index",
+        evidence_record_ids=(item_id,) if is_trace else tuple(item.source_record_ids),
         text=item.text,
         source_ref=item.source_ref,
         locator=item.locator,
@@ -802,7 +802,7 @@ def _validate_branch_candidates(
     branch: str,
     candidates: Sequence[RetrievalCandidate],
     index: _Index,
-    store: SQLiteTraceStore,
+    store: SQLiteMemoryLogStore,
 ) -> list[RetrievalCandidate]:
     del store  # Index is already scoped to the active Trace snapshot.
     result: list[RetrievalCandidate] = []
@@ -814,17 +814,17 @@ def _validate_branch_candidates(
             raise ValueError(f"retrieval branch {branch} returned a candidate for {candidate.branch}")
         if candidate.score <= 0:
             continue
-        evidence = tuple(dict.fromkeys(candidate.evidence_delta_ids))
+        evidence = tuple(dict.fromkeys(candidate.evidence_record_ids))
         if not evidence or any(
             item_id not in index.items
-            or index.items[item_id].kind not in {"observation", "extraction"}
+            or index.items[item_id].kind not in {"raw_source", "fact"}
             for item_id in evidence
         ):
             raise ValueError(f"retrieval branch {branch} returned invalid active evidence")
-        if candidate.kind == "trace" and len(evidence) != 1:
-            raise ValueError("Trace candidates must identify exactly one evidence delta")
-        if candidate.kind == "recall" and not candidate.text:
-            raise ValueError("Recall candidates require routing text")
+        if candidate.kind == "log" and len(evidence) != 1:
+            raise ValueError("Log candidates must identify exactly one evidence record")
+        if candidate.kind == "index" and not candidate.text:
+            raise ValueError("Index candidates require routing text")
         canonical = candidate.canonical_id
         if canonical in seen:
             continue
@@ -834,8 +834,8 @@ def _validate_branch_candidates(
 
 
 def _materialize_candidate(candidate: RetrievalCandidate, index: _Index) -> str:
-    if candidate.kind == "trace":
-        return candidate.evidence_delta_ids[0]
+    if candidate.kind == "log":
+        return candidate.evidence_record_ids[0]
     item_id = candidate.canonical_id
     metadata = dict(candidate.metadata)
     fields = {
@@ -845,11 +845,11 @@ def _materialize_candidate(candidate: RetrievalCandidate, index: _Index) -> str:
     }
     index.items[item_id] = _Item(
         id=item_id,
-        kind="recall_extension",
+        kind="index_extension",
         text=candidate.text or "",
         index_text=candidate.text or "",
         confidence=float(metadata.get("confidence", 0.8)),
-        source_delta_ids=list(candidate.evidence_delta_ids),
+        source_record_ids=list(candidate.evidence_record_ids),
         source_ref=candidate.source_ref,
         locator=candidate.locator,
         modality=str(metadata.get("modality") or "text"),
@@ -868,7 +868,7 @@ def _snapshot(hit: SearchHit, route: str, rank: int) -> QueryCandidateSnapshot:
         rank=rank,
         score=round(hit.score, 6),
         excerpt=hit.text[:600],
-        source_delta_ids=hit.source_delta_ids,
+        source_record_ids=hit.source_record_ids,
         source_ref=hit.source_ref,
         locator=hit.locator,
     )
@@ -891,7 +891,7 @@ def _route_snapshots(
             rank=rank,
             score=round(float(score), 6),
             excerpt=item.text[:600],
-            source_delta_ids=item.source_delta_ids,
+            source_record_ids=item.source_record_ids,
             source_ref=item.source_ref,
             locator=item.locator,
         ))
@@ -936,22 +936,22 @@ def _ground_trace(
     ordered = [item_id for item_id, _ in reranked]
     routing_seeds = [
         item_id for item_id in ordered
-        if index.items[item_id].kind in {"episode_recall", "compiled", "recall_extension"}
+        if index.items[item_id].kind in {"group_summary", "claim", "index_extension"}
     ][:5]
     trace_ids = {
         item_id
         for item_id in ordered[: max(12, context_limit)]
-        if index.items[item_id].kind in {"observation", "extraction"}
+        if index.items[item_id].kind in {"raw_source", "fact"}
     }
     query_terms = set(tokenize(query))
     for seed in routing_seeds:
         routing_item = index.items[seed]
         source_items = [
             index.items[item_id]
-            for item_id in routing_item.source_delta_ids
-            if item_id in index.items and index.items[item_id].kind in {"observation", "extraction"}
+            for item_id in routing_item.source_record_ids
+            if item_id in index.items and index.items[item_id].kind in {"raw_source", "fact"}
         ]
-        if routing_item.kind in {"compiled", "recall_extension"}:
+        if routing_item.kind in {"claim", "index_extension"}:
             trace_ids.update(item.id for item in source_items)
         else:
             # Episode Recall chooses a region; only its best matching Trace
@@ -967,24 +967,24 @@ def _ground_trace(
             trace_ids.update(item.id for item in source_items[:8])
     walked = _graph_walk(list(trace_ids), index.adjacency, hops=graph_hops)
     walk_scores = {item_id: score for item_id, score, _ in walked}
-    trace_ids.update(item_id for item_id, _, _ in walked if item_id in index.items and index.items[item_id].kind in {"observation", "extraction"})
+    trace_ids.update(item_id for item_id, _, _ in walked if item_id in index.items and index.items[item_id].kind in {"raw_source", "fact"})
     query_kind = classify_query(query)
     if cold:
-        episodes = {index.items[item_id].episode_id for item_id in trace_ids if index.items[item_id].episode_id}
+        groups = {index.items[item_id].group_id for item_id in trace_ids if index.items[item_id].group_id}
         trace_ids.update(
             item.id
             for item in index.items.values()
-            if item.kind in {"observation", "extraction"} and item.episode_id in episodes
+            if item.kind in {"raw_source", "fact"} and item.group_id in groups
         )
     if query_kind in {"inference", "multi_hop"}:
         relevant_claims = [
             item for item in index.items.values()
-            if item.kind == "compiled" and set(tokenize(item.index_text)) & set(tokenize(query))
+            if item.kind == "claim" and set(tokenize(item.index_text)) & set(tokenize(query))
         ]
         for claim in relevant_claims:
             trace_ids.update(
-                item_id for item_id in claim.source_delta_ids
-                if item_id in index.items and index.items[item_id].kind in {"observation", "extraction"}
+                item_id for item_id in claim.source_record_ids
+                if item_id in index.items and index.items[item_id].kind in {"raw_source", "fact"}
             )
 
     max_fused = max(fused.values(), default=1.0)
@@ -992,7 +992,7 @@ def _ground_trace(
     grounded_scores: list[tuple[str, float]] = []
     for item_id in trace_ids:
         item = index.items.get(item_id)
-        if item is None or item.kind not in {"observation", "extraction"}:
+        if item is None or item.kind not in {"raw_source", "fact"}:
             continue
         item_terms = set(tokenize(item.index_text))
         lexical = len(query_terms & item_terms) / max(len(query_terms), 1)
@@ -1004,7 +1004,7 @@ def _ground_trace(
             + 0.05 * item.confidence
             + 0.03 * walk_scores.get(item_id, 0.0)
         )
-        if item.kind == "observation":
+        if item.kind == "raw_source":
             score += 0.05
         grounded_scores.append((item_id, score))
     grounded_scores.sort(key=lambda pair: pair[1], reverse=True)
@@ -1028,8 +1028,8 @@ def _diverse_grounded(
     per_source_context_tokens: int = 2000,
     token_counter: TokenCounter | None = None,
 ) -> list[str]:
-    episode_count = len({index.items[item_id].episode_id for item_id, _ in ranked if index.items[item_id].episode_id})
-    per_episode = max(4, context_limit // 2) if episode_count > 1 else context_limit
+    group_count = len({index.items[item_id].group_id for item_id, _ in ranked if index.items[item_id].group_id})
+    per_episode = max(4, context_limit // 2) if group_count > 1 else context_limit
     selected: list[str] = []
     episode_usage: Counter[str] = Counter()
     normalized_texts: set[str] = set()
@@ -1057,7 +1057,7 @@ def _diverse_grounded(
         normalized = " ".join(tokenize(item.text))
         if normalized in normalized_texts:
             continue
-        episode = item.episode_id or ""
+        episode = item.group_id or ""
         if episode and episode_usage[episode] >= per_episode:
             deferred.append(item_id)
             continue
@@ -1085,8 +1085,8 @@ def _source_bucket(item: _Item) -> str:
         identifier = item.source_ref.get("id") or item.source_ref.get("source_key")
         if identifier:
             return f"source:{identifier}"
-    if item.episode_id:
-        return f"episode:{item.episode_id}"
+    if item.group_id:
+        return f"group:{item.group_id}"
     return f"item:{item.id}"
 
 
@@ -1100,7 +1100,7 @@ def _query_lens_terms(query: str, index: _Index, *, limit: int = 8) -> list[str]
     query_terms = set(tokenize(query))
     candidates: Counter[str] = Counter()
     for item in index.items.values():
-        if item.kind not in {"extraction", "compiled"}:
+        if item.kind not in {"fact", "claim"}:
             continue
         fields = [item.subject, item.relation, item.object, item.text]
         blob_terms = set(tokenize(" ".join(value for value in fields if value)))

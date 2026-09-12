@@ -46,10 +46,10 @@ class HaluMemAdapter(BenchmarkAdapter):
 
     def ingest_case(self, engine: MemoryEngine, case: BenchmarkCase) -> PreparedCase:
         namespace = MemoryNamespace(project_id=f"benchmark:halumem:{case.id}")
-        episode_ids: list[str] = []
+        group_ids: list[str] = []
         for session_index, session in enumerate(case.payload.get("sessions") or []):
-            episode_id = f"halu:{case.id}:s{session_index:04d}"
-            episode_ids.append(episode_id)
+            group_id = f"halu:{case.id}:s{session_index:04d}"
+            group_ids.append(group_id)
             messages = [
                 {
                     "id": f"{session_index}:{turn_index}",
@@ -60,8 +60,8 @@ class HaluMemAdapter(BenchmarkAdapter):
                 for turn_index, turn in enumerate(session.get("dialogue") or [])
             ]
             if messages:
-                engine.ingest_messages(messages, episode_id=episode_id, namespace=namespace)
-        return PreparedCase(tuple(episode_ids), namespace, episode_prefix=f"halu:{case.id}:")
+                engine.ingest_messages(messages, group_id=group_id, namespace=namespace)
+        return PreparedCase(tuple(group_ids), namespace, group_prefix=f"halu:{case.id}:")
 
 
 def _normalize_timestamp(value: object) -> str | None:

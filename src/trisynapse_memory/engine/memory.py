@@ -1,4 +1,4 @@
-"""Public Trace & Recall memory engine."""
+"""Public ingest, memory-log, and index memory engine."""
 
 from __future__ import annotations
 
@@ -16,21 +16,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from trisynapse_memory.engine.recall.compilation import (
-    build_episode_recall_views,
+from trisynapse_memory.engine.indexes.claims import (
+    build_group_summary_views,
     compile_claims,
 )
-from trisynapse_memory.engine.recall import inspect as recall_inspect
+from trisynapse_memory.engine.indexes import inspect as index_inspect
 from trisynapse_memory.engine.providers.embedding import Embedder, SentenceTransformerEmbedder, UnavailableEmbedder
-from trisynapse_memory.engine.formation.pipeline import extract_episode, ingest_document, ingest_observation
+from trisynapse_memory.engine.ingest.pipeline import extract_facts, ingest_document, ingest_raw_source
 from trisynapse_memory.engine.models import (
     Actor,
     Citation,
-    CompiledClaim,
-    EpisodeInfo,
-    EpisodeRecallView,
+    Claim,
+    RecordGroupInfo,
+    GroupSummaryView,
     MemoryCatalog,
-    MemoryDelta,
+    MemoryRecord,
     MemoryDocumentPage,
     MemoryHelperPage,
     MemoryHistory,
@@ -56,7 +56,7 @@ from trisynapse_memory.engine.models import (
     MemoryQueryResult,
     MemorySearchResult,
     MemoryTermPage,
-    RecallSnapshot,
+    IndexSnapshot,
     SnapshotDiff,
     SourceIngestionResult,
     SourceInput,
@@ -83,24 +83,24 @@ from trisynapse_memory.engine.providers.registry import (
 )
 from trisynapse_memory.engine.retrieval.engine import HybridRetriever, RetrieverConfig, classify_query
 from trisynapse_memory.engine.retrieval.contracts import QueryPlanner, RouteRegistry
-from trisynapse_memory.engine.trace.store import SQLiteTraceStore
+from trisynapse_memory.engine.memory_log.store import SQLiteMemoryLogStore
 from trisynapse_memory.engine.retrieval.tokenization import TokenCounter, token_counter_for
-from trisynapse_memory.engine.formation.sources import BuiltinSourceHandler, PreparedChunk, PreparedSource, store_blob
-from trisynapse_memory.engine.recall.vector_cache import VectorCache, preferred_vector_cache
+from trisynapse_memory.engine.ingest.sources import BuiltinSourceHandler, PreparedChunk, PreparedSource, store_blob
+from trisynapse_memory.engine.indexes.embedding_index import EmbeddingIndex, preferred_embedding_index
 from trisynapse_memory.prompts import load_prompt
 from trisynapse_memory.engine.extensions import (
     EngineExtensionRegistry,
     ExtensionState,
     CandidateReranker,
-    FormationContext,
-    FormationEvent,
+    IngestContext,
+    IngestEvent,
     FusionStrategy,
     MemoryExtension,
-    ProposedDelta,
-    RecallWriter,
+    ProposedRecord,
+    IndexWriter,
     SourcePreparationContext,
-    TraceReader,
-    TraceChangeBatch,
+    MemoryLogReader,
+    MemoryLogChangeBatch,
     WeightedRRFFusion,
 )
 from trisynapse_memory.engine.utils import __version__
@@ -111,19 +111,19 @@ CompletionJSON = Callable[[str, str], dict[str, Any]]
 class SnapshotManager:
     """Recall-window snapshots; rollback never mutates the underlying trace."""
 
-    def __init__(self, store: SQLiteTraceStore) -> None:
+    def __init__(self, store: SQLiteMemoryLogStore) -> None:
         self._store = store
 
-    def create(self, label: str | None = None) -> RecallSnapshot:
+    def create(self, label: str | None = None) -> IndexSnapshot:
         return self._store.create_snapshot(label)
 
-    def list(self) -> list[RecallSnapshot]:
+    def list(self) -> list[IndexSnapshot]:
         return self._store.list_snapshots()
 
     def diff(self, a: str, b: str) -> SnapshotDiff:
         return self._store.snapshot_diff(a, b)
 
-    def rollback(self, snapshot_id: str) -> RecallSnapshot:
+    def rollback(self, snapshot_id: str) -> IndexSnapshot:
         """Activate a historical evidence cutoff without deleting newer deltas."""
 
         return self._store.activate_snapshot(snapshot_id)
@@ -136,7 +136,7 @@ class MemoryEngine:
 
     def __init__(
         self,
-        store: SQLiteTraceStore,
+        store: SQLiteMemoryLogStore,
         *,
         embedder: Embedder | None = None,
         completion: CompletionJSON | None = None,
@@ -144,7 +144,7 @@ class MemoryEngine:
         query_planner: QueryPlanner | None = None,
         retrieval_routes: RouteRegistry | None = None,
         token_counter: TokenCounter | None = None,
-        vector_cache: VectorCache | None = None,
+        embedding_index: EmbeddingIndex | None = None,
         extension_registry: EngineExtensionRegistry | None = None,
         fusion_strategy: FusionStrategy | None = None,
         candidate_reranker: CandidateReranker | None = None,
@@ -165,7 +165,7 @@ class MemoryEngine:
         self.retrieval_routes = retrieval_routes
         self._token_counter_override = token_counter is not None
         self.token_counter = token_counter or token_counter_for(completion)
-        self.vector_cache = vector_cache or preferred_vector_cache(store)
+        self.embedding_index = embedding_index or preferred_embedding_index(store)
         self.extensions = extension_registry or _build_extension_registry(())
         self.fusion_strategy = fusion_strategy or WeightedRRFFusion()
         self.candidate_reranker = candidate_reranker
@@ -186,7 +186,7 @@ class MemoryEngine:
         completion: CompletionJSON | None = None,
         embedding_model: str = "all-MiniLM-L6-v2",
         local_files_only: bool = False,
-        vector_cache: VectorCache | None = None,
+        embedding_index: EmbeddingIndex | None = None,
         extensions: Iterable[MemoryExtension] = (),
         extension_registry: EngineExtensionRegistry | None = None,
         fusion_strategy: FusionStrategy | None = None,
@@ -199,7 +199,7 @@ class MemoryEngine:
         embedding_provider: ProviderSettings | None = None,
         auto_process: bool = True,
     ) -> "MemoryEngine":
-        store = SQLiteTraceStore(path)
+        store = SQLiteMemoryLogStore(path)
         configuration = store.get_model_configuration()
         managed_embedding = embedder is None and embedding_provider is None and embedding_model == "all-MiniLM-L6-v2"
         managed_completion = completion is None and completion_provider is None
@@ -246,7 +246,7 @@ class MemoryEngine:
             store,
             embedder=provider,
             completion=completion_callable,
-            vector_cache=vector_cache,
+            embedding_index=embedding_index,
             extension_registry=registry,
             fusion_strategy=fusion_strategy,
             candidate_reranker=candidate_reranker,
@@ -588,12 +588,12 @@ class MemoryEngine:
             "warning": "Retained originals are permission-restricted but not encrypted.",
         }
 
-    # Formation
-    def ingest_observation(
+    # Ingest
+    def ingest_raw_source(
         self,
         text: str,
         *,
-        episode_id: str | None = None,
+        group_id: str | None = None,
         source_ref: dict[str, Any] | str | None = None,
         locator: dict[str, Any] | str | None = None,
         scope: dict[str, Any] | None = None,
@@ -606,12 +606,12 @@ class MemoryEngine:
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         process: bool | None = None,
         schedule: bool = True,
-    ) -> MemoryDelta:
+    ) -> MemoryRecord:
         memory_namespace = self._resolve_namespace(namespace)
-        delta = ingest_observation(
+        delta = ingest_raw_source(
             self.store,
             text,
-            episode_id=episode_id,
+            group_id=group_id,
             source_ref=source_ref,
             locator=locator,
             scope=self._scope(memory_namespace, scope),
@@ -625,22 +625,22 @@ class MemoryEngine:
                 "retrieval_fields": retrieval_fields or {},
             },
         )
-        if episode_id and schedule:
-            self._schedule_episode(episode_id, memory_namespace, process=process)
+        if group_id and schedule:
+            self._schedule_group(group_id, memory_namespace, process=process)
         return delta
 
     def ingest_messages(
         self,
         messages: Iterable[dict[str, Any] | str],
         *,
-        episode_id: str,
+        group_id: str,
         source_ref: dict[str, Any] | str | None = None,
         scope: dict[str, Any] | None = None,
-        run_extraction: bool = False,
+        run_fact_extraction: bool = False,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> list[MemoryDelta]:
-        memory_namespace = self._resolve_namespace(namespace, session_id=episode_id)
-        result: list[MemoryDelta] = []
+    ) -> list[MemoryRecord]:
+        memory_namespace = self._resolve_namespace(namespace, session_id=group_id)
+        result: list[MemoryRecord] = []
         for index, message in enumerate(messages):
             if isinstance(message, str):
                 text = message
@@ -654,15 +654,15 @@ class MemoryEngine:
                 message_id = message.get("id")
             prefix = f"{role}: " if role else ""
             result.append(
-                self.ingest_observation(
+                self.ingest_raw_source(
                     prefix + text,
-                    episode_id=episode_id,
-                    source_ref=source_ref or {"type": "chat", "id": episode_id},
+                    group_id=group_id,
+                    source_ref=source_ref or {"type": "chat", "id": group_id},
                     locator={"kind": "message_index", "message_index": index, "message_id": message_id},
                     scope=scope,
                     namespace=memory_namespace,
                     observed_at=observed_at,
-                    external_key=f"message:{episode_id}:{message_id or index}",
+                    external_key=f"message:{group_id}:{message_id or index}",
                     modality="conversation",
                     source_type="conversation",
                     retrieval_fields={"speaker": role or "", "message": text},
@@ -670,7 +670,7 @@ class MemoryEngine:
                     schedule=False,
                 )
             )
-        self._schedule_episode(episode_id, memory_namespace, force_extraction=run_extraction)
+        self._schedule_group(group_id, memory_namespace, force_extraction=run_fact_extraction)
         return result
 
     def ingest_document(
@@ -684,7 +684,7 @@ class MemoryEngine:
         observed_at: datetime | str | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> list[MemoryDelta]:
+    ) -> list[MemoryRecord]:
         memory_namespace = self._resolve_namespace(namespace, session_id=f"item:{document_id}")
         deltas = ingest_document(
             self.store, text, document_id=document_id, title=title, chunk_chars=chunk_chars,
@@ -692,7 +692,7 @@ class MemoryEngine:
             namespace=memory_namespace,
             payload_extra={"document_metadata": metadata or {}},
         )
-        self._schedule_episode(f"item:{document_id}", memory_namespace)
+        self._schedule_group(f"item:{document_id}", memory_namespace)
         return deltas
 
     def ingest_file(
@@ -704,7 +704,7 @@ class MemoryEngine:
         chunk_chars: int = 3500,
         scope: dict[str, Any] | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> list[MemoryDelta]:
+    ) -> list[MemoryRecord]:
         file_path = Path(path)
         result = self.ingest(
             SourceInput(
@@ -716,7 +716,7 @@ class MemoryEngine:
             ),
             namespace=namespace,
         )
-        return [self.get_delta(delta_id) for delta_id in result.delta_ids]
+        return [self.get_record(delta_id) for delta_id in result.record_ids]
 
     def ingest(
         self,
@@ -848,7 +848,7 @@ class MemoryEngine:
             store_blob(self.store.root, prepared.original, filename=prepared.filename)
             return SourceIngestionResult(
                 index=index, source_id=previous.id, source_key=source_key, kind=previous.kind,
-                status="skipped", episode_id=f"source:{previous.id}:v{previous.version}", delta_ids=previous.delta_ids,
+                status="skipped", group_id=f"source:{previous.id}:v{previous.version}", record_ids=previous.record_ids,
                 skipped_paths=prepared.skipped_paths,
             )
         identity = json.dumps(
@@ -861,22 +861,22 @@ class MemoryEngine:
         )
         source_id = f"src_{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
         version = (previous.version + 1) if previous else 1
-        episode_id = f"source:{source_id}:v{version}"
+        group_id = f"source:{source_id}:v{version}"
         blob_path = store_blob(self.store.root, prepared.original, filename=prepared.filename)
         source_ref = {
             "type": prepared.kind, "id": source_id, "source_key": source_key, "title": prepared.title,
             "version": version, "content_hash": prepared.content_hash, "uri": prepared.uri,
         }
-        deltas: list[MemoryDelta] = []
+        deltas: list[MemoryRecord] = []
         for chunk_index, chunk in enumerate(prepared.chunks):
             if not chunk.text.strip():
                 continue
             modality, source_type, retrieval_fields = _source_retrieval_descriptor(
                 prepared, chunk
             )
-            delta = self.ingest_observation(
+            delta = self.ingest_raw_source(
                 chunk.text,
-                episode_id=episode_id,
+                group_id=group_id,
                 source_ref=source_ref,
                 locator={**chunk.locator, "chunk_index": chunk_index, "metadata": chunk.metadata},
                 scope={**prepared.source.scope, "source_id": source_id, "source_kind": prepared.kind},
@@ -909,21 +909,21 @@ class MemoryEngine:
             version=version,
             namespace=namespace,
             metadata={**prepared.metadata, "skipped_paths": prepared.skipped_paths},
-            delta_ids=[item.id for item in deltas],
+            record_ids=[item.id for item in deltas],
             previous_source_id=previous.id if previous else None,
         )
         self.store.put_source(record)
         if previous is not None and previous.status == "active":
-            for delta_id in previous.delta_ids:
+            for delta_id in previous.record_ids:
                 if delta_id not in self.store.retracted_ids():
-                    self.retract(delta_id=delta_id, reason=f"source replaced by {source_id}", requested_by="source-ingestion", namespace=namespace)
+                    self.retract(record_id=delta_id, reason=f"source replaced by {source_id}", requested_by="source-ingestion", namespace=namespace)
             previous.status = "superseded"
             previous.removed_at = datetime.now(timezone.utc)
             self.store.put_source(previous)
-        self._schedule_episode(episode_id, namespace)
+        self._schedule_group(group_id, namespace)
         return SourceIngestionResult(
             index=index, source_id=source_id, source_key=source_key, kind=prepared.kind,
-            status="success", episode_id=episode_id, delta_ids=record.delta_ids, skipped_paths=prepared.skipped_paths,
+            status="success", group_id=group_id, record_ids=record.record_ids, skipped_paths=prepared.skipped_paths,
         )
 
     def retry_ingestion(self, run_id: str) -> IngestionRun:
@@ -1004,7 +1004,7 @@ class MemoryEngine:
         if not source.filename:
             derived_filename = source.metadata.get("filename")
             if not derived_filename:
-                for delta_id in source.delta_ids:
+                for delta_id in source.record_ids:
                     delta = self.store.get(delta_id)
                     if delta is not None and isinstance(delta.locator, dict) and delta.locator.get("path"):
                         derived_filename = Path(str(delta.locator["path"])).name
@@ -1013,7 +1013,7 @@ class MemoryEngine:
         if not source.byte_size and path.is_file():
             update["byte_size"] = path.stat().st_size
         if not source.chunk_count:
-            update["chunk_count"] = len(source.delta_ids)
+            update["chunk_count"] = len(source.record_ids)
         if not source.preview_type:
             update["preview_type"] = str(source.metadata.get("source_type") or source.kind)
         skipped_paths = source.metadata.get("skipped_paths") or []
@@ -1045,7 +1045,7 @@ class MemoryEngine:
             raise KeyError(f"unknown source: {source_id}")
         values: list[SourcePreviewItem] = []
         manifest: list[str] = []
-        selected_ids = source.delta_ids[cursor:cursor + limit + 1]
+        selected_ids = source.record_ids[cursor:cursor + limit + 1]
         for delta_id in selected_ids[:limit]:
             delta = self.store.get(delta_id)
             if delta is None:
@@ -1061,7 +1061,7 @@ class MemoryEngine:
             if kind == "manifest":
                 manifest = [line for line in delta.text.splitlines()[1:] if line.strip()]
             values.append(SourcePreviewItem(
-                delta_id=delta.id,
+                record_id=delta.id,
                 kind=kind,
                 text=delta.text,
                 locator=locator,
@@ -1091,52 +1091,52 @@ class MemoryEngine:
             raise FileNotFoundError(source_id)
         return source, path
 
-    def run_extraction(
+    def run_fact_extraction(
         self,
         *,
-        episode_id: str,
+        group_id: str,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> list[MemoryDelta]:
+    ) -> list[MemoryRecord]:
         self._sync_model_configuration()
         if self.completion is None:
-            raise RuntimeError("run_extraction requires a configured completion provider")
-        return extract_episode(self.store, episode_id, self.completion, namespace=self._resolve_namespace(namespace))
+            raise RuntimeError("run_fact_extraction requires a configured completion provider")
+        return extract_facts(self.store, group_id, self.completion, namespace=self._resolve_namespace(namespace))
 
-    def build_episode_recall(
+    def build_group_summary(
         self,
-        episode_ids: list[str] | None = None,
+        group_ids: list[str] | None = None,
         *,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> list[EpisodeRecallView]:
+    ) -> list[GroupSummaryView]:
         self._sync_model_configuration()
         memory_namespace = self._resolve_namespace(namespace)
-        deltas = self.store.list_deltas(
-            kinds=["observation", "extraction", "annotation"], namespace=memory_namespace
+        deltas = self.store.list_records(
+            kinds=["raw_source", "fact", "note"], namespace=memory_namespace
         )
-        views = build_episode_recall_views(deltas, complete_json=self.completion, episode_ids=episode_ids)
+        views = build_group_summary_views(deltas, complete_json=self.completion, group_ids=group_ids)
         for view in views:
             view.namespace = memory_namespace
             view.cache_key = f"{view.cache_key}:{_namespace_key(memory_namespace)}"
-            self.store.put_episode_recall(view)
+            self.store.put_group_summary(view)
         return views
 
     def retract(
         self,
         *,
-        delta_id: str,
+        record_id: str,
         reason: str,
         requested_by: str = "user",
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> MemoryDelta:
+    ) -> MemoryRecord:
         memory_namespace = self._resolve_namespace(namespace)
-        target = self.get(delta_id, namespace=memory_namespace)
+        target = self.get(record_id, namespace=memory_namespace)
         if target is None:
-            raise KeyError(f"unknown delta: {delta_id}")
+            raise KeyError(f"unknown record: {record_id}")
         return self.store.append(
             kind="retraction",
-            text=f"Retracted {delta_id}: {reason}",
-            evidence_refs=[delta_id],
-            payload={"target_delta_ids": [delta_id], "reason": reason, "requested_by": requested_by},
+            text=f"Retracted {record_id}: {reason}",
+            evidence_refs=[record_id],
+            payload={"target_record_ids": [record_id], "reason": reason, "requested_by": requested_by},
             actor=Actor(type="user", id=requested_by),
             confidence=1.0,
             namespace=memory_namespace,
@@ -1148,20 +1148,20 @@ class MemoryEngine:
     def correct(
         self,
         *,
-        delta_id: str,
+        record_id: str,
         text: str,
         reason: str = "user correction",
         requested_by: str = "user",
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> MemoryDelta:
+    ) -> MemoryRecord:
         memory_namespace = self._resolve_namespace(namespace)
-        target = self.get(delta_id, namespace=memory_namespace)
+        target = self.get(record_id, namespace=memory_namespace)
         return self.store.append(
-            kind="extraction",
+            kind="fact",
             text=text,
-            episode_id=target.episode_id,
-            evidence_refs=[delta_id],
-            payload={"annotation_type": "correction", "target_delta_ids": [delta_id], "reason": reason},
+            group_id=target.group_id,
+            evidence_refs=[record_id],
+            payload={"note_type": "correction", "target_record_ids": [record_id], "reason": reason},
             actor=Actor(type="user", id=requested_by),
             confidence=1.0,
             namespace=memory_namespace,
@@ -1171,19 +1171,19 @@ class MemoryEngine:
     def remove(
         self,
         *,
-        delta_ids: list[str],
+        record_ids: list[str],
         reason: str,
         requested_by: str = "user",
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> RemoveResult:
         memory_namespace = self._resolve_namespace(namespace)
-        for delta_id in delta_ids:
+        for delta_id in record_ids:
             self.get(delta_id, namespace=memory_namespace, include_retracted=True)
-        for delta_id in delta_ids:
+        for delta_id in record_ids:
             if delta_id not in self.store.retracted_ids():
-                self.retract(delta_id=delta_id, reason=reason, requested_by=requested_by, namespace=memory_namespace)
-        result = self.store.hard_remove(delta_ids, requested_by=requested_by, reason=reason)
-        self.vector_cache.clear()
+                self.retract(record_id=delta_id, reason=reason, requested_by=requested_by, namespace=memory_namespace)
+        result = self.store.hard_remove(record_ids, requested_by=requested_by, reason=reason)
+        self.embedding_index.clear()
         return result
 
     def remove_source(
@@ -1195,7 +1195,7 @@ class MemoryEngine:
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> RemoveResult:
         source = self.get_source(source_id, namespace=namespace)
-        result = self.remove(delta_ids=source.delta_ids, reason=reason, requested_by=requested_by, namespace=source.namespace)
+        result = self.remove(record_ids=source.record_ids, reason=reason, requested_by=requested_by, namespace=source.namespace)
         source.status = "removed"
         source.removed_at = datetime.now(timezone.utc)
         self.store.put_source(source)
@@ -1204,26 +1204,26 @@ class MemoryEngine:
             blob.unlink(missing_ok=True)
         return result
 
-    def add(self, text: str, **kwargs: Any) -> MemoryDelta:
-        return self.ingest_observation(text, **kwargs)
+    def add(self, text: str, **kwargs: Any) -> MemoryRecord:
+        return self.ingest_raw_source(text, **kwargs)
 
-    def add_batch(self, items: Iterable[dict[str, Any] | str], **kwargs: Any) -> list[MemoryDelta]:
-        result: list[MemoryDelta] = []
+    def add_many(self, items: Iterable[dict[str, Any] | str], **kwargs: Any) -> list[MemoryRecord]:
+        result: list[MemoryRecord] = []
         scheduled: dict[tuple[str, str], tuple[str, MemoryNamespace, bool | None]] = {}
         for item in items:
             payload = {**kwargs, **({"text": item} if isinstance(item, str) else item)}
-            episode_id = payload.get("episode_id")
-            if episode_id:
+            group_id = payload.get("group_id")
+            if group_id:
                 namespace = self._resolve_namespace(payload.get("namespace"))
                 process = payload.get("process")
                 payload["schedule"] = False
-                scheduled[(_namespace_key(namespace), str(episode_id))] = (str(episode_id), namespace, process)
+                scheduled[(_namespace_key(namespace), str(group_id))] = (str(group_id), namespace, process)
             result.append(self.add(**payload))
-        for episode_id, namespace, process in scheduled.values():
-            self._schedule_episode(episode_id, namespace, process=process)
+        for group_id, namespace, process in scheduled.values():
+            self._schedule_group(group_id, namespace, process=process)
         return result
 
-    def append_deltas(self, deltas: Iterable[dict[str, Any]]) -> list[MemoryDelta]:
+    def append_deltas(self, deltas: Iterable[dict[str, Any]]) -> list[MemoryRecord]:
         return [self.store.append(**delta) for delta in deltas]
 
     # Retrieval
@@ -1232,7 +1232,7 @@ class MemoryEngine:
         query: str,
         *,
         top_k: int | None = None,
-        episode_prefix: str | None = None,
+        group_prefix: str | None = None,
         scope: dict[str, Any] | None = None,
         query_id: str | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
@@ -1247,7 +1247,7 @@ class MemoryEngine:
         return self._execute_search(
             run,
             top_k=top_k,
-            episode_prefix=episode_prefix,
+            group_prefix=group_prefix,
             scope=scope,
             finish=True,
             on_step=on_step,
@@ -1259,7 +1259,7 @@ class MemoryEngine:
         question: str,
         *,
         top_k: int | None = None,
-        episode_prefix: str | None = None,
+        group_prefix: str | None = None,
         scope: dict[str, Any] | None = None,
         abstain_threshold: float | None = None,
         history: list[dict[str, Any]] | None = None,
@@ -1277,7 +1277,7 @@ class MemoryEngine:
             run,
             original_question=question,
             top_k=top_k,
-            episode_prefix=episode_prefix,
+            group_prefix=group_prefix,
             scope=scope,
             abstain_threshold=abstain_threshold,
             on_step=on_step,
@@ -1336,7 +1336,7 @@ class MemoryEngine:
         run: QueryRun,
         *,
         top_k: int | None,
-        episode_prefix: str | None,
+        group_prefix: str | None,
         scope: dict[str, Any] | None,
         finish: bool,
         on_step: Callable[[QueryStep], None] | None = None,
@@ -1349,7 +1349,7 @@ class MemoryEngine:
         retriever = HybridRetriever(
             self.store,
             self.embedder,
-            self.vector_cache,
+            self.embedding_index,
             self.retriever_config,
             planner=self.query_planner,
             routes=self.retrieval_routes,
@@ -1374,7 +1374,7 @@ class MemoryEngine:
         result = retriever.search(
             run.query,
             top_k=effective_top_k,
-            episode_prefix=episode_prefix,
+            group_prefix=group_prefix,
             scope=self._scope(run.namespace, scope),
             namespace=run.namespace,
             query_id=run.id,
@@ -1396,7 +1396,7 @@ class MemoryEngine:
         *,
         original_question: str,
         top_k: int | None,
-        episode_prefix: str | None,
+        group_prefix: str | None,
         scope: dict[str, Any] | None,
         abstain_threshold: float | None,
         on_step: Callable[[QueryStep], None] | None = None,
@@ -1412,7 +1412,7 @@ class MemoryEngine:
                 if top_k is not None
                 else run.retrieval_configuration.max_context_items
             ),
-            episode_prefix=episode_prefix,
+            group_prefix=group_prefix,
             scope=scope,
             finish=False,
             on_step=on_step,
@@ -1458,14 +1458,14 @@ class MemoryEngine:
             label="Generate grounded answer" if relevant else "Abstain without enough evidence",
             sequence=len(run.steps),
             input={"evidence_ids": [hit.item_id for hit in hits], "threshold": threshold},
-            output={"answer": answer, "abstain": abstain, "citation_ids": [item.delta_id for item in citations]},
+            output={"answer": answer, "abstain": abstain, "citation_ids": [item.record_id for item in citations]},
             metrics={"evidence_count": len(hits), "citation_count": len(citations)},
             duration_ms=(time.perf_counter() - generation_started) * 1000,
         ), on_step)
         self.store.append(
             kind="access",
             text=f"Query access {search_result.query_id}",
-            evidence_refs=[citation.delta_id for citation in citations],
+            evidence_refs=[citation.record_id for citation in citations],
             payload={
                 "query_id": search_result.query_id,
                 "compiled_view_ids_used": [],
@@ -1481,7 +1481,7 @@ class MemoryEngine:
             phase="audit",
             label="Record citation access",
             sequence=len(run.steps),
-            output={"query_id": run.id, "citation_ids": [item.delta_id for item in citations]},
+            output={"query_id": run.id, "citation_ids": [item.record_id for item in citations]},
         ), on_step)
         run.answer = answer
         run.abstain = abstain
@@ -1508,7 +1508,7 @@ class MemoryEngine:
         *,
         mode: str = "query",
         top_k: int | None = None,
-        episode_prefix: str | None = None,
+        group_prefix: str | None = None,
         scope: dict[str, Any] | None = None,
         abstain_threshold: float | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
@@ -1526,7 +1526,7 @@ class MemoryEngine:
                 "query": query,
                 "mode": mode,
                 "top_k": top_k,
-                "episode_prefix": episode_prefix,
+                "group_prefix": group_prefix,
                 "scope": scope or {},
                 "abstain_threshold": abstain_threshold,
                 "namespace": memory_namespace.model_dump(mode="json"),
@@ -1563,7 +1563,7 @@ class MemoryEngine:
                 self._execute_search(
                     run,
                     top_k=payload.get("top_k"),
-                    episode_prefix=payload.get("episode_prefix"),
+                    group_prefix=payload.get("group_prefix"),
                     scope=payload.get("scope"),
                     finish=True,
                 )
@@ -1572,7 +1572,7 @@ class MemoryEngine:
                     run,
                     original_question=run.query,
                     top_k=payload.get("top_k"),
-                    episode_prefix=payload.get("episode_prefix"),
+                    group_prefix=payload.get("group_prefix"),
                     scope=payload.get("scope"),
                     abstain_threshold=payload.get("abstain_threshold"),
                 )
@@ -1628,7 +1628,7 @@ class MemoryEngine:
         )
 
     # Introspection
-    def get_delta(self, delta_id: str) -> MemoryDelta:
+    def get_record(self, delta_id: str) -> MemoryRecord:
         delta = self.store.get(delta_id)
         if delta is None:
             raise KeyError(f"unknown delta: {delta_id}")
@@ -1640,8 +1640,8 @@ class MemoryEngine:
         *,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         include_retracted: bool = False,
-    ) -> MemoryDelta:
-        delta = self.get_delta(delta_id)
+    ) -> MemoryRecord:
+        delta = self.get_record(delta_id)
         requested = self._resolve_namespace(namespace)
         requested_values = requested.model_dump(exclude_none=True)
         if any(getattr(delta.namespace, key) != value for key, value in requested_values.items()):
@@ -1663,7 +1663,7 @@ class MemoryEngine:
         if limit < 1 or limit > 500:
             raise ValueError("limit must be between 1 and 500")
         memory_namespace = self._resolve_namespace(namespace)
-        items = self.store.list_deltas(
+        items = self.store.list_records(
             kinds=kinds,
             namespace=memory_namespace,
             scope=self._scope(memory_namespace, scope),
@@ -1690,7 +1690,7 @@ class MemoryEngine:
         include_retracted: bool = True,
     ) -> dict[str, Any]:
         memory_namespace = self._resolve_namespace(namespace)
-        deltas = self.store.list_deltas(namespace=memory_namespace, include_retracted=include_retracted)
+        deltas = self.store.list_records(namespace=memory_namespace, include_retracted=include_retracted)
         return {
             "schema_version": 2,
             "engine_version": self.VERSION,
@@ -1756,30 +1756,30 @@ class MemoryEngine:
             return None
         return trace
 
-    def list_episodes(
+    def list_groups(
         self,
         *,
         scope: dict[str, Any] | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> list[EpisodeInfo]:
+    ) -> list[RecordGroupInfo]:
         memory_namespace = self._resolve_namespace(namespace)
-        grouped: dict[str, list[MemoryDelta]] = defaultdict(list)
-        for delta in self.store.list_deltas(scope=self._scope(memory_namespace, scope), namespace=memory_namespace):
-            if delta.episode_id:
-                grouped[delta.episode_id].append(delta)
-        fresh = {view.episode_id: not view.stale for view in self.store.episode_recall_views(namespace=memory_namespace)}
+        grouped: dict[str, list[MemoryRecord]] = defaultdict(list)
+        for delta in self.store.list_records(scope=self._scope(memory_namespace, scope), namespace=memory_namespace):
+            if delta.group_id:
+                grouped[delta.group_id].append(delta)
+        fresh = {view.group_id: not view.stale for view in self.store.group_summary_views(namespace=memory_namespace)}
         result = []
-        for episode_id, deltas in sorted(grouped.items()):
+        for group_id, deltas in sorted(grouped.items()):
             observed = [item.observed_at for item in deltas if item.observed_at]
             result.append(
-                EpisodeInfo(
-                    episode_id=episode_id,
-                    delta_count=len(deltas),
-                    observation_count=sum(item.kind == "observation" for item in deltas),
-                    extraction_count=sum(item.kind == "extraction" for item in deltas),
+                RecordGroupInfo(
+                    group_id=group_id,
+                    record_count=len(deltas),
+                    raw_source_count=sum(item.kind == "raw_source" for item in deltas),
+                    fact_count=sum(item.kind == "fact" for item in deltas),
                     first_observed_at=min(observed) if observed else None,
                     last_observed_at=max(observed) if observed else None,
-                    stale=not fresh.get(episode_id, False),
+                    stale=not fresh.get(group_id, False),
                 )
             )
         return result
@@ -1792,13 +1792,13 @@ class MemoryEngine:
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> dict[str, Any] | str:
         memory_namespace = self._resolve_namespace(namespace)
-        deltas = self.store.list_deltas(
-            kinds=["observation", "extraction"],
+        deltas = self.store.list_records(
+            kinds=["raw_source", "fact"],
             scope=self._scope(memory_namespace, scope),
             namespace=memory_namespace,
         )
-        observations = {item.id: item for item in deltas if item.kind == "observation"}
-        claims = compile_claims([item for item in deltas if item.kind == "extraction"], observations)
+        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
+        claims = compile_claims([item for item in deltas if item.kind == "fact"], observations)
         nodes = []
         edges = []
         seen: set[str] = set()
@@ -1823,30 +1823,30 @@ class MemoryEngine:
         search: str | None = None,
         node_types: Iterable[str] | None = None,
         source_id: str | None = None,
-        episode_id: str | None = None,
+        group_id: str | None = None,
         limit: int = 500,
         cursor: str | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> MemoryGraphPage:
-        if view not in {"knowledge", "lineage", "trace", "retrieval"}:
-            raise ValueError("view must be knowledge, lineage, trace, or retrieval")
+        if view not in {"knowledge", "lineage", "log", "retrieval"}:
+            raise ValueError("view must be knowledge, lineage, log, or retrieval")
         if limit < 1 or limit > 2000:
             raise ValueError("limit must be between 1 and 2000")
         memory_namespace = self._resolve_namespace(namespace)
         if view == "retrieval":
-            return recall_inspect.retrieval_graph_page(
-                self, memory_namespace, seed_id=source_id or episode_id, limit=limit
+            return index_inspect.retrieval_graph_page(
+                self, memory_namespace, seed_id=source_id or group_id, limit=limit
             )
-        deltas = self.store.list_deltas(
+        deltas = self.store.list_records(
             namespace=memory_namespace, include_retracted=True
         )
-        if episode_id:
-            deltas = [item for item in deltas if item.episode_id == episode_id]
+        if group_id:
+            deltas = [item for item in deltas if item.group_id == group_id]
         if source_id:
             deltas = [item for item in deltas if item.scope.get("source_id") == source_id]
-        observations = {item.id: item for item in deltas if item.kind == "observation"}
+        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
         claims = compile_claims(
-            [item for item in deltas if item.kind == "extraction"], observations
+            [item for item in deltas if item.kind == "fact"], observations
         )
         nodes: dict[str, MemoryGraphNode] = {}
         edges: dict[str, MemoryGraphEdge] = {}
@@ -1857,7 +1857,7 @@ class MemoryEngine:
         def add_edge(edge: MemoryGraphEdge) -> None:
             edges.setdefault(edge.id, edge)
 
-        if view in {"lineage", "trace"}:
+        if view in {"lineage", "log"}:
             source_values = self.list_sources(
                 namespace=memory_namespace, include_removed=True
             )
@@ -1875,13 +1875,13 @@ class MemoryEngine:
                         source=source.id, target=source.previous_source_id,
                         type="supersedes", label="supersedes",
                     ))
-            previous_by_episode: dict[str, str] = {}
+            previous_by_group: dict[str, str] = {}
             for delta in deltas:
                 add_node(MemoryGraphNode(
-                    id=delta.id, type="trace", label=(delta.text or delta.kind)[:90],
+                    id=delta.id, type="log", label=(delta.text or delta.kind)[:90],
                     subtitle=delta.kind, status="retracted" if delta.id in self.store.retracted_ids() else "active",
                     data={
-                        "kind": delta.kind, "seq": delta.seq, "episode_id": delta.episode_id,
+                        "kind": delta.kind, "seq": delta.seq, "group_id": delta.group_id,
                         "observed_at": delta.observed_at.isoformat() if delta.observed_at else None,
                         "source_ref": delta.source_ref, "locator": delta.locator,
                     },
@@ -1892,23 +1892,23 @@ class MemoryEngine:
                         id=f"source-trace:{current_source}:{delta.id}", source=current_source,
                         target=delta.id, type="produced", label="produced",
                     ))
-                if delta.episode_id:
-                    episode_node = f"episode:{delta.episode_id}"
+                if delta.group_id:
+                    group_node = f"group:{delta.group_id}"
                     add_node(MemoryGraphNode(
-                        id=episode_node, type="episode", label=delta.episode_id,
-                        subtitle="episode",
+                        id=group_node, type="group", label=delta.group_id,
+                        subtitle="record group",
                     ))
                     add_edge(MemoryGraphEdge(
-                        id=f"episode-trace:{episode_node}:{delta.id}", source=episode_node,
+                        id=f"episode-trace:{group_node}:{delta.id}", source=group_node,
                         target=delta.id, type="contains", label="contains",
                     ))
-                    previous = previous_by_episode.get(delta.episode_id)
-                    if view == "trace" and previous:
+                    previous = previous_by_group.get(delta.group_id)
+                    if view == "log" and previous:
                         add_edge(MemoryGraphEdge(
                             id=f"follows:{previous}:{delta.id}", source=previous,
                             target=delta.id, type="followed_by", label="then",
                         ))
-                    previous_by_episode[delta.episode_id] = delta.id
+                    previous_by_group[delta.group_id] = delta.id
                 for evidence_id in delta.evidence_refs:
                     add_edge(MemoryGraphEdge(
                         id=f"evidence:{evidence_id}:{delta.id}", source=evidence_id,
@@ -1921,7 +1921,7 @@ class MemoryEngine:
                 add_node(MemoryGraphNode(
                     id=claim_id, type="claim", label=claim.text[:100],
                     subtitle=claim.relation, status=claim.status,
-                    data={"confidence": claim.confidence, "source_delta_ids": claim.source_delta_ids},
+                    data={"confidence": claim.confidence, "source_record_ids": claim.source_record_ids},
                 ))
                 for role, label in (("subject", claim.subject), ("object", claim.object)):
                     if not label:
@@ -1941,19 +1941,19 @@ class MemoryEngine:
                             weight=claim.confidence,
                         ))
                 if view == "lineage":
-                    for evidence_id in dict.fromkeys(claim.source_delta_ids + claim.observation_delta_ids):
+                    for evidence_id in dict.fromkeys(claim.source_record_ids + claim.raw_source_ids):
                         add_edge(MemoryGraphEdge(
                             id=f"claim-ground:{evidence_id}:{claim_id}", source=evidence_id,
                             target=claim_id, type="grounds", label="grounds",
                         ))
             if view == "lineage":
-                for recall in self.store.episode_recall_views(namespace=memory_namespace):
+                for recall in self.store.group_summary_views(namespace=memory_namespace):
                     add_node(MemoryGraphNode(
-                        id=recall.id, type="recall", label=recall.concept_or_topic,
-                        subtitle="Episode Recall", status="stale" if recall.stale else "fresh",
-                        data={"episode_id": recall.episode_id, "summary": recall.summary},
+                        id=recall.id, type="index", label=recall.concept_or_topic,
+                        subtitle="Batch summary", status="stale" if recall.stale else "fresh",
+                        data={"group_id": recall.group_id, "summary": recall.summary},
                     ))
-                    for trace_id in recall.source_trace_ids:
+                    for trace_id in recall.source_log_ids:
                         add_edge(MemoryGraphEdge(
                             id=f"recall-ground:{trace_id}:{recall.id}", source=trace_id,
                             target=recall.id, type="summarizes", label="summarizes",
@@ -2002,7 +2002,7 @@ class MemoryEngine:
     ) -> MemoryGraphPage:
         if view == "retrieval":
             memory_namespace = self._resolve_namespace(namespace)
-            return recall_inspect.retrieval_graph_page(
+            return index_inspect.retrieval_graph_page(
                 self, memory_namespace, seed_id=node_id, limit=limit
             )
         graph = self.memory_graph(view, limit=2000, namespace=namespace)
@@ -2024,7 +2024,7 @@ class MemoryEngine:
         *,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> MemoryCatalog:
-        return recall_inspect.memory_catalog(self, self._resolve_namespace(namespace))
+        return index_inspect.memory_catalog(self, self._resolve_namespace(namespace))
 
     def memory_helper_items(
         self,
@@ -2037,7 +2037,7 @@ class MemoryEngine:
     ) -> MemoryHelperPage:
         if limit < 1 or limit > 500:
             raise ValueError("limit must be between 1 and 500")
-        return recall_inspect.helper_items(
+        return index_inspect.helper_items(
             self, helper_id, self._resolve_namespace(namespace),
             search=search, cursor=cursor, limit=limit,
         )
@@ -2053,7 +2053,7 @@ class MemoryEngine:
     ) -> MemoryDocumentPage:
         if limit < 1 or limit > 500:
             raise ValueError("limit must be between 1 and 500")
-        return recall_inspect.document_page(
+        return index_inspect.document_page(
             self, self._resolve_namespace(namespace),
             search=search, modality=modality, cursor=cursor, limit=limit,
         )
@@ -2068,7 +2068,7 @@ class MemoryEngine:
     ) -> MemoryTermPage:
         if limit < 1 or limit > 200:
             raise ValueError("limit must be between 1 and 200")
-        return recall_inspect.term_page(
+        return index_inspect.term_page(
             self, self._resolve_namespace(namespace), search=search, cursor=cursor, limit=limit,
         )
 
@@ -2076,8 +2076,8 @@ class MemoryEngine:
         self,
         *,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> list[CompiledClaim]:
-        return recall_inspect.compiled_claims(self, self._resolve_namespace(namespace))
+    ) -> list[Claim]:
+        return index_inspect.compiled_claims(self, self._resolve_namespace(namespace))
 
     def memory_vector_projection(
         self,
@@ -2086,17 +2086,17 @@ class MemoryEngine:
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> VectorProjection:
         sample = max(10, min(sample, 1000))
-        return recall_inspect.vector_projection(self, self._resolve_namespace(namespace), sample=sample)
+        return index_inspect.vector_projection(self, self._resolve_namespace(namespace), sample=sample)
 
     def memory_vector_neighbors(
         self,
-        delta_id: str,
+        record_id: str,
         *,
         limit: int = 12,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> VectorNeighbors:
-        return recall_inspect.vector_neighbors(
-            self, self._resolve_namespace(namespace), delta_id, limit=max(1, min(limit, 50))
+        return index_inspect.vector_neighbors(
+            self, self._resolve_namespace(namespace), record_id, limit=max(1, min(limit, 50))
         )
 
     def memory_retrieval_graph(
@@ -2107,7 +2107,7 @@ class MemoryEngine:
         limit: int = 400,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> MemoryGraphPage:
-        return recall_inspect.retrieval_graph_page(
+        return index_inspect.retrieval_graph_page(
             self, self._resolve_namespace(namespace),
             seed_id=seed_id, edge_kind=edge_kind, limit=max(1, min(limit, 2000)),
         )
@@ -2120,13 +2120,13 @@ class MemoryEngine:
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         memory_namespace = self._resolve_namespace(namespace)
-        deltas = self.store.list_deltas(
-            kinds=["observation", "extraction"],
+        deltas = self.store.list_records(
+            kinds=["raw_source", "fact"],
             scope=self._scope(memory_namespace, scope),
             namespace=memory_namespace,
         )
-        observations = {item.id: item for item in deltas if item.kind == "observation"}
-        claims = compile_claims([item for item in deltas if item.kind == "extraction"], observations)
+        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
+        claims = compile_claims([item for item in deltas if item.kind == "fact"], observations)
         ordered = sorted(claims, key=lambda item: item.confidence, reverse=True)
         profile = {
             "static": [item.text for item in ordered if item.confidence >= 0.7][:12],
@@ -2146,7 +2146,7 @@ class MemoryEngine:
         helpful: bool,
         comment: str | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> MemoryDelta:
+    ) -> MemoryRecord:
         memory_namespace = self._resolve_namespace(namespace)
         trace = self.get_retrieval_trace(query_id, namespace=memory_namespace)
         if trace is None:
@@ -2231,10 +2231,10 @@ class MemoryEngine:
         return completed
 
     def _record_extension_job_failure(self, job: MemoryJob, error: str) -> None:
-        if job.kind.startswith("formation:"):
-            capability, name = "formation", job.kind.removeprefix("formation:")
-        elif job.kind.startswith("recall:") and job.kind.endswith(":project"):
-            capability, name = "recall", job.kind.removeprefix("recall:").removesuffix(":project")
+        if job.kind.startswith("ingest:"):
+            capability, name = "ingest", job.kind.removeprefix("ingest:")
+        elif job.kind.startswith("index:") and job.kind.endswith(":project"):
+            capability, name = "index", job.kind.removeprefix("index:").removesuffix(":project")
         elif job.kind.startswith("extension:") and job.kind.endswith(":rebuild"):
             extension_id = job.kind.removeprefix("extension:").removesuffix(":rebuild")
             spec = self.extensions.extensions.get(extension_id)
@@ -2297,8 +2297,8 @@ class MemoryEngine:
             status = "available"
             has_persistent_recall = any(
                 channel.spec.persistent
-                and self.extensions.owner("recall", channel.spec.id) == extension_id
-                for channel in self.extensions.recall_channels.channels
+                and self.extensions.owner("index", channel.spec.id) == extension_id
+                for channel in self.extensions.index_channels.channels
             )
             revision_changed = bool(
                 previous
@@ -2359,22 +2359,22 @@ class MemoryEngine:
         self._config_revision = configuration.revision
 
     def _prewarm_embedding_cache(self, embedder: Embedder) -> None:
-        deltas = self.store.list_deltas(
-            kinds=["observation", "extraction", "annotation"],
+        deltas = self.store.list_records(
+            kinds=["raw_source", "fact", "note"],
             include_retracted=False,
         )
-        observations = {item.id: item for item in deltas if item.kind == "observation"}
+        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
         claims = compile_claims(
-            [item for item in deltas if item.kind == "extraction"], observations
+            [item for item in deltas if item.kind == "fact"], observations
         )
         texts = [
             item.text for item in deltas
-            if item.kind in {"observation", "extraction"} and item.text.strip()
+            if item.kind in {"raw_source", "fact"} and item.text.strip()
         ]
         texts.extend(item.text for item in claims if item.text.strip())
         texts.extend(
             " ".join([view.summary, view.concept_or_topic, *view.alt_phrasings])
-            for view in self.store.episode_recall_views()
+            for view in self.store.group_summary_views()
             if view.summary.strip()
         )
         unique = {
@@ -2382,14 +2382,14 @@ class MemoryEngine:
             for text in texts
         }
         cache_key = str(getattr(embedder, "cache_key", embedder.model_name))
-        existing = self.vector_cache.get(list(unique), cache_key)
+        existing = self.embedding_index.get(list(unique), cache_key)
         missing = [(text_hash, text) for text_hash, text in unique.items() if text_hash not in existing]
         for offset in range(0, len(missing), 64):
             batch = missing[offset : offset + 64]
             vectors = embedder.encode([text for _, text in batch])
             if len(vectors) != len(batch):
                 raise RuntimeError("embedding provider returned the wrong number of vectors")
-            self.vector_cache.put(
+            self.embedding_index.put(
                 {text_hash: vector for (text_hash, _), vector in zip(batch, vectors)},
                 cache_key,
             )
@@ -2409,44 +2409,44 @@ class MemoryEngine:
     def _scope(namespace: MemoryNamespace, scope: dict[str, Any] | None) -> dict[str, Any]:
         return {**namespace.as_scope(), **(scope or {})}
 
-    def _schedule_episode(
+    def _schedule_group(
         self,
-        episode_id: str,
+        group_id: str,
         namespace: MemoryNamespace,
         *,
         force_extraction: bool = False,
         process: bool | None = None,
     ) -> None:
-        payload = {"episode_id": episode_id, "namespace": namespace.model_dump(mode="json")}
+        payload = {"group_id": group_id, "namespace": namespace.model_dump(mode="json")}
         namespace_key = _namespace_key(namespace)
         evidence_version = self.store.max_seq()
         if self.completion is not None or force_extraction:
             self.store.enqueue_job(
-                "extract_episode", payload, dedup_key=f"extract:{namespace_key}:{episode_id}:{evidence_version}"
+                "extract_facts", payload, dedup_key=f"extract:{namespace_key}:{group_id}:{evidence_version}"
             )
         self.store.enqueue_job(
-            "compile_episode", payload, dedup_key=f"compile:{namespace_key}:{episode_id}:{evidence_version}"
+            "summarize_group", payload, dedup_key=f"compile:{namespace_key}:{group_id}:{evidence_version}"
         )
-        event = FormationEvent(
-            name="episode_committed",
-            episode_id=episode_id,
+        event = IngestEvent(
+            name="group_committed",
+            group_id=group_id,
             namespace=namespace,
             evidence_version=evidence_version,
         )
-        for processor in self.extensions.formation_processors.scheduled(event):
+        for processor in self.extensions.ingest_processors.scheduled(event):
             self.store.enqueue_job(
-                f"formation:{processor.spec.name}",
+                f"ingest:{processor.spec.name}",
                 {**payload, "processor": processor.spec.name, "evidence_version": evidence_version},
-                dedup_key=f"formation:{processor.spec.name}:{namespace_key}:{episode_id}:{evidence_version}",
+                dedup_key=f"ingest:{processor.spec.name}:{namespace_key}:{group_id}:{evidence_version}",
                 max_attempts=processor.spec.max_attempts,
             )
-        for channel in self.extensions.recall_channels.channels:
+        for channel in self.extensions.index_channels.channels:
             if not callable(getattr(channel, "project", None)):
                 continue
             self.store.enqueue_job(
-                f"recall:{channel.spec.id}:project",
+                f"index:{channel.spec.id}:project",
                 {**payload, "channel_id": channel.spec.id, "evidence_version": evidence_version},
-                dedup_key=f"recall:{channel.spec.id}:{namespace_key}:{episode_id}:{evidence_version}",
+                dedup_key=f"index:{channel.spec.id}:{namespace_key}:{group_id}:{evidence_version}",
             )
         should_process = process if process is not None else self.auto_process
         if should_process:
@@ -2472,28 +2472,28 @@ def _finalize_extension_registry(
     if "builtin.sources" not in registry.source_handlers.names:
         registry.source_handlers.register(BuiltinSourceHandler())
     for kind, handler in (
-        ("extract_episode", _job_extract_episode),
-        ("compile_episode", _job_compile_episode),
+        ("extract_facts", _job_extract_facts),
+        ("summarize_group", _job_summarize_group),
         ("rebuild_embeddings", _job_rebuild_embeddings),
         ("execute_query", _job_execute_query),
     ):
         if kind not in registry.job_handlers.names:
             registry.job_handlers.register(handler, kind=kind)
-    for name in registry.formation_processors.names:
-        kind = f"formation:{name}"
+    for name in registry.ingest_processors.names:
+        kind = f"ingest:{name}"
         if kind not in registry.job_handlers.names:
-            registry.job_handlers.register(_job_formation_processor, kind=kind)
-    for channel_id in registry.recall_channels.names:
-        channel = registry.recall_channels.get(channel_id)
+            registry.job_handlers.register(_job_ingest_processor, kind=kind)
+    for channel_id in registry.index_channels.names:
+        channel = registry.index_channels.get(channel_id)
         if channel is not None and callable(getattr(channel, "project", None)):
-            kind = f"recall:{channel_id}:project"
+            kind = f"index:{channel_id}:project"
             if kind not in registry.job_handlers.names:
-                registry.job_handlers.register(_job_recall_projection, kind=kind)
+                registry.job_handlers.register(_job_index_projection, kind=kind)
     for extension_id in registry.extensions:
         if any(
             channel.spec.persistent
-            and registry.owner("recall", channel.spec.id) == extension_id
-            for channel in registry.recall_channels.channels
+            and registry.owner("index", channel.spec.id) == extension_id
+            for channel in registry.index_channels.channels
         ):
             registry.job_handlers.register(
                 _job_extension_rebuild,
@@ -2503,19 +2503,19 @@ def _finalize_extension_registry(
     return registry
 
 
-def _job_extract_episode(engine: MemoryEngine, job: MemoryJob) -> None:
+def _job_extract_facts(engine: MemoryEngine, job: MemoryJob) -> None:
     if engine.completion is None:
         raise RuntimeError("no completion provider is configured")
     namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
-    engine.run_extraction(
-        episode_id=str(job.payload.get("episode_id") or ""), namespace=namespace
+    engine.run_fact_extraction(
+        group_id=str(job.payload.get("group_id") or ""), namespace=namespace
     )
 
 
-def _job_compile_episode(engine: MemoryEngine, job: MemoryJob) -> None:
+def _job_summarize_group(engine: MemoryEngine, job: MemoryJob) -> None:
     namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
-    engine.build_episode_recall(
-        [str(job.payload.get("episode_id") or "")], namespace=namespace
+    engine.build_group_summary(
+        [str(job.payload.get("group_id") or "")], namespace=namespace
     )
 
 
@@ -2531,22 +2531,22 @@ def _job_execute_query(engine: MemoryEngine, job: MemoryJob) -> None:
     engine.execute_query_run(str(job.payload["query_id"]))
 
 
-def _job_formation_processor(engine: MemoryEngine, job: MemoryJob) -> None:
-    name = str(job.payload.get("processor") or job.kind.removeprefix("formation:"))
-    processor = engine.extensions.formation_processors.get(name)
+def _job_ingest_processor(engine: MemoryEngine, job: MemoryJob) -> None:
+    name = str(job.payload.get("processor") or job.kind.removeprefix("ingest:"))
+    processor = engine.extensions.ingest_processors.get(name)
     if processor is None:
-        raise RuntimeError(f"formation processor is unavailable: {name}")
+        raise RuntimeError(f"ingest processor is unavailable: {name}")
     namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
-    episode_id = str(job.payload.get("episode_id") or "")
-    evidence = engine.store.list_deltas(
+    group_id = str(job.payload.get("group_id") or "")
+    evidence = engine.store.list_records(
         kinds=processor.spec.input_kinds,
         namespace=namespace,
-        episode_prefix=episode_id,
+        group_prefix=group_id,
         include_retracted=False,
     )
-    proposed = processor.process(evidence, FormationContext(
+    proposed = processor.process(evidence, IngestContext(
         namespace=namespace,
-        episode_id=episode_id,
+        group_id=group_id,
         evidence_version=int(
             job.payload.get("evidence_version") or engine.store.max_seq()
         ),
@@ -2554,24 +2554,24 @@ def _job_formation_processor(engine: MemoryEngine, job: MemoryJob) -> None:
     ))
     available = {item.id: item for item in evidence}
     for item in proposed:
-        if not isinstance(item, ProposedDelta):
-            raise TypeError(f"formation processor {name} returned a non-ProposedDelta value")
+        if not isinstance(item, ProposedRecord):
+            raise TypeError(f"ingest processor {name} returned a non-ProposedRecord value")
         if item.kind not in processor.spec.output_kinds:
-            raise ValueError(f"formation processor {name} returned disallowed kind {item.kind}")
+            raise ValueError(f"ingest processor {name} returned disallowed kind {item.kind}")
         if not item.evidence_refs or any(ref not in available for ref in item.evidence_refs):
-            raise ValueError(f"formation processor {name} returned invalid evidence references")
+            raise ValueError(f"ingest processor {name} returned invalid evidence references")
         primary = available[item.evidence_refs[0]]
         engine.store.append(
             kind=item.kind,
             text=item.text,
-            episode_id=episode_id,
+            group_id=group_id,
             evidence_refs=item.evidence_refs,
             confidence=item.confidence,
             subject=item.subject,
             relation=item.relation,
             object=item.object,
             temporal_anchor=item.temporal_anchor,
-            actor=Actor(type="formation_pipeline", id=name),
+            actor=Actor(type="ingest_pipeline", id=name),
             namespace=namespace,
             scope=primary.scope,
             payload={**dict(item.payload), "producer": name},
@@ -2580,35 +2580,35 @@ def _job_formation_processor(engine: MemoryEngine, job: MemoryJob) -> None:
             external_key=item.external_key,
         )
     engine._record_extension_success(
-        "formation",
+        "ingest",
         name,
         int(job.payload.get("evidence_version") or engine.store.max_seq()),
     )
 
 
-def _job_recall_projection(engine: MemoryEngine, job: MemoryJob) -> None:
+def _job_index_projection(engine: MemoryEngine, job: MemoryJob) -> None:
     channel_id = str(job.payload.get("channel_id") or "")
-    channel = engine.extensions.recall_channels.get(channel_id)
+    channel = engine.extensions.index_channels.get(channel_id)
     if channel is None:
-        raise RuntimeError(f"recall channel is unavailable: {channel_id}")
+        raise RuntimeError(f"index channel is unavailable: {channel_id}")
     namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
-    episode_id = str(job.payload.get("episode_id") or "")
+    group_id = str(job.payload.get("group_id") or "")
     evidence_version = int(job.payload.get("evidence_version") or engine.store.max_seq())
-    deltas = engine.store.list_deltas(
+    deltas = engine.store.list_records(
         namespace=namespace,
-        episode_prefix=episode_id or None,
+        group_prefix=group_id or None,
         seq_cutoff=evidence_version,
         include_retracted=False,
     )
-    batch = TraceChangeBatch(
-        deltas=tuple(deltas),
+    batch = MemoryLogChangeBatch(
+        records=tuple(deltas),
         namespace=namespace,
         evidence_version=evidence_version,
-        episode_id=episode_id or None,
+        group_id=group_id or None,
     )
-    writer = RecallWriter(engine.store, channel.spec, namespace)
+    writer = IndexWriter(engine.store, channel.spec, namespace)
     channel.project(batch, writer)
-    engine._record_extension_success("recall", channel_id, evidence_version)
+    engine._record_extension_success("index", channel_id, evidence_version)
 
 
 def _job_extension_rebuild(engine: MemoryEngine, job: MemoryJob) -> None:
@@ -2619,15 +2619,15 @@ def _job_extension_rebuild(engine: MemoryEngine, job: MemoryJob) -> None:
     evidence_version = int(job.payload.get("evidence_version") or engine.store.max_seq())
     channels = [
         channel
-        for channel in engine.extensions.recall_channels.channels
+        for channel in engine.extensions.index_channels.channels
         if channel.spec.persistent
-        and engine.extensions.owner("recall", channel.spec.id) == extension_id
+        and engine.extensions.owner("index", channel.spec.id) == extension_id
     ]
     namespaces = engine.store.namespaces() or [engine.default_namespace]
     for namespace in namespaces:
-        reader = TraceReader(engine.store, namespace, seq_cutoff=evidence_version)
+        reader = MemoryLogReader(engine.store, namespace, seq_cutoff=evidence_version)
         for channel in channels:
-            channel.rebuild(reader, RecallWriter(engine.store, channel.spec, namespace))
+            channel.rebuild(reader, IndexWriter(engine.store, channel.spec, namespace))
     engine.store.put_extension_state(ExtensionState(
         extension_id=extension_id,
         installed_version=spec.version,
@@ -2653,7 +2653,7 @@ def _answer_prompt(question: str, hits: list[Any]) -> str:
             f"({hit.temporal_anchor or hit.observed_at or 'unknown date'}) {hit.text}"
         )
         for hit in hits
-        if hit.kind in {"observation", "extraction"}
+        if hit.kind in {"raw_source", "fact"}
     ]
     return (
         f"Question type: {query_kind}\n"
@@ -2733,7 +2733,7 @@ def _retriever_config(value: RetrievalConfiguration) -> RetrieverConfig:
         graph_hops=value.graph_hops,
         margin_threshold=value.confidence_margin,
         max_refinement_rounds=value.max_refinement_rounds,
-        deep_recall_enabled=value.deep_recall_enabled,
+        deep_summary_enabled=value.deep_summary_enabled,
         retrieval_profile=value.retrieval_profile,
         enabled_routes=tuple(value.enabled_routes),
         route_weights=dict(value.route_weights),
@@ -2769,12 +2769,12 @@ def _citations(hits: list[Any]) -> list[Citation]:
     result: list[Citation] = []
     seen: set[str] = set()
     for hit in hits:
-        if hit.item_id in seen or hit.kind not in {"observation", "extraction"}:
+        if hit.item_id in seen or hit.kind not in {"raw_source", "fact"}:
             continue
         seen.add(hit.item_id)
         result.append(
             Citation(
-                delta_id=hit.item_id,
+                record_id=hit.item_id,
                 source_ref=hit.source_ref,
                 locator=hit.locator,
                 excerpt=hit.text[:500],

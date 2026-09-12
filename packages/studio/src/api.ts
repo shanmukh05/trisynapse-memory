@@ -2,7 +2,7 @@ import type {
   Connection, GraphPage, IngestionRun, MemoryCatalog, HelperPage, MemoryDocument,
   MemoryPage, MemoryTerm, ModelConfigurationState, Namespace, Provider, QueryRun, Source,
   QueryRunPage, RetrievalConfiguration, SearchResult, SourceInput, SourcePage,
-  SourcePreview, VectorNeighbors, VectorProjection, CompiledClaim, EpisodeInfo,
+  SourcePreview, VectorNeighbors, VectorProjection, Claim, RecordGroupInfo,
 } from "./types";
 
 export class StudioApi {
@@ -88,14 +88,14 @@ export class StudioApi {
     }
   }
 
-  graph(view: GraphPage["view"], search = "", filters: { nodeType?: string; sourceId?: string; episodeId?: string } = {}) {
+  graph(view: GraphPage["view"], search = "", filters: { nodeType?: string; sourceId?: string; groupId?: string } = {}) {
     const q = this.namespaceQuery();
     q.set("view", view);
     q.set("limit", "800");
     if (search) q.set("q", search);
     if (filters.nodeType) q.append("node_type", filters.nodeType);
     if (filters.sourceId) q.set("source_id", filters.sourceId);
-    if (filters.episodeId) q.set("episode_id", filters.episodeId);
+    if (filters.groupId) q.set("group_id", filters.groupId);
     return this.request<GraphPage>(`/api/v1/memory-graph?${q}`);
   }
   graphNeighbors(id: string, view: GraphPage["view"]) { const q = this.namespaceQuery(); q.set("view", view); return this.request<GraphPage>(`/api/v1/memory-graph/nodes/${encodeURIComponent(id)}/neighbors?${q}`); }
@@ -128,12 +128,12 @@ export class StudioApi {
     if (search) q.set("q", search);
     return this.request<{ terms: MemoryTerm[]; next_cursor?: number | null; total: number }>(`/api/v1/memory/terms?${q}`);
   }
-  claims() { return this.request<{ claims: CompiledClaim[] }>(`/api/v1/memory/claims?${this.namespaceQuery()}`); }
-  episodes() { return this.request<{ episodes: EpisodeInfo[] }>(`/api/v1/episodes?${this.namespaceQuery()}`); }
+  claims() { return this.request<{ claims: Claim[] }>(`/api/v1/memory/claims?${this.namespaceQuery()}`); }
+  groups() { return this.request<{ groups: RecordGroupInfo[] }>(`/api/v1/groups?${this.namespaceQuery()}`); }
   vectorProjection() { return this.request<VectorProjection>(`/api/v1/memory/vectors/projection?${this.namespaceQuery()}`); }
-  vectorNeighbors(deltaId: string) {
+  vectorNeighbors(recordId: string) {
     const q = this.namespaceQuery();
-    q.set("delta_id", deltaId);
+    q.set("record_id", recordId);
     return this.request<VectorNeighbors>(`/api/v1/memory/vectors/neighbors?${q}`);
   }
   retrievalGraph(seedId = "", edgeKind = "") {

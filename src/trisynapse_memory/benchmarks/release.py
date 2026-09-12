@@ -51,7 +51,7 @@ def evaluate_release_gate(
         prompt_names = [item.get("name") for item in payload.get("prompts") or [] if isinstance(item, dict)]
         workflow_provenance_valid = (
             providers.get("completion", {}).get("provider") not in {None, "none"}
-            and prompt_names == ["extraction", "episode_recall", "answer", "benchmark_judge"]
+            and prompt_names == ["facts", "group_summary", "answer", "benchmark_judge"]
             if mode == "end-to-end"
             else providers.get("completion", {}).get("provider") == "none" and prompt_names == []
         )

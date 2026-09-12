@@ -17,13 +17,13 @@ from trisynapse_memory.engine.models import (
     Actor,
     ModelConfiguration,
     ModelDescriptor,
-    EpisodeRecallView,
-    MemoryDelta,
+    GroupSummaryView,
+    MemoryRecord,
     MemoryJob,
     MemoryNamespace,
     IngestionRun,
     RemoveResult,
-    RecallSnapshot,
+    IndexSnapshot,
     QueryRun,
     QueryRunPage,
     RetrievalConfiguration,
@@ -33,7 +33,7 @@ from trisynapse_memory.engine.models import (
     StoreValidation,
 )
 from trisynapse_memory.engine.retrieval.contracts import RetrievalDocument
-from trisynapse_memory.engine.extensions import ExtensionState, RecallRecord
+from trisynapse_memory.engine.extensions import ExtensionState, IndexRecord
 from trisynapse_memory.engine.utils import bm25_term_score
 from trisynapse_memory.engine.retrieval.tokenization import LEXICAL_TOKENIZER_VERSION, lexical_tokens
 
@@ -81,7 +81,7 @@ def _namespace_sql_key(namespace: MemoryNamespace | dict[str, Any]) -> str:
     return _json(model.model_dump(mode="json", exclude_none=True))
 
 
-class SQLiteTraceStore:
+class SQLiteMemoryLogStore:
     """Durable ordered Trace with transactional sequence assignment."""
 
     def __init__(self, root: str | Path) -> None:
@@ -121,10 +121,10 @@ class SQLiteTraceStore:
                 seq INTEGER NOT NULL UNIQUE,
                 written_at TEXT NOT NULL,
                 observed_at TEXT,
-                kind TEXT NOT NULL CHECK(kind IN ('observation','extraction','annotation','access','retraction')),
+                kind TEXT NOT NULL CHECK(kind IN ('raw_source','fact','note','access','retraction')),
                 actor_json TEXT NOT NULL,
                 namespace_json TEXT NOT NULL DEFAULT '{"project_id":"default"}',
-                episode_id TEXT,
+                group_id TEXT,
                 evidence_refs_json TEXT NOT NULL,
                 confidence REAL NOT NULL,
                 privacy_scope_json TEXT NOT NULL,
@@ -139,9 +139,6 @@ class SQLiteTraceStore:
                 locator_json TEXT,
                 external_key TEXT UNIQUE
             );
-            CREATE INDEX IF NOT EXISTS idx_deltas_episode ON deltas(episode_id, seq);
-            CREATE INDEX IF NOT EXISTS idx_deltas_kind ON deltas(kind, seq);
-            CREATE INDEX IF NOT EXISTS idx_deltas_observed ON deltas(observed_at);
 
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
@@ -295,7 +292,7 @@ class SQLiteTraceStore:
                 namespace_key TEXT NOT NULL,
                 seq INTEGER NOT NULL,
                 kind TEXT NOT NULL,
-                episode_id TEXT,
+                group_id TEXT,
                 modality TEXT NOT NULL,
                 source_type TEXT NOT NULL,
                 text_hash TEXT NOT NULL,
@@ -338,6 +335,13 @@ class SQLiteTraceStore:
         )
         tables = {row["name"] for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         self._migrate_delta_schema()
+        self._connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_deltas_group ON deltas(group_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_deltas_kind ON deltas(kind, seq);
+            CREATE INDEX IF NOT EXISTS idx_deltas_observed ON deltas(observed_at);
+            """
+        )
         self._migrate_removal_audit_schema()
         self._migrate_snapshot_schema()
         if "purge_audit" in tables:
@@ -420,7 +424,7 @@ class SQLiteTraceStore:
         for row in self._connection.execute(
             """SELECT d.* FROM deltas d
                LEFT JOIN retrieval_documents r ON r.delta_id=d.id
-               WHERE r.delta_id IS NULL AND d.kind IN ('observation','extraction')"""
+               WHERE r.delta_id IS NULL AND d.kind IN ('raw_source','fact')"""
         ).fetchall():
             self._index_delta_uncommitted(self._connection, self._from_row(row))
         for row in self._connection.execute(
@@ -452,10 +456,10 @@ class SQLiteTraceStore:
                 seq INTEGER NOT NULL UNIQUE,
                 written_at TEXT NOT NULL,
                 observed_at TEXT,
-                kind TEXT NOT NULL CHECK(kind IN ('observation','extraction','annotation','access','retraction')),
+                kind TEXT NOT NULL CHECK(kind IN ('raw_source','fact','note','access','retraction')),
                 actor_json TEXT NOT NULL,
                 namespace_json TEXT NOT NULL DEFAULT '{"project_id":"default"}',
-                episode_id TEXT,
+                group_id TEXT,
                 evidence_refs_json TEXT NOT NULL,
                 confidence REAL NOT NULL,
                 privacy_scope_json TEXT NOT NULL,
@@ -471,17 +475,21 @@ class SQLiteTraceStore:
                 external_key TEXT UNIQUE
             );
             INSERT INTO deltas_without_chain(
-                id,seq,written_at,observed_at,kind,actor_json,namespace_json,episode_id,
+                id,seq,written_at,observed_at,kind,actor_json,namespace_json,group_id,
                 evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,text,
                 subject,relation,object,temporal_anchor,source_ref_json,locator_json,external_key
             ) SELECT
-                id,seq,written_at,observed_at,kind,actor_json,namespace_json,episode_id,
-                evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,text,
+                id,seq,written_at,observed_at,
+                kind,
+                actor_json,namespace_json,group_id,
+                evidence_refs_json,confidence,privacy_scope_json,scope_json,
+                payload_json,
+                text,
                 subject,relation,object,temporal_anchor,source_ref_json,locator_json,external_key
             FROM deltas ORDER BY seq;
             DROP TABLE deltas;
             ALTER TABLE deltas_without_chain RENAME TO deltas;
-            CREATE INDEX idx_deltas_episode ON deltas(episode_id, seq);
+            CREATE INDEX idx_deltas_group ON deltas(group_id, seq);
             CREATE INDEX idx_deltas_kind ON deltas(kind, seq);
             CREATE INDEX idx_deltas_observed ON deltas(observed_at);
             """
@@ -736,7 +744,7 @@ class SQLiteTraceStore:
     def has_searchable_content(self) -> bool:
         row = self._connection.execute(
             """SELECT 1 FROM deltas
-               WHERE kind IN ('observation','extraction') AND text!='' AND text!='[REMOVED]'
+               WHERE kind IN ('raw_source','fact') AND text!='' AND text!='[REMOVED]'
                LIMIT 1"""
         ).fetchone()
         return row is not None
@@ -749,7 +757,7 @@ class SQLiteTraceStore:
         observed_at: datetime | str | None = None,
         actor: Actor | dict[str, Any] | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-        episode_id: str | None = None,
+        group_id: str | None = None,
         evidence_refs: Iterable[str] = (),
         confidence: float = 0.7,
         scope: dict[str, Any] | None = None,
@@ -761,7 +769,7 @@ class SQLiteTraceStore:
         source_ref: dict[str, Any] | str | None = None,
         locator: dict[str, Any] | str | None = None,
         external_key: str | None = None,
-    ) -> MemoryDelta:
+    ) -> MemoryRecord:
         if external_key:
             existing = self.get_by_external_key(external_key)
             if existing is not None:
@@ -771,13 +779,14 @@ class SQLiteTraceStore:
         observed = _parse_datetime(observed_at)
         written = datetime.now(timezone.utc)
         evidence = list(dict.fromkeys(evidence_refs))
+        payload = dict(payload or {})
         with self._lock:
             cursor = self._connection.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             try:
                 previous = cursor.execute("SELECT seq FROM deltas ORDER BY seq DESC LIMIT 1").fetchone()
                 seq = int(previous["seq"]) + 1 if previous else 1
-                delta = MemoryDelta(
+                delta = MemoryRecord(
                     id=_new_id(),
                     seq=seq,
                     written_at=written,
@@ -785,12 +794,12 @@ class SQLiteTraceStore:
                     kind=kind,
                     actor=actor_model,
                     namespace=namespace_model,
-                    episode_id=episode_id,
+                    group_id=group_id,
                     evidence_refs=evidence,
                     confidence=confidence,
                     privacy_scope={},
                     scope=scope or {},
-                    payload=payload or {},
+                    payload=payload,
                     text=text,
                     subject=subject,
                     relation=relation,
@@ -803,7 +812,7 @@ class SQLiteTraceStore:
                 cursor.execute(
                     """INSERT INTO deltas(
                            id,seq,written_at,observed_at,kind,actor_json,namespace_json,
-                           episode_id,evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,
+                           group_id,evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,
                            text,subject,relation,object,temporal_anchor,source_ref_json,locator_json,external_key
                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     self._to_row(delta),
@@ -825,7 +834,7 @@ class SQLiteTraceStore:
                 raise
 
     @staticmethod
-    def _to_row(delta: MemoryDelta) -> tuple[Any, ...]:
+    def _to_row(delta: MemoryRecord) -> tuple[Any, ...]:
         return (
             delta.id,
             delta.seq,
@@ -834,7 +843,7 @@ class SQLiteTraceStore:
             delta.kind,
             _json(delta.actor),
             _json(delta.namespace),
-            delta.episode_id,
+            delta.group_id,
             _json(delta.evidence_refs),
             delta.confidence,
             _json(delta.privacy_scope),
@@ -851,8 +860,8 @@ class SQLiteTraceStore:
         )
 
     @staticmethod
-    def _from_row(row: sqlite3.Row) -> MemoryDelta:
-        return MemoryDelta(
+    def _from_row(row: sqlite3.Row) -> MemoryRecord:
+        return MemoryRecord(
             id=row["id"],
             seq=row["seq"],
             written_at=_parse_datetime(row["written_at"]),
@@ -860,7 +869,7 @@ class SQLiteTraceStore:
             kind=row["kind"],
             actor=json.loads(row["actor_json"]),
             namespace=json.loads(row["namespace_json"]) if "namespace_json" in row.keys() else {},
-            episode_id=row["episode_id"],
+            group_id=row["group_id"],
             evidence_refs=json.loads(row["evidence_refs_json"]),
             confidence=row["confidence"],
             privacy_scope=json.loads(row["privacy_scope_json"]),
@@ -876,35 +885,35 @@ class SQLiteTraceStore:
             external_key=row["external_key"],
         )
 
-    def get(self, delta_id: str) -> MemoryDelta | None:
+    def get(self, delta_id: str) -> MemoryRecord | None:
         row = self._connection.execute("SELECT * FROM deltas WHERE id=?", (delta_id,)).fetchone()
         return self._from_row(row) if row else None
 
-    def get_by_external_key(self, external_key: str) -> MemoryDelta | None:
+    def get_by_external_key(self, external_key: str) -> MemoryRecord | None:
         row = self._connection.execute("SELECT * FROM deltas WHERE external_key=?", (external_key,)).fetchone()
         return self._from_row(row) if row else None
 
-    def list_deltas(
+    def list_records(
         self,
         *,
         kinds: Iterable[str] | None = None,
-        episode_prefix: str | None = None,
+        group_prefix: str | None = None,
         scope: dict[str, Any] | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         seq_cutoff: int | None = None,
         include_retracted: bool = False,
         after_seq: int | None = None,
         limit: int | None = None,
-    ) -> list[MemoryDelta]:
+    ) -> list[MemoryRecord]:
         clauses: list[str] = []
         params: list[Any] = []
         if kinds:
             kind_list = list(kinds)
             clauses.append(f"kind IN ({','.join('?' for _ in kind_list)})")
             params.extend(kind_list)
-        if episode_prefix:
-            clauses.append("episode_id LIKE ?")
-            params.append(f"{episode_prefix}%")
+        if group_prefix:
+            clauses.append("group_id LIKE ?")
+            params.append(f"{group_prefix}%")
         if seq_cutoff is not None:
             clauses.append("seq <= ?")
             params.append(seq_cutoff)
@@ -935,7 +944,7 @@ class SQLiteTraceStore:
         targets: set[str] = set()
         for row in rows:
             payload = json.loads(row["payload_json"])
-            targets.update(payload.get("target_delta_ids") or [])
+            targets.update(payload.get("target_record_ids") or [])
         return targets
 
     def max_seq(self) -> int:
@@ -948,7 +957,7 @@ class SQLiteTraceStore:
         ).fetchall()
         return [MemoryNamespace.model_validate(json.loads(row["namespace_json"])) for row in rows]
 
-    def delta_count(self) -> int:
+    def record_count(self) -> int:
         row = self._connection.execute("SELECT COUNT(*) AS value FROM deltas").fetchone()
         return int(row["value"])
 
@@ -963,7 +972,7 @@ class SQLiteTraceStore:
         """Check database structure, ordered records, references, and source bytes."""
 
         issues: list[str] = []
-        malformed_delta_ids: list[str] = []
+        malformed_record_ids: list[str] = []
         broken_evidence_refs: list[str] = []
         missing_source_ids: list[str] = []
         corrupted_source_ids: list[str] = []
@@ -979,7 +988,7 @@ class SQLiteTraceStore:
         except sqlite3.Error as exc:
             issues.append(f"SQLite validation failed: {exc}")
 
-        parsed: list[MemoryDelta] = []
+        parsed: list[MemoryRecord] = []
         sequence_contiguous = True
         for expected_seq, row in enumerate(rows, 1):
             delta_id = str(row["id"]) if "id" in row.keys() else f"row:{expected_seq}"
@@ -988,15 +997,15 @@ class SQLiteTraceStore:
                     sequence_contiguous = False
                 parsed.append(self._from_row(row))
             except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                malformed_delta_ids.append(delta_id)
+                malformed_record_ids.append(delta_id)
                 issues.append(f"Malformed delta {delta_id}: {exc}")
         if not sequence_contiguous:
             issues.append("Trace sequence numbers are not contiguous from 1")
 
-        delta_ids = {delta.id for delta in parsed}
+        record_ids = {delta.id for delta in parsed}
         for delta in parsed:
             for evidence_id in delta.evidence_refs:
-                if evidence_id not in delta_ids:
+                if evidence_id not in record_ids:
                     broken_evidence_refs.append(f"{delta.id}->{evidence_id}")
         if broken_evidence_refs:
             issues.append(f"{len(broken_evidence_refs)} evidence references point to missing deltas")
@@ -1032,29 +1041,29 @@ class SQLiteTraceStore:
         return StoreValidation(
             ok=database_ok and not issues,
             database_ok=database_ok,
-            delta_count=len(rows),
+            record_count=len(rows),
             sequence_contiguous=sequence_contiguous,
             source_blobs_checked=source_blobs_checked,
             missing_source_ids=missing_source_ids,
             corrupted_source_ids=corrupted_source_ids,
-            malformed_delta_ids=malformed_delta_ids,
+            malformed_record_ids=malformed_record_ids,
             broken_evidence_refs=broken_evidence_refs,
             issues=issues,
         )
 
-    def history(self, delta_id: str) -> list[MemoryDelta]:
+    def history(self, delta_id: str) -> list[MemoryRecord]:
         events = []
-        for delta in self.list_deltas(include_retracted=True):
+        for delta in self.list_records(include_retracted=True):
             targets = set(delta.evidence_refs)
-            targets.update(delta.payload.get("target_delta_ids") or [])
+            targets.update(delta.payload.get("target_record_ids") or [])
             if delta.id == delta_id or delta_id in targets:
                 events.append(delta)
         return events
 
-    def hard_remove(self, delta_ids: list[str], *, requested_by: str, reason: str) -> RemoveResult:
+    def hard_remove(self, record_ids: list[str], *, requested_by: str, reason: str) -> RemoveResult:
         """Redact selected payloads and record the lifecycle operation."""
 
-        targets = list(dict.fromkeys(delta_ids))
+        targets = list(dict.fromkeys(record_ids))
         if not targets:
             raise ValueError("remove requires at least one delta id")
         remove_id = _new_id("remove")
@@ -1075,7 +1084,7 @@ class SQLiteTraceStore:
                     raise KeyError(f"unknown deltas: {', '.join(missing)}")
                 cursor.execute(
                     f"""UPDATE deltas SET
-                        text='[REMOVED]', observed_at=NULL, actor_json=?, episode_id=NULL,
+                        text='[REMOVED]', observed_at=NULL, actor_json=?, group_id=NULL,
                         evidence_refs_json=?, scope_json=?, external_key=NULL,
                         subject=NULL, relation=NULL, object=NULL, temporal_anchor=NULL,
                         source_ref_json=NULL, locator_json=NULL,
@@ -1092,7 +1101,7 @@ class SQLiteTraceStore:
                 )
                 cursor.execute("DELETE FROM embedding_cache")
                 cursor.execute("DELETE FROM recall_cache")
-                affected_recall_ids = self._dependent_delta_ids_uncommitted(cursor, targets)
+                affected_recall_ids = self._dependent_record_ids_uncommitted(cursor, targets)
                 affected_placeholders = ",".join("?" for _ in affected_recall_ids)
                 cursor.execute(
                     f"""DELETE FROM recall_records
@@ -1122,7 +1131,7 @@ class SQLiteTraceStore:
             self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return RemoveResult(
             remove_id=remove_id,
-            removed_delta_ids=targets,
+            removed_record_ids=targets,
             requested_by=requested_by,
             created_at=created,
         )
@@ -1270,30 +1279,30 @@ class SQLiteTraceStore:
             created_at=_parse_datetime(row["created_at"]), updated_at=_parse_datetime(row["updated_at"]),
         )
 
-    def put_episode_recall(self, view: EpisodeRecallView, recall_config_id: str = "episode-recall-v1") -> None:
+    def put_group_summary(self, view: GroupSummaryView, recall_config_id: str = "group-summary-v1") -> None:
         evidence_hash = hashlib.sha256(
-            _json(view.source_trace_ids).encode("utf-8")
+            _json(view.source_log_ids).encode("utf-8")
         ).hexdigest()
         self._connection.execute(
             """INSERT INTO recall_cache(cache_key,view_type,scope_ref,evidence_hash,recall_config_id,generated_at,stale,payload_json)
                VALUES(?,?,?,?,?,?,?,?)
                ON CONFLICT(cache_key) DO UPDATE SET generated_at=excluded.generated_at,stale=0,payload_json=excluded.payload_json""",
-            (view.cache_key, "episode_recall", view.episode_id, evidence_hash, recall_config_id, view.generated_at.isoformat(), 0, view.model_dump_json()),
+            (view.cache_key, "group_summary", view.group_id, evidence_hash, recall_config_id, view.generated_at.isoformat(), 0, view.model_dump_json()),
         )
         self._connection.commit()
 
-    def episode_recall_views(
+    def group_summary_views(
         self,
         *,
         include_stale: bool = True,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
-    ) -> list[EpisodeRecallView]:
-        sql = "SELECT payload_json,stale FROM recall_cache WHERE view_type='episode_recall'"
+    ) -> list[GroupSummaryView]:
+        sql = "SELECT payload_json,stale FROM recall_cache WHERE view_type='group_summary'"
         if not include_stale:
             sql += " AND stale=0"
-        views: list[EpisodeRecallView] = []
+        views: list[GroupSummaryView] = []
         for row in self._connection.execute(sql).fetchall():
-            view = EpisodeRecallView.model_validate_json(row["payload_json"])
+            view = GroupSummaryView.model_validate_json(row["payload_json"])
             view.stale = bool(row["stale"])
             views.append(view)
         if namespace is not None:
@@ -1302,7 +1311,7 @@ class SQLiteTraceStore:
             views = [view for view in views if all(getattr(view.namespace, key) == value for key, value in requested.items())]
         return views
 
-    def put_recall_record(self, record: RecallRecord) -> None:
+    def put_recall_record(self, record: IndexRecord) -> None:
         """Upsert one extension-owned Recall record in core-managed storage."""
 
         namespace_key = _namespace_sql_key(record.namespace)
@@ -1312,7 +1321,7 @@ class SQLiteTraceStore:
             self._connection.commit()
 
     def _recall_record_values(
-        self, record: RecallRecord, namespace_key: str
+        self, record: IndexRecord, namespace_key: str
     ) -> tuple[Any, ...]:
         evidence_refs = tuple(dict.fromkeys(record.evidence_refs))
         if not evidence_refs:
@@ -1353,7 +1362,7 @@ class SQLiteTraceStore:
         self,
         channel_id: str,
         namespace: MemoryNamespace | dict[str, Any],
-        records: Iterable[RecallRecord],
+        records: Iterable[IndexRecord],
     ) -> None:
         namespace_key = _namespace_sql_key(namespace)
         values = list(records)
@@ -1384,7 +1393,7 @@ class SQLiteTraceStore:
         cursor: int = 0,
         limit: int = 200,
         active_only: bool = True,
-    ) -> tuple[list[RecallRecord], int]:
+    ) -> tuple[list[IndexRecord], int]:
         namespace_model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
         clauses = ["channel_id=?", "namespace_key=?"]
         params: list[Any] = [channel_id, _namespace_sql_key(namespace_model)]
@@ -1404,7 +1413,7 @@ class SQLiteTraceStore:
             [*params, limit, cursor],
         ).fetchall()
         return [
-            RecallRecord(
+            IndexRecord(
                 channel_id=str(row["channel_id"]), record_id=str(row["record_id"]),
                 namespace=namespace_model, evidence_version=int(row["evidence_version"]),
                 text=str(row["text"]), evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
@@ -1470,7 +1479,7 @@ class SQLiteTraceStore:
         ]
 
     @staticmethod
-    def _dependent_delta_ids_uncommitted(
+    def _dependent_record_ids_uncommitted(
         cursor: Any, target_ids: Iterable[str]
     ) -> list[str]:
         """Return the transitive evidence dependency closure for Recall cleanup."""
@@ -1489,11 +1498,11 @@ class SQLiteTraceStore:
                     changed = True
         return sorted(affected)
 
-    def _index_delta_uncommitted(self, cursor: Any, delta: MemoryDelta) -> None:
+    def _index_delta_uncommitted(self, cursor: Any, delta: MemoryRecord) -> None:
         """Incrementally maintain disposable lexical/document/graph indexes."""
 
         if delta.kind == "retraction":
-            targets = list(dict.fromkeys(delta.payload.get("target_delta_ids") or []))
+            targets = list(dict.fromkeys(delta.payload.get("target_record_ids") or []))
             if targets:
                 placeholders = ",".join("?" for _ in targets)
                 cursor.execute(
@@ -1508,7 +1517,7 @@ class SQLiteTraceStore:
                     f"DELETE FROM retrieval_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
                     [*targets, *targets],
                 )
-                affected_recall_ids = self._dependent_delta_ids_uncommitted(cursor, targets)
+                affected_recall_ids = self._dependent_record_ids_uncommitted(cursor, targets)
                 affected_placeholders = ",".join("?" for _ in affected_recall_ids)
                 cursor.execute(
                     f"""UPDATE recall_records SET active=0,stale=1
@@ -1519,7 +1528,7 @@ class SQLiteTraceStore:
                     affected_recall_ids,
                 )
             return
-        if delta.kind not in {"observation", "extraction"} or not delta.text or delta.text == "[REMOVED]":
+        if delta.kind not in {"raw_source", "fact"} or not delta.text or delta.text == "[REMOVED]":
             return
 
         namespace_key = _json(delta.namespace.model_dump(mode="json", exclude_none=True))
@@ -1553,11 +1562,11 @@ class SQLiteTraceStore:
             counts[token] = counts.get(token, 0) + 1
         cursor.execute(
             """INSERT OR REPLACE INTO retrieval_documents(
-                   delta_id,namespace_key,seq,kind,episode_id,modality,source_type,text_hash,
+                   delta_id,namespace_key,seq,kind,group_id,modality,source_type,text_hash,
                    text,index_text,fields_json,metadata_json,token_count,active,observed_at
                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
             (
-                delta.id, namespace_key, delta.seq, delta.kind, delta.episode_id,
+                delta.id, namespace_key, delta.seq, delta.kind, delta.group_id,
                 modality, source_type, hashlib.sha256(document.index_text.encode()).hexdigest(),
                 delta.text, document.index_text, _json(fields), _json(document.metadata), len(tokens),
                 delta.observed_at.isoformat() if delta.observed_at else None,
@@ -1569,12 +1578,12 @@ class SQLiteTraceStore:
             [(delta.id, namespace_key, term, frequency) for term, frequency in counts.items()],
         )
 
-        if delta.episode_id:
+        if delta.group_id:
             previous = cursor.execute(
                 """SELECT delta_id FROM retrieval_documents
-                   WHERE namespace_key=? AND episode_id=? AND active=1 AND seq<?
+                   WHERE namespace_key=? AND group_id=? AND active=1 AND seq<?
                    ORDER BY seq DESC LIMIT 1""",
-                (namespace_key, delta.episode_id, delta.seq),
+                (namespace_key, delta.group_id, delta.seq),
             ).fetchone()
             if previous:
                 self._put_retrieval_edge_uncommitted(
@@ -1587,7 +1596,7 @@ class SQLiteTraceStore:
         for entity in entities:
             rows = cursor.execute(
                 """SELECT id FROM deltas
-                   WHERE id!=? AND kind IN ('observation','extraction')
+                   WHERE id!=? AND kind IN ('raw_source','fact')
                      AND namespace_json=?
                      AND (lower(subject)=? OR lower(object)=?)
                    ORDER BY seq DESC LIMIT 6""",
@@ -1844,7 +1853,7 @@ class SQLiteTraceStore:
             f"SELECT COUNT(*) AS n FROM retrieval_documents WHERE {where}", params
         ).fetchone()["n"])
         rows = self._connection.execute(
-            f"""SELECT delta_id,seq,kind,episode_id,modality,source_type,text_hash,text,
+            f"""SELECT delta_id,seq,kind,group_id,modality,source_type,text_hash,text,
                        fields_json,metadata_json,token_count,active
                 FROM retrieval_documents WHERE {where}
                 ORDER BY seq LIMIT ? OFFSET ?""",
@@ -1857,7 +1866,7 @@ class SQLiteTraceStore:
                 "id": str(row["delta_id"]),
                 "seq": int(row["seq"]),
                 "kind": str(row["kind"]),
-                "episode_id": row["episode_id"],
+                "group_id": row["group_id"],
                 "modality": str(row["modality"]),
                 "source_type": str(row["source_type"]),
                 "text_hash": str(row["text_hash"]),
@@ -1919,7 +1928,7 @@ class SQLiteTraceStore:
                 "document_frequency": int(term_row["df"]),
                 "postings": [
                     {
-                        "delta_id": str(item["delta_id"]),
+                        "record_id": str(item["delta_id"]),
                         "term_frequency": int(item["term_frequency"]),
                         "excerpt": str(item["text"])[:240],
                         "token_count": int(item["token_count"]),
@@ -1932,15 +1941,15 @@ class SQLiteTraceStore:
     def retrieval_documents_by_ids(
         self,
         namespace: MemoryNamespace | dict[str, Any],
-        delta_ids: Iterable[str],
+        record_ids: Iterable[str],
     ) -> list[dict[str, Any]]:
-        identifiers = list(dict.fromkeys(delta_ids))
+        identifiers = list(dict.fromkeys(record_ids))
         if not identifiers:
             return []
         key = _namespace_sql_key(namespace)
         placeholders = ",".join("?" for _ in identifiers)
         rows = self._connection.execute(
-            f"""SELECT delta_id,seq,kind,episode_id,modality,source_type,text_hash,text,
+            f"""SELECT delta_id,seq,kind,group_id,modality,source_type,text_hash,text,
                        fields_json,metadata_json,token_count,active
                 FROM retrieval_documents
                 WHERE namespace_key=? AND delta_id IN ({placeholders})""",
@@ -1957,7 +1966,7 @@ class SQLiteTraceStore:
                 "id": str(row["delta_id"]),
                 "seq": int(row["seq"]),
                 "kind": str(row["kind"]),
-                "episode_id": row["episode_id"],
+                "group_id": row["group_id"],
                 "modality": str(row["modality"]),
                 "source_type": str(row["source_type"]),
                 "text_hash": str(row["text_hash"]),
@@ -2205,9 +2214,9 @@ class SQLiteTraceStore:
         row = self._connection.execute("SELECT payload_json FROM retrieval_traces WHERE query_id=?", (query_id,)).fetchone()
         return RetrievalTrace.model_validate_json(row["payload_json"]) if row else None
 
-    def create_snapshot(self, label: str | None = None) -> RecallSnapshot:
+    def create_snapshot(self, label: str | None = None) -> IndexSnapshot:
         cutoff = self.max_seq()
-        snapshot = RecallSnapshot(id=_new_id("snap"), label=label, seq_cutoff=cutoff)
+        snapshot = IndexSnapshot(id=_new_id("snap"), label=label, seq_cutoff=cutoff)
         self._connection.execute(
             "INSERT INTO snapshots VALUES(?,?,?,?,0)",
             (snapshot.id, snapshot.label, snapshot.seq_cutoff, snapshot.created_at.isoformat()),
@@ -2215,9 +2224,9 @@ class SQLiteTraceStore:
         self._connection.commit()
         return snapshot
 
-    def list_snapshots(self) -> list[RecallSnapshot]:
+    def list_snapshots(self) -> list[IndexSnapshot]:
         return [
-            RecallSnapshot(
+            IndexSnapshot(
                 id=row["id"], label=row["label"], seq_cutoff=row["seq_cutoff"],
                 created_at=_parse_datetime(row["created_at"]), active=bool(row["active"]),
             )
@@ -2226,14 +2235,14 @@ class SQLiteTraceStore:
 
     def snapshot_diff(self, a: str, b: str) -> SnapshotDiff:
         left, right = self._snapshot(a), self._snapshot(b)
-        left_ids = {d.id for d in self.list_deltas(seq_cutoff=left.seq_cutoff, include_retracted=True)}
-        right_ids = {d.id for d in self.list_deltas(seq_cutoff=right.seq_cutoff, include_retracted=True)}
+        left_ids = {d.id for d in self.list_records(seq_cutoff=left.seq_cutoff, include_retracted=True)}
+        right_ids = {d.id for d in self.list_records(seq_cutoff=right.seq_cutoff, include_retracted=True)}
         return SnapshotDiff(
-            from_snapshot=a, to_snapshot=b, added_delta_ids=sorted(right_ids - left_ids),
-            removed_delta_ids=sorted(left_ids - right_ids), from_seq=left.seq_cutoff, to_seq=right.seq_cutoff,
+            from_snapshot=a, to_snapshot=b, added_record_ids=sorted(right_ids - left_ids),
+            removed_record_ids=sorted(left_ids - right_ids), from_seq=left.seq_cutoff, to_seq=right.seq_cutoff,
         )
 
-    def activate_snapshot(self, snapshot_id: str) -> RecallSnapshot:
+    def activate_snapshot(self, snapshot_id: str) -> IndexSnapshot:
         snapshot = self._snapshot(snapshot_id)
         self._connection.execute("UPDATE snapshots SET active=0")
         self._connection.execute("UPDATE snapshots SET active=1 WHERE id=?", (snapshot_id,))
@@ -2245,14 +2254,15 @@ class SQLiteTraceStore:
         row = self._connection.execute("SELECT seq_cutoff FROM snapshots WHERE active=1 LIMIT 1").fetchone()
         return int(row["seq_cutoff"]) if row else None
 
-    def _snapshot(self, snapshot_id: str) -> RecallSnapshot:
+    def _snapshot(self, snapshot_id: str) -> IndexSnapshot:
         row = self._connection.execute("SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone()
         if not row:
             raise KeyError(f"unknown snapshot: {snapshot_id}")
-        return RecallSnapshot(
+        return IndexSnapshot(
             id=row["id"], label=row["label"], seq_cutoff=row["seq_cutoff"],
             created_at=_parse_datetime(row["created_at"]), active=bool(row["active"]),
         )
+
 
 
 def _scope_matches(candidate: dict[str, Any], requested: dict[str, Any]) -> bool:

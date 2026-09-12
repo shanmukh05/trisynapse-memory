@@ -7,20 +7,20 @@ import type { GraphPage, InspectorRecord } from "../../types";
 import { registerHelper, type HelperViewProps } from "./index";
 import { CardList, GenericItemsView, ItemTable, MemoryFlowGraph, PostingsList, TimelineList, VectorCanvas } from "./families";
 
-function TraceView(props: HelperViewProps) {
+function LogView(props: HelperViewProps) {
   const api = useApi();
   const page = useQuery({ queryKey: ["memories", api.connection], queryFn: () => api.memories() });
-  if (page.isLoading) return <Loading label="Loading Trace" />;
-  if (page.isError) return <Empty title="Trace unavailable" detail={(page.error as Error).message} />;
+  if (page.isLoading) return <Loading label="Loading memory log" />;
+  if (page.isError) return <Empty title="Memory log unavailable" detail={(page.error as Error).message} />;
   const items = (page.data?.items || []).filter(item => {
     if (!props.search) return true;
-    return `${item.text} ${item.kind} ${item.episode_id || ""}`.toLowerCase().includes(props.search.toLowerCase());
+    return `${item.text} ${item.kind} ${item.group_id || ""}`.toLowerCase().includes(props.search.toLowerCase());
   }).map(item => ({
-    id: item.id, helper_id: "trace", kind: item.kind, title: (item.text || item.kind).slice(0, 120),
-    subtitle: item.episode_id, excerpt: item.text.slice(0, 400), status: item.kind,
+    id: item.id, helper_id: "log", kind: item.kind, title: (item.text || item.kind).slice(0, 120),
+    subtitle: item.group_id, excerpt: item.text.slice(0, 400), status: item.kind,
     data: item as unknown as Record<string, unknown>,
   }));
-  return items.length ? <TimelineList items={items} selectedId={props.selectedId} onSelect={props.onSelect} /> : <Empty title="Trace is empty" detail="Accepted sources and observations appear here as ordered evidence." />;
+  return items.length ? <TimelineList items={items} selectedId={props.selectedId} onSelect={props.onSelect} /> : <Empty title="Memory log is empty" detail="Accepted sources and raw sources appear here as ordered evidence." />;
 }
 
 function DocumentsView(props: HelperViewProps) {
@@ -33,7 +33,7 @@ function DocumentsView(props: HelperViewProps) {
     subtitle: `${item.source_type} · ${item.token_count} tokens`, excerpt: item.text.slice(0, 400),
     status: item.active ? "active" : "inactive", data: item as unknown as Record<string, unknown>,
   }));
-  return items.length ? <ItemTable items={items} selectedId={props.selectedId} onSelect={props.onSelect} /> : <Empty title="No retrieval documents" detail="Accepted Trace records become searchable documents during indexing." />;
+  return items.length ? <ItemTable items={items} selectedId={props.selectedId} onSelect={props.onSelect} /> : <Empty title="No retrieval documents" detail="Accepted memory-log records become searchable documents during indexing." />;
 }
 
 function Bm25View(props: HelperViewProps) {
@@ -53,7 +53,7 @@ function Bm25View(props: HelperViewProps) {
       <div className="df-bars" aria-hidden="true">
         {items.slice(0, 18).map(item => <span key={item.id} style={{ height: `${Math.max(8, (Number(item.score) / maxDf) * 64)}px` }} title={`${item.title} ${item.subtitle}`} />)}
       </div>
-      {items.length ? <PostingsList items={items} selectedId={props.selectedId} onSelect={props.onSelect} /> : <Empty title="No postings" detail="Lexical terms appear here after Trace is indexed." />}
+      {items.length ? <PostingsList items={items} selectedId={props.selectedId} onSelect={props.onSelect} /> : <Empty title="No postings" detail="Lexical terms appear here after the memory log is indexed." />}
     </>}
   </div>;
 }
@@ -64,7 +64,7 @@ function VectorsView(props: HelperViewProps) {
   if (projection.isLoading) return <Loading label="Projecting embeddings" />;
   if (projection.isError) return <Empty title="Vectors unavailable" detail={(projection.error as Error).message} />;
   const data = projection.data;
-  if (!data?.points.length) return <Empty title="No embeddings yet" detail="Semantic vectors are stored after searchable Trace is embedded." />;
+  if (!data?.points.length) return <Empty title="No embeddings yet" detail="Semantic vectors are stored after searchable memory-log records are embedded." />;
   return <div className="vector-view">
     <p className="vector-caption">{data.embedded} embedded / {data.searchable} searchable · {data.model || "active model"} · {data.fingerprint}</p>
     <VectorCanvas points={data.points} selectedId={props.selectedId} onSelect={id => {
@@ -75,26 +75,26 @@ function VectorsView(props: HelperViewProps) {
   </div>;
 }
 
-function EpisodesView(props: HelperViewProps) {
+function GroupsView(props: HelperViewProps) {
   const api = useApi();
-  const recall = useQuery({ queryKey: ["helper-items", "episodes", props.search, api.connection], queryFn: () => api.helperItems("episodes", props.search) });
-  const episodes = useQuery({ queryKey: ["episodes", api.connection], queryFn: () => api.episodes() });
-  if (recall.isLoading) return <Loading label="Loading Episode Recall" />;
-  if (recall.isError) return <Empty title="Episode Recall unavailable" detail={(recall.error as Error).message} />;
-  const items = [...(recall.data?.items || [])];
-  const seen = new Set(items.map(item => String(item.data.episode_id || item.subtitle || "")));
-  for (const episode of episodes.data?.episodes || []) {
-    if (seen.has(episode.episode_id)) continue;
+  const summaries = useQuery({ queryKey: ["helper-items", "groups", props.search, api.connection], queryFn: () => api.helperItems("groups", props.search) });
+  const groups = useQuery({ queryKey: ["groups", api.connection], queryFn: () => api.groups() });
+  if (summaries.isLoading) return <Loading label="Loading group summaries" />;
+  if (summaries.isError) return <Empty title="Group summaries unavailable" detail={(summaries.error as Error).message} />;
+  const items = [...(summaries.data?.items || [])];
+  const seen = new Set(items.map(item => String(item.data.group_id || item.subtitle || "")));
+  for (const group of groups.data?.groups || []) {
+    if (seen.has(group.group_id)) continue;
     items.push({
-      id: episode.episode_id, helper_id: "episodes", kind: "episode", title: episode.episode_id,
-      subtitle: `${episode.delta_count} deltas`, excerpt: null, status: episode.stale ? "stale" : "fresh",
-      data: episode as unknown as Record<string, unknown>,
+      id: group.group_id, helper_id: "groups", kind: "group", title: group.group_id,
+      subtitle: `${group.record_count} records`, excerpt: null, status: group.stale ? "stale" : "fresh",
+      data: group as unknown as Record<string, unknown>,
     });
   }
   const filtered = props.search
     ? items.filter(item => `${item.title} ${item.excerpt || ""} ${item.subtitle || ""}`.toLowerCase().includes(props.search.toLowerCase()))
     : items;
-  return filtered.length ? <CardList items={filtered} selectedId={props.selectedId} onSelect={props.onSelect} /> : <Empty title="No Episode Recall views" detail="Episode summaries appear after compilation." />;
+  return filtered.length ? <CardList items={filtered} selectedId={props.selectedId} onSelect={props.onSelect} /> : <Empty title="No group summaries" detail="Group summaries appear after indexing." />;
 }
 
 function ClaimsView(props: HelperViewProps) {
@@ -106,7 +106,7 @@ function ClaimsView(props: HelperViewProps) {
     if (!props.search) return true;
     return `${item.text} ${item.subject} ${item.object} ${item.relation} ${(item.objects || []).join(" ")}`.toLowerCase().includes(props.search.toLowerCase());
   });
-  if (!filtered.length) return <Empty title="No compiled claims" detail="Claims appear after evidence-linked extractions are compiled." />;
+  if (!filtered.length) return <Empty title="No claims" detail="Claims appear after evidence-linked facts are compiled." />;
   return <div className="claims-table" role="table">
     <div role="row" className="graph-table-head"><span>Claim</span><span>Relation</span><span>Status</span></div>
     {filtered.map(item => {
@@ -126,7 +126,7 @@ function ClaimsView(props: HelperViewProps) {
           <div className="contested-objects">
             <strong>Competing objects</strong>
             {objects.map(value => <span key={value}>{value}</span>)}
-            {item.source_delta_ids.map(id => <code key={id}>{id}</code>)}
+            {item.source_record_ids.map(id => <code key={id}>{id}</code>)}
           </div>
         )}
       </div>;
@@ -139,15 +139,15 @@ function GraphView(props: HelperViewProps) {
   const [view, setView] = useState<"knowledge" | "lineage" | "retrieval">("knowledge");
   const [nodeType, setNodeType] = useState("");
   const [sourceId, setSourceId] = useState("");
-  const [episodeId, setEpisodeId] = useState("");
+  const [groupId, setGroupId] = useState("");
   const [extra, setExtra] = useState<GraphPage | null>(null);
   const graph = useQuery({
-    queryKey: ["memory-graph", view, props.search, nodeType, sourceId, episodeId, api.connection],
+    queryKey: ["memory-graph", view, props.search, nodeType, sourceId, groupId, api.connection],
     queryFn: () => view === "retrieval"
       ? api.retrievalGraph(sourceId || props.selectedId || "", "")
-      : api.graph(view, props.search, { nodeType, sourceId, episodeId }),
+      : api.graph(view, props.search, { nodeType, sourceId, groupId }),
   });
-  useEffect(() => { setExtra(null); }, [view, props.search, nodeType, sourceId, episodeId]);
+  useEffect(() => { setExtra(null); }, [view, props.search, nodeType, sourceId, groupId]);
   useEffect(() => {
     if (!props.selectedId || view === "retrieval") return;
     void api.graphNeighbors(props.selectedId, view).then(setExtra).catch(() => setExtra(null));
@@ -165,14 +165,14 @@ function GraphView(props: HelperViewProps) {
       </div>
       <select aria-label="Node type" value={nodeType} onChange={event => setNodeType(event.target.value)}>
         <option value="">All node types</option>
-        {["source", "trace", "episode", "claim", "concept", "recall"].map(value => <option key={value} value={value}>{value}</option>)}
+        {["source", "log", "group", "claim", "concept", "index"].map(value => <option key={value} value={value}>{value}</option>)}
       </select>
       <input aria-label="Source ID" value={sourceId} onChange={event => setSourceId(event.target.value)} placeholder="source id" />
-      <input aria-label="Episode ID" value={episodeId} onChange={event => setEpisodeId(event.target.value)} placeholder="episode id" />
+      <input aria-label="Group ID" value={groupId} onChange={event => setGroupId(event.target.value)} placeholder="group id" />
     </div>
     {merged.nodes.length ? <MemoryFlowGraph graph={merged} selectedId={props.selectedId} onSelect={node => {
       props.onSelect({ id: node.id, helperId: "graph", kind: node.type, title: node.label, subtitle: node.subtitle, status: node.status, data: node.data });
-    }} /> : <Empty title="Graph is empty" detail="Concepts, claims, and retrieval edges appear after Recall is built." />}
+    }} /> : <Empty title="Graph is empty" detail="Concepts, claims, and retrieval edges appear after indexes are built." />}
   </div>;
 }
 
@@ -197,11 +197,11 @@ function mergeGraphs(base?: GraphPage, extra?: GraphPage | null): GraphPage | un
 }
 
 export function registerBuiltinHelpers() {
-  registerHelper({ id: "trace", kind: "timeline", render: TraceView, seedPlayground: record => record.excerpt || record.title });
+  registerHelper({ id: "log", kind: "timeline", render: LogView, seedPlayground: record => record.excerpt || record.title });
   registerHelper({ id: "documents", kind: "table", render: DocumentsView, seedPlayground: record => record.excerpt || record.title });
   registerHelper({ id: "bm25", kind: "postings", render: Bm25View, seedPlayground: record => record.title });
   registerHelper({ id: "vectors", kind: "embedding", render: VectorsView, seedPlayground: record => record.excerpt || record.title });
-  registerHelper({ id: "episodes", kind: "cards", render: EpisodesView, seedPlayground: record => record.excerpt || record.title });
+  registerHelper({ id: "groups", kind: "cards", render: GroupsView, seedPlayground: record => record.excerpt || record.title });
   registerHelper({ id: "claims", kind: "table", render: ClaimsView, seedPlayground: record => record.title });
   registerHelper({ id: "graph", kind: "graph", render: GraphView, seedPlayground: record => record.title });
 }

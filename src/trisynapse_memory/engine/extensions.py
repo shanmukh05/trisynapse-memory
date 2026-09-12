@@ -1,7 +1,7 @@
-"""Versioned in-process extension contracts for Formation, Recall, and retrieval.
+"""Versioned in-process extension contracts for ingest, indexes, and retrieval.
 
 Extensions are trusted Python components registered before an engine starts.
-They receive bounded service objects from the engine rather than owning Trace.
+They receive bounded service objects from the engine rather than owning the memory log.
 """
 
 from __future__ import annotations
@@ -77,17 +77,16 @@ class SourceHandlerRegistry:
 
 
 @dataclass(frozen=True)
-class FormationEvent:
+class IngestEvent:
     name: str
-    episode_id: str | None
+    group_id: str | None
     namespace: Any
     evidence_version: int
-    delta: Any | None = None
-
+    record: Any | None = None
 
 @dataclass(frozen=True)
-class ProposedDelta:
-    kind: Literal["extraction", "annotation"]
+class ProposedRecord:
+    kind: Literal["fact", "note"]
     text: str
     evidence_refs: tuple[str, ...]
     subject: str | None = None
@@ -102,54 +101,54 @@ class ProposedDelta:
 
 
 @dataclass(frozen=True)
-class FormationContext:
+class IngestContext:
     namespace: Any
-    episode_id: str
+    group_id: str
     evidence_version: int
     completion: Any | None = None
 
 
 @dataclass(frozen=True)
-class FormationProcessorSpec:
+class IngestProcessorSpec:
     name: str
-    events: tuple[str, ...] = ("episode_committed",)
-    input_kinds: tuple[str, ...] = ("observation",)
-    output_kinds: tuple[str, ...] = ("extraction",)
+    events: tuple[str, ...] = ("group_committed",)
+    input_kinds: tuple[str, ...] = ("raw_source",)
+    output_kinds: tuple[str, ...] = ("fact",)
     max_attempts: int = 3
 
 
-class FormationProcessor(Protocol):
-    spec: FormationProcessorSpec
+class IngestProcessor(Protocol):
+    spec: IngestProcessorSpec
 
-    def should_schedule(self, event: FormationEvent) -> bool: ...
+    def should_schedule(self, event: IngestEvent) -> bool: ...
 
     def process(
-        self, episode: Sequence[Any], context: FormationContext
-    ) -> Sequence[ProposedDelta]: ...
+        self, episode: Sequence[Any], context: IngestContext
+    ) -> Sequence[ProposedRecord]: ...
 
 
-class FormationProcessorRegistry:
+class IngestProcessorRegistry:
     def __init__(self) -> None:
-        self._processors: dict[str, FormationProcessor] = {}
+        self._processors: dict[str, IngestProcessor] = {}
         self._frozen = False
 
     @property
     def names(self) -> tuple[str, ...]:
         return tuple(self._processors)
 
-    def register(self, processor: FormationProcessor, *, replace: bool = False) -> None:
+    def register(self, processor: IngestProcessor, *, replace: bool = False) -> None:
         self._ensure_mutable()
         name = processor.spec.name
-        _validate_name(name, "formation processor")
+        _validate_name(name, "ingest processor")
         if name in self._processors and not replace:
-            raise ValueError(f"formation processor already registered: {name}")
+            raise ValueError(f"ingest processor already registered: {name}")
         self._processors[name] = processor
 
-    def get(self, name: str) -> FormationProcessor | None:
+    def get(self, name: str) -> IngestProcessor | None:
         return self._processors.get(name)
 
-    def scheduled(self, event: FormationEvent) -> list[FormationProcessor]:
-        scheduled: list[FormationProcessor] = []
+    def scheduled(self, event: IngestEvent) -> list[IngestProcessor]:
+        scheduled: list[IngestProcessor] = []
         for processor in self._processors.values():
             if event.name not in processor.spec.events:
                 continue
@@ -171,7 +170,7 @@ class FormationProcessorRegistry:
 
 
 @dataclass(frozen=True)
-class RecallChannelSpec:
+class IndexChannelSpec:
     id: str
     title: str
     kind: str = "cards"
@@ -181,12 +180,12 @@ class RecallChannelSpec:
     playground_seed: str | None = "excerpt"
 
 
-class RecallChannel(Protocol):
-    spec: RecallChannelSpec
+class IndexChannel(Protocol):
+    spec: IndexChannelSpec
 
 
 @dataclass(frozen=True)
-class RecallRecord:
+class IndexRecord:
     channel_id: str
     record_id: str
     namespace: Any
@@ -201,18 +200,18 @@ class RecallRecord:
 
 
 @dataclass(frozen=True)
-class TraceChangeBatch:
-    deltas: tuple[Any, ...]
+class MemoryLogChangeBatch:
+    records: tuple[Any, ...]
     namespace: Any
     evidence_version: int
-    event: str = "episode_committed"
-    episode_id: str | None = None
+    event: str = "group_committed"
+    group_id: str | None = None
 
 
-class RecallWriter:
+class IndexWriter:
     """Namespace- and channel-scoped writer for core-owned Recall storage."""
 
-    def __init__(self, store: Any, spec: RecallChannelSpec, namespace: Any) -> None:
+    def __init__(self, store: Any, spec: IndexChannelSpec, namespace: Any) -> None:
         self._store = store
         self._spec = spec
         self._namespace = namespace
@@ -227,8 +226,8 @@ class RecallWriter:
         fields: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
         stale: bool = False,
-    ) -> RecallRecord:
-        record = RecallRecord(
+    ) -> IndexRecord:
+        record = IndexRecord(
             channel_id=self._spec.id,
             record_id=record_id,
             namespace=self._namespace,
@@ -245,12 +244,12 @@ class RecallWriter:
 
     def records(
         self, *, search: str | None = None, cursor: int = 0, limit: int = 200
-    ) -> tuple[list[RecallRecord], int]:
+    ) -> tuple[list[IndexRecord], int]:
         return self._store.recall_records(
             self._spec.id, self._namespace, search=search, cursor=cursor, limit=limit
         )
 
-    def replace(self, records: Iterable[RecallRecord]) -> None:
+    def replace(self, records: Iterable[IndexRecord]) -> None:
         """Atomically replace this channel's records in the scoped namespace."""
         values = list(records)
         for record in values:
@@ -261,31 +260,31 @@ class RecallWriter:
         self._store.replace_recall_records(self._spec.id, self._namespace, values)
 
 
-class TraceReader:
-    """Read-only, namespace-scoped view of active Trace deltas."""
+class MemoryLogReader:
+    """Read-only, namespace-scoped view of active memory-log records."""
 
     def __init__(self, store: Any, namespace: Any, *, seq_cutoff: int | None = None) -> None:
         self._store = store
         self.namespace = namespace
         self.seq_cutoff = seq_cutoff
 
-    def deltas(
+    def records(
         self,
         *,
         kinds: Iterable[str] | None = None,
-        episode_prefix: str | None = None,
+        group_prefix: str | None = None,
     ) -> tuple[Any, ...]:
-        return tuple(self._store.list_deltas(
+        return tuple(self._store.list_records(
             kinds=kinds,
             namespace=self.namespace,
-            episode_prefix=episode_prefix,
+            group_prefix=group_prefix,
             seq_cutoff=self.seq_cutoff,
             include_retracted=False,
         ))
 
 
-class RecallReader:
-    """Read-only, namespace-scoped view of generic Recall records."""
+class IndexReader:
+    """Read-only, namespace-scoped view of generic index records."""
 
     def __init__(self, store: Any, namespace: Any) -> None:
         self._store = store
@@ -299,7 +298,7 @@ class RecallReader:
         cursor: int = 0,
         limit: int = 200,
         active_only: bool = True,
-    ) -> tuple[list[RecallRecord], int]:
+    ) -> tuple[list[IndexRecord], int]:
         return self._store.recall_records(
             channel_id,
             self.namespace,
@@ -331,9 +330,9 @@ class ExtensionState:
     last_error: str | None = None
 
 
-class RecallChannelRegistry:
+class IndexChannelRegistry:
     def __init__(self) -> None:
-        self._channels: dict[str, RecallChannel] = {}
+        self._channels: dict[str, IndexChannel] = {}
         self._frozen = False
 
     @property
@@ -341,20 +340,20 @@ class RecallChannelRegistry:
         return tuple(self._channels)
 
     @property
-    def channels(self) -> tuple[RecallChannel, ...]:
+    def channels(self) -> tuple[IndexChannel, ...]:
         return tuple(self._channels.values())
 
-    def register(self, channel: RecallChannel, *, replace: bool = False) -> None:
+    def register(self, channel: IndexChannel, *, replace: bool = False) -> None:
         self._ensure_mutable()
         channel_id = channel.spec.id
-        _validate_name(channel_id, "recall channel")
+        _validate_name(channel_id, "index channel")
         if channel_id in self._channels and not replace:
-            raise ValueError(f"recall channel already registered: {channel_id}")
+            raise ValueError(f"index channel already registered: {channel_id}")
         if channel.spec.kind not in {"timeline", "table", "postings", "embedding", "cards", "graph"}:
-            raise ValueError(f"unsupported recall helper kind: {channel.spec.kind}")
+            raise ValueError(f"unsupported index helper kind: {channel.spec.kind}")
         self._channels[channel_id] = channel
 
-    def get(self, channel_id: str) -> RecallChannel | None:
+    def get(self, channel_id: str) -> IndexChannel | None:
         return self._channels.get(channel_id)
 
     def freeze(self) -> None:
@@ -362,7 +361,7 @@ class RecallChannelRegistry:
 
     def _ensure_mutable(self) -> None:
         if self._frozen:
-            raise RuntimeError("recall channel registry is frozen")
+            raise RuntimeError("index channel registry is frozen")
 
 
 @dataclass(frozen=True)
@@ -370,8 +369,8 @@ class RetrievalCandidate:
     id: str
     branch: str
     score: float
-    kind: Literal["trace", "recall"]
-    evidence_delta_ids: tuple[str, ...]
+    kind: Literal["log", "index"]
+    evidence_record_ids: tuple[str, ...]
     text: str | None = None
     channel_id: str | None = None
     source_ref: Any = None
@@ -380,11 +379,11 @@ class RetrievalCandidate:
 
     @property
     def canonical_id(self) -> str:
-        if self.kind == "trace":
-            trace_id = self.evidence_delta_ids[0] if self.evidence_delta_ids else self.id
-            return f"trace:{trace_id}"
+        if self.kind == "log":
+            record_id = self.evidence_record_ids[0] if self.evidence_record_ids else self.id
+            return f"log:{record_id}"
         channel = self.channel_id or self.branch
-        return f"recall:{channel}:{self.id}"
+        return f"index:{channel}:{self.id}"
 
 
 @dataclass(frozen=True)
@@ -411,9 +410,9 @@ class RetrievalBranchSpec:
 @dataclass
 class RetrievalContext:
     namespace: Any
-    trace_cutoff: int
+    seq_cutoff: int
     items: Mapping[str, Any]
-    recall: Any
+    indexes: Any
     embedder: Any
     token_counter: Any
     prior_results: Mapping[str, BranchResult] = field(default_factory=dict)
@@ -638,8 +637,8 @@ class EngineExtensionRegistry:
 
     def __init__(self) -> None:
         self.source_handlers = SourceHandlerRegistry()
-        self.formation_processors = FormationProcessorRegistry()
-        self.recall_channels = RecallChannelRegistry()
+        self.ingest_processors = IngestProcessorRegistry()
+        self.index_channels = IndexChannelRegistry()
         self.retrieval_branches = RetrievalBranchRegistry()
         self.job_handlers = JobHandlerRegistry()
         self.extensions: dict[str, ExtensionSpec] = {}
@@ -660,16 +659,16 @@ class EngineExtensionRegistry:
         _validate_engine_api(spec.engine_api)
         snapshots = (
             list(self.source_handlers._handlers),
-            dict(self.formation_processors._processors),
-            dict(self.recall_channels._channels),
+            dict(self.ingest_processors._processors),
+            dict(self.index_channels._channels),
             dict(self.retrieval_branches._branches),
             dict(self.job_handlers._handlers),
         )
         self.extensions[spec.id] = spec
         before = {
             "source": set(self.source_handlers.names),
-            "formation": set(self.formation_processors.names),
-            "recall": set(self.recall_channels.names),
+            "ingest": set(self.ingest_processors.names),
+            "index": set(self.index_channels.names),
             "retrieval": set(self.retrieval_branches.names),
             "job": set(self.job_handlers.names),
         }
@@ -678,15 +677,15 @@ class EngineExtensionRegistry:
         except Exception:
             self.extensions.pop(spec.id, None)
             self.source_handlers._handlers = snapshots[0]
-            self.formation_processors._processors = snapshots[1]
-            self.recall_channels._channels = snapshots[2]
+            self.ingest_processors._processors = snapshots[1]
+            self.index_channels._channels = snapshots[2]
             self.retrieval_branches._branches = snapshots[3]
             self.job_handlers._handlers = snapshots[4]
             raise
         after = {
             "source": set(self.source_handlers.names),
-            "formation": set(self.formation_processors.names),
-            "recall": set(self.recall_channels.names),
+            "ingest": set(self.ingest_processors.names),
+            "index": set(self.index_channels.names),
             "retrieval": set(self.retrieval_branches.names),
             "job": set(self.job_handlers.names),
         }
@@ -699,26 +698,26 @@ class EngineExtensionRegistry:
 
     def validate_and_freeze(self, legacy_route_names: Iterable[str] = ()) -> None:
         self.retrieval_branches.validate(legacy_route_names)
-        self._validate_formation_graph()
-        for channel in self.recall_channels.channels:
+        self._validate_ingest_graph()
+        for channel in self.index_channels.channels:
             if channel.spec.persistent and not callable(getattr(channel, "rebuild", None)):
                 raise ValueError(
-                    f"persistent recall channel {channel.spec.id} must implement rebuild"
+                    f"persistent index channel {channel.spec.id} must implement rebuild"
                 )
         self.source_handlers.freeze()
-        self.formation_processors.freeze()
-        self.recall_channels.freeze()
+        self.ingest_processors.freeze()
+        self.index_channels.freeze()
         self.retrieval_branches.freeze()
         self.job_handlers.freeze()
         self._frozen = True
 
-    def _validate_formation_graph(self) -> None:
-        processors = list(self.formation_processors._processors.values())
+    def _validate_ingest_graph(self) -> None:
+        processors = list(self.ingest_processors._processors.values())
         for processor in processors:
             overlap = set(processor.spec.input_kinds) & set(processor.spec.output_kinds)
             if overlap:
                 raise ValueError(
-                    f"formation processor {processor.spec.name} consumes its own output kinds: {sorted(overlap)}"
+                    f"ingest processor {processor.spec.name} consumes its own output kinds: {sorted(overlap)}"
                 )
 
 

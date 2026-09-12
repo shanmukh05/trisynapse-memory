@@ -17,7 +17,7 @@ export function GenericItemsView({ helper, search, selectedId, onSelect, kind }:
   if (page.isError) return <Empty title={`${helper.title} unavailable`} detail={(page.error as Error).message} />;
   const items = page.data?.items || [];
   const family = kind || helper.kind;
-  if (!items.length) return <Empty title={`No ${helper.title.toLowerCase()} yet`} detail="Ingest sources or wait for Recall to compile this helper." />;
+  if (!items.length) return <Empty title={`No ${helper.title.toLowerCase()} yet`} detail="Ingest sources or wait for indexes to compile this helper." />;
   if (family === "cards") return <CardList items={items} selectedId={selectedId} onSelect={onSelect} />;
   if (family === "timeline") return <TimelineList items={items} selectedId={selectedId} onSelect={onSelect} />;
   if (family === "postings") return <PostingsList items={items} selectedId={selectedId} onSelect={onSelect} />;
@@ -78,10 +78,12 @@ export function PostingsList({ items, selectedId, onSelect }: { items: HelperIte
     </div>
     <div className="postings-detail">
       {items.filter(item => item.id === selectedId).map(item => {
-        const postings = Array.isArray(item.data.postings) ? item.data.postings as Array<{ delta_id: string; term_frequency: number; excerpt: string }> : [];
-        return <div key={item.id}>{postings.map(posting => (
-          <article key={posting.delta_id}><header>{posting.delta_id}<strong>tf {posting.term_frequency}</strong></header><p>{posting.excerpt}</p></article>
-        ))}</div>;
+        const postings = Array.isArray(item.data.postings) ? item.data.postings as Array<{ record_id?: string; term_frequency: number; excerpt: string }> : [];
+        return <div key={item.id}>{postings.map(posting => {
+          const id = posting.record_id || "";
+          return (
+          <article key={id}><header>{id}<strong>tf {posting.term_frequency}</strong></header><p>{posting.excerpt}</p></article>
+        ); })}</div>;
       })}
     </div>
   </div>;
@@ -91,8 +93,8 @@ export function MemoryFlowGraph({ graph, selectedId, onSelect }: { graph: GraphP
   const columns = graph.view === "knowledge"
     ? ["concept", "claim"]
     : graph.view === "lineage"
-      ? ["source", "episode", "trace", "claim", "recall"]
-      : ["trace"];
+      ? ["source", "group", "log", "claim", "index"]
+      : ["log"];
   const positions = useMemo(() => layoutColumns(graph.nodes, columns), [graph.nodes, columns]);
   const nodes: Node[] = graph.nodes.map(node => ({
     id: node.id,

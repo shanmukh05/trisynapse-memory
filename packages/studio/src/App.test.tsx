@@ -6,11 +6,11 @@ import { App } from "./App";
 
 const catalog = {
   helpers: [
-    { id: "trace", title: "Trace", kind: "timeline", inspect_path: "/api/v1/memories", count: 4, health: { observations: 3 } },
+    { id: "log", title: "Memory log", kind: "timeline", inspect_path: "/api/v1/memories", count: 4, health: { raw_sources: 3 } },
     { id: "documents", title: "Documents", kind: "table", inspect_path: "/api/v1/memory/documents", count: 3, health: {} },
     { id: "bm25", title: "BM25", kind: "postings", inspect_path: "/api/v1/memory/terms", count: 12, health: {} },
     { id: "vectors", title: "Vectors", kind: "embedding", inspect_path: "/api/v1/memory/vectors/projection", count: 3, health: {} },
-    { id: "episodes", title: "Episode Recall", kind: "cards", inspect_path: "/api/v1/episodes", count: 1, health: { stale: 0 } },
+    { id: "groups", title: "Group summaries", kind: "cards", inspect_path: "/api/v1/groups", count: 1, health: { stale: 0 } },
     { id: "claims", title: "Claims", kind: "table", inspect_path: "/api/v1/memory/claims", count: 2, health: { contested: 0 } },
     { id: "graph", title: "Graph", kind: "graph", inspect_path: "/api/v1/memory/retrieval-graph", count: 2, health: {} },
     { id: "temporal_index", title: "Temporal Index", kind: "cards", inspect_path: "/api/v1/memory/helpers/temporal_index", count: 1, health: {} },
@@ -29,11 +29,11 @@ const payloads: Record<string, unknown> = {
     helper_id: "temporal_index", kind: "cards", truncated: false,
     items: [{ id: "t1", helper_id: "temporal_index", kind: "window", title: "Last week", subtitle: "7d", excerpt: "Atlas launch window", status: "fresh", data: {} }],
   },
-  "/api/v1/memory/terms": { terms: [{ term: "atlas", document_frequency: 2, postings: [{ delta_id: "d1", term_frequency: 1, excerpt: "Project Atlas", token_count: 4 }] }], total: 1 },
+  "/api/v1/memory/terms": { terms: [{ term: "atlas", document_frequency: 2, postings: [{ record_id: "d1", term_frequency: 1, excerpt: "Project Atlas", token_count: 4 }] }], total: 1 },
   "/api/v1/memory/claims": { claims: [] },
   "/api/v1/memory/vectors/projection": { points: [], embedded: 0, searchable: 0, sampled: 0 },
   "/api/v1/sources": {
-    sources: [{ id: "src_demo", source_key: "guide", kind: "file", title: "Product guide", content_hash: "abc", media_type: "text/markdown", byte_size: 1024, chunk_count: 4, skipped_count: 0, version: 1, status: "active", namespace: { project_id: "default" }, metadata: {}, delta_ids: [], created_at: "2026-08-11T00:00:00Z" }],
+    sources: [{ id: "src_demo", source_key: "guide", kind: "file", title: "Product guide", content_hash: "abc", media_type: "text/markdown", byte_size: 1024, chunk_count: 4, skipped_count: 0, version: 1, status: "active", namespace: { project_id: "default" }, metadata: {}, record_ids: [], created_at: "2026-08-11T00:00:00Z" }],
     total: 1, facets: { file: 1 }, next_cursor: null,
   },
   "/api/v1/ingestion-runs": { runs: [] },
@@ -54,7 +54,7 @@ describe("Memory Studio shell", () => {
       const url = new URL(String(input), "http://studio.local");
       if (url.pathname === "/api/v1/search") {
         lastSearch = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
-        return new Response(JSON.stringify({ query_id: "q1", hits: [{ item_id: "d1", kind: "observation", text: "Atlas", score: 0.9, route: "bm25", source_delta_ids: [] }], stage: "fast", confident: true, retrieval_trace: { routes: { bm25: ["d1"], custom_lex: [] } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ query_id: "q1", hits: [{ item_id: "d1", kind: "raw_source", text: "Atlas", score: 0.9, route: "bm25", source_record_ids: [] }], stage: "fast", confident: true, retrieval_trace: { routes: { bm25: ["d1"], custom_lex: [] } } }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
       const value = payloads[url.pathname];
       return new Response(JSON.stringify(value ?? {}), { status: value ? 200 : 404, headers: { "Content-Type": "application/json" } });

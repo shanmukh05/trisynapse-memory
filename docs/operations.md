@@ -145,7 +145,7 @@ Retained blobs are content-addressed, so identical content uses one file. A sour
 Trisynapse uses two independent model settings:
 
 - The **embedding provider** turns text into vectors for semantic search. It defaults to local SentenceTransformers and needs no API key.
-- The optional **completion provider** extracts facts, builds richer Recall views, generates grounded answers, and reads images. Text ingestion and retrieval still work when it is `none`; image ingestion does not.
+- The optional **completion provider** extracts facts, builds richer index views, generates grounded answers, and reads images. Text ingestion and retrieval still work when it is `none`; image ingestion does not.
 
 ### Fastest setup
 
@@ -290,9 +290,9 @@ retrieval_graph_edges   temporal/entity/semantic neighbors
 vectors.lance/          fingerprinted nearest-neighbor vectors
 ```
 
-New writes update these indexes. Retractions deactivate their targets; removal deletes target index rows. Older stores backfill automatically on open without changing Trace deltas. Backups include the index state, but Trace remains sufficient to rebuild it.
+New writes update these indexes. Retractions deactivate their targets; removal deletes target index rows. Older stores backfill automatically on open without changing memory-log records. Backups include the index state, but Trace remains sufficient to rebuild it.
 
-The lexical tokenizer has its own index version. A tokenizer upgrade automatically rebuilds disposable documents, postings, and structural graph edges from Trace once; historical deltas remain unchanged.
+The lexical tokenizer has its own index version. A tokenizer upgrade automatically rebuilds disposable documents, postings, and structural graph edges from the memory log once; historical deltas remain unchanged.
 
 ## REST service and Studio
 
@@ -302,7 +302,7 @@ trisynapse-memory serve --studio
 
 The service binds to `127.0.0.1:8765`, runs durable memory jobs, redirects `/` to Studio at `/studio/`, and serves OpenAPI at `/openapi.json`. `init` creates `<store>/.api-key`; enter it in Studio's Connection view. `--no-auth` is for trusted local development only.
 
-Studio opens on Memory Viewer. Helper tabs, health chips, and playground route filters come from `GET /api/v1/memory/catalog` — Trace plus every Recall helper and retrieval route the running engine has. Sources remain mixed file/link batches with authorized preview and download; HTML is never executed inline. Queries stream into a clickable retrieval workflow; citation clicks open the matching Trace record. Configuration generates `enabled_routes` and route-weight editors from the catalog. The bearer token stays in browser session storage.
+Studio opens on Memory Viewer. Helper tabs, health chips, and playground route filters come from `GET /api/v1/memory/catalog` — Trace plus every Recall helper and retrieval route the running engine has. Sources remain mixed file/link batches with authorized preview and download; HTML is never executed inline. Queries stream into a clickable retrieval workflow; citation clicks open the matching memory-log record. Configuration generates `enabled_routes` and route-weight editors from the catalog. The bearer token stays in browser session storage.
 
 The bearer token stays in browser session storage. Namespace preferences use local storage. When Studio connects to a different origin, that server must allow Studio's origin through CORS; same-origin operation needs no extra configuration.
 
@@ -317,7 +317,7 @@ For a shared deployment:
 
 ## Jobs and ingestion runs
 
-Durable jobs are `extract_episode`, `compile_episode`, `rebuild_embeddings`, and single-attempt `execute_query`. States are pending, running, completed, or failed. Expired extraction/compilation leases return to the retry flow. Live queries use one attempt so a restart cannot silently repeat a billable completion; their saved partial workflow is marked interrupted. Embedding rebuild jobs also own a pending configuration; final failure clears it without changing the active model.
+Durable jobs are `extract_facts`, `summarize_group`, `rebuild_embeddings`, and single-attempt `execute_query`. States are pending, running, completed, or failed. Expired extraction/compilation leases return to the retry flow. Live queries use one attempt so a restart cannot silently repeat a billable completion; their saved partial workflow is marked interrupted. Embedding rebuild jobs also own a pending configuration; final failure clears it without changing the active model.
 
 ```bash
 trisynapse-memory jobs list --status failed
@@ -367,7 +367,7 @@ trisynapse-memory --yes remove memory ID1 ID2 --reason "approved deletion"
 trisynapse-memory --yes remove source SOURCE_ID --reason "approved deletion"
 ```
 
-Removal redacts the selected content in one transaction, clears affected Recall data, checkpoints SQLite, and records the target IDs, requester, reason, and time. Historical `[PURGED]` data is never rewritten during migration.
+Removal redacts the selected content in one transaction, clears affected index data, checkpoints SQLite, and records the target IDs, requester, reason, and time. Historical `[PURGED]` data is never rewritten during migration.
 
 ## Release process
 

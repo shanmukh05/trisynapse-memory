@@ -12,20 +12,20 @@ from typing import Protocol
 import numpy as np
 
 from trisynapse_memory.engine.utils import cosine_scores
-from trisynapse_memory.engine.trace.store import SQLiteTraceStore
+from trisynapse_memory.engine.memory_log.store import SQLiteMemoryLogStore
 
 
-class VectorCache(Protocol):
+class EmbeddingIndex(Protocol):
     def get(self, text_hashes: list[str], model: str) -> dict[str, list[float]]: ...
     def put(self, values: dict[str, list[float]], model: str) -> None: ...
     def nearest(self, vector: list[float], model: str, limit: int) -> list[tuple[str, float]]: ...
     def clear(self) -> None: ...
 
 
-class SQLiteVectorCache:
+class SQLiteEmbeddingIndex:
     """Portable test/safe-mode cache; the trace remains independent of it."""
 
-    def __init__(self, store: SQLiteTraceStore) -> None:
+    def __init__(self, store: SQLiteMemoryLogStore) -> None:
         self.store = store
 
     def get(self, text_hashes: list[str], model: str) -> dict[str, list[float]]:
@@ -57,7 +57,7 @@ class SQLiteVectorCache:
         return [(compatible[index][0], float(scores[index])) for index in ordered]
 
 
-class LanceVectorCache:
+class LanceEmbeddingIndex:
     """LanceDB cache partitioned by embedding model and vector dimension."""
 
     def __init__(self, path: str | Path) -> None:
@@ -118,9 +118,9 @@ class LanceVectorCache:
         return {str(item) for item in response.tables}
 
 
-def preferred_vector_cache(store: SQLiteTraceStore) -> VectorCache:
+def preferred_embedding_index(store: SQLiteMemoryLogStore) -> EmbeddingIndex:
     try:
-        return LanceVectorCache(store.root / "vectors.lance")
+        return LanceEmbeddingIndex(store.root / "vectors.lance")
     except RuntimeError:
         warnings.warn(
             "LanceDB is unavailable; using the explicit SQLite disposable-vector-cache mode. "
@@ -128,7 +128,7 @@ def preferred_vector_cache(store: SQLiteTraceStore) -> VectorCache:
             RuntimeWarning,
             stacklevel=2,
         )
-        return SQLiteVectorCache(store)
+        return SQLiteEmbeddingIndex(store)
 
 
 def _table_name(model: str) -> str:

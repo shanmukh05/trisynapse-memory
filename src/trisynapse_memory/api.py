@@ -1,4 +1,4 @@
-"""FastAPI surface for Trace & Recall and benchmark artifacts."""
+"""FastAPI surface for ingest, indexes, retrieval, and benchmark artifacts."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ MAX_RUN_BYTES = 250 * 1024 * 1024
 
 class ObservationRequest(BaseModel):
     text: str
-    episode_id: str | None = None
+    group_id: str | None = None
     observed_at: str | None = None
     source_ref: dict[str, Any] | str | None = None
     locator: dict[str, Any] | str | None = None
@@ -55,10 +55,10 @@ class ObservationRequest(BaseModel):
 
 
 class MessagesRequest(BaseModel):
-    episode_id: str
+    group_id: str
     messages: list[dict[str, Any] | str]
     scope: dict[str, Any] | None = None
-    run_extraction: bool = False
+    run_fact_extraction: bool = False
     namespace: MemoryNamespace | None = None
 
 
@@ -81,7 +81,7 @@ class FileRequest(BaseModel):
     namespace: MemoryNamespace | None = None
 
 
-class BatchMemoryRequest(BaseModel):
+class ManyMemoriesRequest(BaseModel):
     items: list[ObservationRequest] = Field(min_length=1, max_length=1000)
 
 
@@ -125,17 +125,17 @@ class AgentEventRequest(AgentEvent):
 
 
 class ExtractRequest(BaseModel):
-    episode_id: str
+    group_id: str
     namespace: MemoryNamespace | None = None
 
 
-class CompileEpisodesRequest(BaseModel):
-    episode_ids: list[str] | None = None
+class CompileBatchesRequest(BaseModel):
+    group_ids: list[str] | None = None
     namespace: MemoryNamespace | None = None
 
 
 class RetractRequest(BaseModel):
-    delta_id: str
+    record_id: str
     reason: str
     namespace: MemoryNamespace | None = None
 
@@ -143,7 +143,7 @@ class RetractRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     top_k: int | None = Field(default=None, ge=1, le=100)
-    episode_prefix: str | None = None
+    group_prefix: str | None = None
     scope: dict[str, Any] | None = None
     include_diagnostics: bool = False
     persist: bool = True
@@ -153,7 +153,7 @@ class SearchRequest(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     top_k: int | None = Field(default=None, ge=1, le=100)
-    episode_prefix: str | None = None
+    group_prefix: str | None = None
     scope: dict[str, Any] | None = None
     abstain_threshold: float | None = Field(default=None, ge=0, le=1)
     namespace: MemoryNamespace | None = None
@@ -169,7 +169,7 @@ class QueryRunRequest(BaseModel):
     query: str = Field(min_length=1, max_length=100_000)
     mode: Literal["query", "search"] = "query"
     top_k: int | None = Field(default=None, ge=1, le=100)
-    episode_prefix: str | None = None
+    group_prefix: str | None = None
     scope: dict[str, Any] | None = None
     abstain_threshold: float | None = Field(default=None, ge=0, le=1)
     namespace: MemoryNamespace | None = None
@@ -497,9 +497,9 @@ def create_app(
             for status in ("pending", "running", "completed", "failed")
         }
         return {
-            "trace_deltas": memory.store.delta_count(),
+            "memory_log_records": memory.store.record_count(),
             "storage_ready": memory.store.is_ready(),
-            "episode_recall_views": len(memory.store.episode_recall_views()),
+            "group_summary_views": len(memory.store.group_summary_views()),
             "jobs": job_counts,
         }
 
@@ -507,15 +507,15 @@ def create_app(
     def openapi_alias() -> dict[str, Any]:
         return app.openapi()
 
-    @app.post("/api/v1/memory/observations", dependencies=auth)
-    def add_observation(
+    @app.post("/api/v1/memory/raw-sources", dependencies=auth)
+    def add_raw_source(
         request: ObservationRequest,
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         payload = request.model_dump()
         payload["namespace"] = requested_namespace(request.namespace, allowed)
-        delta = memory.ingest_observation(**payload)
-        return {"delta_id": delta.id}
+        delta = memory.ingest_raw_source(**payload)
+        return {"record_id": delta.id}
 
     @app.post("/api/v1/memory/messages", dependencies=auth)
     def add_messages(
@@ -525,7 +525,7 @@ def create_app(
         payload = request.model_dump()
         payload["namespace"] = requested_namespace(request.namespace, allowed)
         deltas = memory.ingest_messages(**payload)
-        return {"delta_ids": [item.id for item in deltas], "extraction_status": "completed" if request.run_extraction else "not_requested"}
+        return {"record_ids": [item.id for item in deltas], "extraction_status": "completed" if request.run_fact_extraction else "not_requested"}
 
     @app.post("/api/v1/memory/documents", dependencies=auth)
     def add_document(
@@ -537,7 +537,7 @@ def create_app(
             kind="text", text=request.text, filename=f"{request.document_id}.txt",
             source_key=request.document_id, title=request.title, scope=request.scope or {},
         ), namespace=namespace)
-        return {"episode_id": result.episode_id, "source_id": result.source_id, "chunk_count": len(result.delta_ids), "delta_ids": result.delta_ids}
+        return {"group_id": result.group_id, "source_id": result.source_id, "chunk_count": len(result.record_ids), "record_ids": result.record_ids}
 
     @app.post("/api/v1/memory/files", dependencies=auth)
     def add_file(
@@ -563,11 +563,11 @@ def create_app(
             ), namespace=requested_namespace(request.namespace, allowed))
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"document_id": request.document_id or Path(request.filename).stem, "source_id": result.source_id, "chunk_count": len(result.delta_ids), "delta_ids": result.delta_ids}
+        return {"document_id": request.document_id or Path(request.filename).stem, "source_id": result.source_id, "chunk_count": len(result.record_ids), "record_ids": result.record_ids}
 
-    @app.post("/api/v1/memories/batch", dependencies=auth)
-    def add_batch(
-        request: BatchMemoryRequest,
+    @app.post("/api/v1/memories/many", dependencies=auth)
+    def add_many(
+        request: ManyMemoriesRequest,
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         payloads = []
@@ -575,8 +575,8 @@ def create_app(
             payload = item.model_dump()
             payload["namespace"] = requested_namespace(item.namespace, allowed)
             payloads.append(payload)
-        deltas = memory.add_batch(payloads)
-        return {"delta_ids": [item.id for item in deltas]}
+        deltas = memory.add_many(payloads)
+        return {"record_ids": [item.id for item in deltas]}
 
     @app.get("/api/v1/memories", dependencies=auth)
     def list_memories(
@@ -597,9 +597,9 @@ def create_app(
         )
         return page.model_dump(mode="json")
 
-    @app.get("/api/v1/memories/{delta_id}", dependencies=auth)
+    @app.get("/api/v1/memories/{record_id}", dependencies=auth)
     def get_memory(
-        delta_id: str,
+        record_id: str,
         user_id: str | None = None,
         agent_id: str | None = None,
         project_id: str = "default",
@@ -610,36 +610,36 @@ def create_app(
         namespace = MemoryNamespace(user_id=user_id, agent_id=agent_id, project_id=project_id, session_id=session_id)
         try:
             return memory.get(
-                delta_id,
+                record_id,
                 namespace=requested_namespace(namespace, allowed),
                 include_retracted=include_retracted,
             ).model_dump(mode="json")
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.get("/api/v1/memories/{delta_id}/history", dependencies=auth)
+    @app.get("/api/v1/memories/{record_id}/history", dependencies=auth)
     def memory_history(
-        delta_id: str,
+        record_id: str,
         project_id: str = "default",
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         try:
             return memory.history(
-                delta_id,
+                record_id,
                 namespace=requested_namespace(MemoryNamespace(project_id=project_id), allowed),
             ).model_dump(mode="json")
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/v1/memories/{delta_id}/corrections", dependencies=auth)
+    @app.post("/api/v1/memories/{record_id}/corrections", dependencies=auth)
     def correct_memory(
-        delta_id: str,
+        record_id: str,
         request: CorrectionRequest,
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         try:
             delta = memory.correct(
-                delta_id=delta_id,
+                record_id=record_id,
                 text=request.text,
                 reason=request.reason,
                 requested_by=request.requested_by,
@@ -649,15 +649,15 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/v1/memories/{delta_id}/forget", dependencies=auth)
+    @app.post("/api/v1/memories/{record_id}/forget", dependencies=auth)
     def forget_memory(
-        delta_id: str,
+        record_id: str,
         request: ForgetRequest,
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         try:
             delta = memory.forget(
-                delta_id=delta_id,
+                record_id=record_id,
                 reason=request.reason,
                 requested_by=request.requested_by,
                 namespace=requested_namespace(request.namespace, allowed),
@@ -675,7 +675,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="remove requires confirm=true")
         try:
             return memory.remove(
-                delta_ids=request.delta_ids,
+                record_ids=request.record_ids,
                 reason=request.reason,
                 requested_by=request.requested_by,
                 namespace=requested_namespace(request.namespace, allowed),
@@ -891,24 +891,24 @@ def create_app(
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         try:
-            deltas = memory.run_extraction(
-                episode_id=request.episode_id,
+            deltas = memory.run_fact_extraction(
+                group_id=request.group_id,
                 namespace=requested_namespace(request.namespace, allowed),
             )
         except (KeyError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"extraction_count": len(deltas), "delta_ids": [item.id for item in deltas]}
+        return {"fact_count": len(deltas), "record_ids": [item.id for item in deltas]}
 
-    @app.post("/api/v1/memory/episodes/compile", dependencies=auth)
-    def compile_episodes(
-        request: CompileEpisodesRequest,
+    @app.post("/api/v1/memory/groups/summarize", dependencies=auth)
+    def summarize_groups(
+        request: CompileBatchesRequest,
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
-        views = memory.build_episode_recall(
-            request.episode_ids,
+        views = memory.build_group_summary(
+            request.group_ids,
             namespace=requested_namespace(request.namespace, allowed),
         )
-        return {"episode_recall_entries": [item.model_dump(mode="json") for item in views]}
+        return {"group_summary_entries": [item.model_dump(mode="json") for item in views]}
 
     @app.post("/api/v1/memory/retract", dependencies=auth)
     def retract(
@@ -931,7 +931,7 @@ def create_app(
         result = memory.search(
             request.query,
             top_k=request.top_k,
-            episode_prefix=request.episode_prefix,
+            group_prefix=request.group_prefix,
             scope=request.scope,
             namespace=requested_namespace(request.namespace, allowed),
             persist=request.persist,
@@ -960,7 +960,7 @@ def create_app(
             request.query,
             mode=request.mode,
             top_k=request.top_k,
-            episode_prefix=request.episode_prefix,
+            group_prefix=request.group_prefix,
             scope=request.scope,
             abstain_threshold=request.abstain_threshold,
             namespace=namespace,
@@ -1126,25 +1126,26 @@ def create_app(
         requested_namespace(event_namespace, allowed)
         return capture_agent_event(memory, request)
 
-    @app.get("/api/v1/deltas/{delta_id}", dependencies=auth)
-    def delta(
-        delta_id: str,
+    @app.get("/api/v1/records/{record_id}", dependencies=auth)
+    def get_record(
+        record_id: str,
         project_id: str = "default",
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         try:
             namespace = requested_namespace(MemoryNamespace(project_id=project_id), allowed)
-            return memory.get(delta_id, namespace=namespace, include_retracted=True).model_dump(mode="json")
+            return memory.get(record_id, namespace=namespace, include_retracted=True).model_dump(mode="json")
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.get("/api/v1/episodes", dependencies=auth)
-    def episodes(
+    @app.get("/api/v1/groups", dependencies=auth)
+    def list_groups(
         project_id: str = "default",
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         namespace = requested_namespace(MemoryNamespace(project_id=project_id), allowed)
-        return {"episodes": [item.model_dump(mode="json") for item in memory.list_episodes(namespace=namespace)]}
+        items = [item.model_dump(mode="json") for item in memory.list_groups(namespace=namespace)]
+        return {"groups": items}
 
     @app.get("/api/v1/graph", dependencies=auth)
     def graph(
@@ -1156,11 +1157,11 @@ def create_app(
 
     @app.get("/api/v1/memory-graph", dependencies=auth)
     def memory_graph(
-        view: Literal["knowledge", "lineage", "trace", "retrieval"] = "knowledge",
+        view: Literal["knowledge", "lineage", "log", "retrieval"] = "knowledge",
         q: str | None = None,
         node_type: list[str] = Query(default=[]),
         source_id: str | None = None,
-        episode_id: str | None = None,
+        group_id: str | None = None,
         limit: int = Query(default=500, ge=1, le=2000),
         cursor: str | None = None,
         user_id: str | None = None,
@@ -1176,7 +1177,7 @@ def create_app(
         try:
             return memory.memory_graph(
                 view, search=q, node_types=node_type, source_id=source_id,
-                episode_id=episode_id, limit=limit, cursor=cursor, namespace=namespace,
+                group_id=group_id, limit=limit, cursor=cursor, namespace=namespace,
             ).model_dump(mode="json")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1184,7 +1185,7 @@ def create_app(
     @app.get("/api/v1/memory-graph/nodes/{node_id}/neighbors", dependencies=auth)
     def memory_graph_neighbors(
         node_id: str,
-        view: Literal["knowledge", "lineage", "trace", "retrieval"] = "lineage",
+        view: Literal["knowledge", "lineage", "log", "retrieval"] = "lineage",
         limit: int = Query(default=500, ge=1, le=2000),
         user_id: str | None = None,
         agent_id: str | None = None,
@@ -1318,7 +1319,7 @@ def create_app(
 
     @app.get("/api/v1/memory/vectors/neighbors", dependencies=auth)
     def memory_vector_neighbors(
-        delta_id: str,
+        record_id: str,
         limit: int = Query(default=12, ge=1, le=50),
         user_id: str | None = None,
         agent_id: str | None = None,
@@ -1327,7 +1328,7 @@ def create_app(
         allowed: MemoryNamespace | None = Depends(authorize),
     ) -> dict[str, Any]:
         return memory.memory_vector_neighbors(
-            delta_id, limit=limit, namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed)
+            record_id, limit=limit, namespace=_studio_namespace(user_id, agent_id, project_id, session_id, allowed)
         ).model_dump(mode="json")
 
     @app.get("/api/v1/memory/retrieval-graph", dependencies=auth)

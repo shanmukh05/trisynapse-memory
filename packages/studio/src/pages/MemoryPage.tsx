@@ -36,7 +36,7 @@ export function MemoryPage() {
   }, [catalog.data, helperId, selectedHelper, helpers.length]);
 
   return <>
-    <PageHeader eyebrow="TRACE + RECALL" title="Memory Viewer" description="Inspect every Recall helper, follow evidence back to Trace, and run live retrieval from the current item." />
+    <PageHeader eyebrow="INGEST + INDEX" title="Memory Viewer" description="Inspect every Recall helper, follow evidence back to the memory log, and run live retrieval from the current item." />
     {catalog.isLoading ? <Loading label="Loading memory catalog" /> : catalog.isError ? <Empty title="Catalog unavailable" detail={(catalog.error as Error).message} /> : <>
       <div className="summary-strip wrap" role="group" aria-label="Memory health">
         {helpers.map(helper => (
