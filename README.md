@@ -25,9 +25,14 @@
     <a href="#quickstart">Quickstart</a> ·
     <a href="#choose-how-you-use-it">Interfaces</a> ·
     <a href="#how-memory-works">Architecture</a> ·
+    <a href="https://www.tensorwrites.com/posts/trisynapse-memory">Blog</a> ·
     <a href="docs/api.md">API</a> ·
     <a href="docs/operations.md">Operations</a> ·
     <a href="#release-notes">Releases</a>
+  </p>
+
+  <p>
+    <a href="https://www.tensorwrites.com/posts/trisynapse-memory"><strong>📖 Read the Architecture Deep-Dive Blog Post →</strong></a>
   </p>
 </div>
 
@@ -214,7 +219,7 @@ flowchart LR
 
 The memory log is an application data store, not a cryptographic ledger. `validate` checks SQLite consistency, sequence continuity, evidence references, and retained source blobs. index data can be rebuilt; cited evidence always comes from the memory log.
 
-[Read the architecture guide →](docs/architecture.md)
+[Read the architecture guide →](docs/architecture.md) · [Read the deep-dive blog post →](https://www.tensorwrites.com/posts/trisynapse-memory)
 
 ## Sources and retrieval
 
@@ -294,6 +299,7 @@ Namespaces isolate memory by project and optionally by user, agent, and session.
 
 | Read this | When you need to… |
 |---|---|
+| [Blog](https://www.tensorwrites.com/posts/trisynapse-memory) | Read the architectural deep-dive and design philosophy behind Trisynapse Memory |
 | [Architecture](docs/architecture.md) | Understand Ingest, memory log, indexes, retrieval, graphs, and storage |
 | [Algorithms](docs/algorithms.md) | Study mathematical formulas, RRF, confidence margin, and grounding |
 | [API and interfaces](docs/api.md) | Use Python, REST, SSE, TypeScript, or CLI contracts |
