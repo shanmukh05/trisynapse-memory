@@ -1,0 +1,20 @@
+suite: beam100k
+data_root: .
+dataset: data/100K-00000-of-00001.parquet
+sampling: sequential
+
+models:
+  completion: {provider: openai, model: gpt-4.1-mini-2025-04-14}
+  embedding: {provider: sentence-transformers, model: all-MiniLM-L6-v2}
+
+profiles:
+  ingest:
+    stage: ingest
+    mode: end-to-end
+  retrieval:
+    stage: query
+    mode: retrieval
+  end-to-end:
+    stage: query
+    mode: end-to-end
+    judge: {provider: openai, model: gpt-4o-mini-2024-07-18}

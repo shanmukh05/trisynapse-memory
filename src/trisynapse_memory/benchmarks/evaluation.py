@@ -1,4 +1,11 @@
-"""Shared benchmark scoring and schema-v4 artifact handling."""
+"""Shared benchmark scoring and schema-v4 artifact handling.
+
+This module owns result-row construction, summary metrics, token overlap
+scoring, and run-artifact I/O for production Trace & Recall benches. Runners
+write rows through `result_row` and `summarize`, then persist them with
+`write_benchmark_artifact`. Summary keys are part of the public artifact
+contract and must stay stable.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from trisynapse_memory.adapters.benchmarks.base import benchmark_tokens, overlap
 from trisynapse_memory.engine import MemoryEngine
 
 BenchmarkMode = Literal["retrieval", "end-to-end"]
@@ -23,8 +31,12 @@ def result_row(
     prediction: str,
     context: str,
     evidence: str,
+    *,
+    context_tokens: int | None = None,
+    recall_time_ms: float | None = None,
+    ingest_time_per_doc_ms: float | None = None,
 ) -> dict[str, Any]:
-    return {
+    row = {
         "question_id": question_id,
         "question": question,
         "gold": gold,
@@ -32,54 +44,164 @@ def result_row(
         "token_f1": token_f1(prediction, gold),
         "evidence_in_context": overlap(evidence, context) if evidence else overlap(gold, context),
     }
+    if context_tokens is not None:
+        row["context_tokens"] = context_tokens
+    if recall_time_ms is not None:
+        row["recall_time_ms"] = recall_time_ms
+    if ingest_time_per_doc_ms is not None:
+        row["ingest_time_per_doc_ms"] = ingest_time_per_doc_ms
+    return row
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0
+    return sum(values) / len(values)
+
+
+def _float_values(rows: list[dict[str, Any]], key: str) -> list[float]:
+    return [float(row[key]) for row in rows if row.get(key) is not None]
+
+
+def _int_values(rows: list[dict[str, Any]], key: str) -> list[float]:
+    return [float(int(row[key])) for row in rows if row.get(key) is not None]
+
+
+def _rows_with_value(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    return [row for row in rows if row.get(key) is not None]
+
+
+def _every_row_has(rows: list[dict[str, Any]], key: str) -> bool:
+    if not rows:
+        return False
+    return all(key in row for row in rows)
+
+
+def _flag_mean(rows: list[dict[str, Any]], key: str) -> float:
+    return _mean([float(bool(row.get(key))) for row in rows])
+
+
+def _judge_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    judged = [row["judge"] for row in rows if "judge" in row]
+    if not judged:
+        return {}
+    judge_accuracy = _mean([float(bool(item["correct"])) for item in judged])
+    return {
+        "mean_judge_score": _mean([item["score"] for item in judged]),
+        "judge_accuracy": judge_accuracy,
+        "accuracy": judge_accuracy,
+    }
+
+
+def _evidence_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    evidence_rows = _rows_with_value(rows, "evidence_recall_at_k")
+    if evidence_rows:
+        return {
+            "evidence_recall_at_k": _mean(_float_values(evidence_rows, "evidence_recall_at_k")),
+            "evidence_hit_at_k": _flag_mean(evidence_rows, "evidence_hit_at_k"),
+            "all_evidence_retrieved_rate": _flag_mean(evidence_rows, "all_evidence_retrieved"),
+        }
+    if not _every_row_has(rows, "evidence_hit"):
+        return {}
+    # Compatibility for adapters whose datasets provide evidence text but no
+    # stable evidence identifiers.
+    return {"evidence_recall_at_k": _flag_mean(rows, "evidence_hit")}
+
+
+def _citation_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    recall = _float_values(rows, "citation_evidence_recall")
+    precision = _float_values(rows, "citation_precision")
+    metrics: dict[str, Any] = {}
+    if recall:
+        metrics["citation_evidence_recall"] = _mean(recall)
+    if precision:
+        metrics["citation_precision"] = _mean(precision)
+    return metrics
+
+
+def _accuracy_metrics(rows: list[dict[str, Any]], partial_result: dict[str, Any]) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    if _every_row_has(rows, "abstain"):
+        metrics["abstention_rate"] = _flag_mean(rows, "abstain")
+
+    judged = _judge_summary(rows)
+    if judged:
+        metrics.update(judged)
+        return metrics
+
+    scored = _float_values(rows, "accuracy")
+    if scored:
+        metrics["accuracy"] = _mean(scored)
+        return metrics
+
+    if "evidence_hit_at_k" in partial_result:
+        metrics["accuracy"] = partial_result["evidence_hit_at_k"]
+        return metrics
+    if "evidence_recall_at_k" in partial_result:
+        metrics["accuracy"] = partial_result["evidence_recall_at_k"]
+    return metrics
+
+
+def _timing_metrics(rows: list[dict[str, Any]], ingest_metrics: dict[str, Any] | None) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    recall_times = _float_values(rows, "recall_time_ms")
+    if recall_times:
+        mean_recall = _mean(recall_times)
+        metrics["mean_recall_time_ms"] = mean_recall
+        metrics["recall_average_time_ms"] = mean_recall
+
+    context_tokens = _int_values(rows, "context_tokens")
+    if context_tokens:
+        metrics["mean_context_tokens"] = _mean(context_tokens)
+
+    ingest_times = _float_values(rows, "ingest_time_per_doc_ms")
+    if ingest_times:
+        mean_ingest = _mean(ingest_times)
+        metrics["mean_ingest_time_per_doc_ms"] = mean_ingest
+        metrics["ingest_time_per_doc_ms"] = mean_ingest
+
+    if ingest_metrics:
+        metrics.update(ingest_metrics)
+    return metrics
+
+
+def _category_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not _rows_with_value(rows, "category"):
+        return {}
+    categories: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        categories.setdefault(str(row.get("category", "uncategorized")), []).append(row)
+    return {
+        "by_category": {
+            category: summarize(values, include_categories=False)
+            for category, values in sorted(categories.items())
+        }
+    }
 
 
 def summarize(
     rows: list[dict[str, Any]],
     *,
     include_categories: bool = True,
+    ingest_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    count = len(rows)
     result = {
-        "questions": count,
-        "mean_token_f1": sum(row["token_f1"] for row in rows) / count if count else 0,
-        "evidence_in_context_rate": sum(row["evidence_in_context"] for row in rows) / count if count else 0,
+        "questions": len(rows),
+        "mean_token_f1": _mean([row["token_f1"] for row in rows]),
+        "evidence_in_context_rate": _mean([row["evidence_in_context"] for row in rows]),
     }
-    evidence_rows = [row for row in rows if row.get("evidence_recall_at_k") is not None]
-    if evidence_rows:
-        result["evidence_recall_at_k"] = sum(float(row["evidence_recall_at_k"]) for row in evidence_rows) / len(evidence_rows)
-        result["evidence_hit_at_k"] = sum(bool(row.get("evidence_hit_at_k")) for row in evidence_rows) / len(evidence_rows)
-        result["all_evidence_retrieved_rate"] = sum(bool(row.get("all_evidence_retrieved")) for row in evidence_rows) / len(evidence_rows)
-    elif rows and all("evidence_hit" in row for row in rows):
-        # Compatibility for adapters whose datasets provide evidence text but no
-        # stable evidence identifiers.
-        result["evidence_recall_at_k"] = sum(bool(row["evidence_hit"]) for row in rows) / count
-    citation_recall = [row["citation_evidence_recall"] for row in rows if row.get("citation_evidence_recall") is not None]
-    citation_precision = [row["citation_precision"] for row in rows if row.get("citation_precision") is not None]
-    if citation_recall:
-        result["citation_evidence_recall"] = sum(citation_recall) / len(citation_recall)
-    if citation_precision:
-        result["citation_precision"] = sum(citation_precision) / len(citation_precision)
-    if rows and all("abstain" in row for row in rows):
-        result["abstention_rate"] = sum(bool(row["abstain"]) for row in rows) / count
-    judged = [row["judge"] for row in rows if "judge" in row]
-    if judged:
-        result["mean_judge_score"] = sum(item["score"] for item in judged) / len(judged)
-        result["judge_accuracy"] = sum(bool(item["correct"]) for item in judged) / len(judged)
-    if include_categories and any(row.get("category") is not None for row in rows):
-        categories: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            categories.setdefault(str(row.get("category", "uncategorized")), []).append(row)
-        result["by_category"] = {
-            category: summarize(values, include_categories=False)
-            for category, values in sorted(categories.items())
-        }
+    result.update(_evidence_metrics(rows))
+    result.update(_citation_metrics(rows))
+    result.update(_accuracy_metrics(rows, result))
+    result.update(_timing_metrics(rows, ingest_metrics))
+    if include_categories:
+        result.update(_category_breakdown(rows))
     return result
 
 
 def token_f1(prediction: str, gold: str) -> float:
-    predicted = _tokens(prediction)
-    target = _tokens(gold)
+    predicted = benchmark_tokens(prediction)
+    target = benchmark_tokens(gold)
     if not predicted or not target:
         return 0
     common = sum((Counter(predicted) & Counter(target)).values())
@@ -88,12 +210,6 @@ def token_f1(prediction: str, gold: str) -> float:
     precision = common / len(predicted)
     recall = common / len(target)
     return 2 * precision * recall / (precision + recall)
-
-
-def overlap(left: str, right: str) -> bool:
-    left_tokens = {item for item in _tokens(left) if len(item) > 3}
-    right_tokens = set(_tokens(right))
-    return bool(left_tokens) and len(left_tokens & right_tokens) / len(left_tokens) >= 0.5
 
 
 def write_benchmark_artifact(
@@ -161,7 +277,3 @@ def read_benchmark_run(storage_root: str | Path, benchmark: str, run_id: str) ->
     if not path.is_file():
         raise FileNotFoundError(path)
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _tokens(value: str) -> list[str]:
-    return re.findall(r"[a-z0-9']+", value.lower())

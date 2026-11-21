@@ -1,4 +1,10 @@
-"""Unified, safety-bounded preprocessing for retained ingestion sources."""
+"""Unified, safety-bounded preprocessing for retained ingestion sources.
+
+This module turns text, files, URLs, git repos, directories, archives, and images
+into `PreparedSource` chunks. Size, symlink, secret, and public-URL limits stay
+here so ingest callers do not reimplement them. `load_document` keeps the older
+normalized-text path used by inspection and tests.
+"""
 
 from __future__ import annotations
 
@@ -146,44 +152,66 @@ def load_document(path: str | Path) -> LoadedDocument:
         "size_bytes": file_path.stat().st_size,
         "suffix": suffix,
     }
-    if suffix == ".pdf":
-        return _load_pdf_document(file_path, metadata)
-    if suffix in {".html", ".htm"}:
-        parser = _TextHTMLParser()
-        parser.feed(file_path.read_text(encoding="utf-8", errors="replace"))
-        text = "\n".join(
-            line.strip()
-            for line in "".join(parser.parts).splitlines()
-            if line.strip()
-        )
-        return LoadedDocument(
-            text=text,
-            title=file_path.name,
-            media_type="text/html",
-            metadata=metadata,
-        )
+    loaders = {
+        ".pdf": _load_pdf_as_document,
+        ".html": _load_html_document,
+        ".htm": _load_html_document,
+    }
+    loader = loaders.get(suffix)
+    if loader is not None:
+        return loader(file_path, metadata, media_type)
     if suffix in CODE_SUFFIXES:
-        raw = file_path.read_text(encoding="utf-8", errors="replace")
-        numbered = "\n".join(
-            f"{index:06d}: {line}" for index, line in enumerate(raw.splitlines(), 1)
-        )
-        metadata["language"] = suffix.lstrip(".")
-        return LoadedDocument(
-            text=numbered,
-            title=file_path.name,
-            media_type=media_type,
-            metadata=metadata,
-        )
+        return _load_code_document(file_path, metadata, media_type)
     if suffix in TEXT_SUFFIXES or media_type.startswith("text/"):
-        return LoadedDocument(
-            text=file_path.read_text(encoding="utf-8", errors="replace"),
-            title=file_path.name,
-            media_type=media_type,
-            metadata=metadata,
-        )
+        return _load_text_document(file_path, metadata, media_type)
     raise ValueError(
         f"unsupported file type: {suffix or media_type}; "
         "supported: PDF, HTML, text, and source code"
+    )
+
+
+def _load_pdf_as_document(file_path: Path, metadata: dict[str, Any], media_type: str) -> LoadedDocument:
+    del media_type
+    return _load_pdf_document(file_path, metadata)
+
+
+def _load_html_document(file_path: Path, metadata: dict[str, Any], media_type: str) -> LoadedDocument:
+    del media_type
+    parser = _TextHTMLParser()
+    parser.feed(file_path.read_text(encoding="utf-8", errors="replace"))
+    text = "\n".join(
+        line.strip()
+        for line in "".join(parser.parts).splitlines()
+        if line.strip()
+    )
+    return LoadedDocument(
+        text=text,
+        title=file_path.name,
+        media_type="text/html",
+        metadata=metadata,
+    )
+
+
+def _load_code_document(file_path: Path, metadata: dict[str, Any], media_type: str) -> LoadedDocument:
+    raw = file_path.read_text(encoding="utf-8", errors="replace")
+    numbered = "\n".join(
+        f"{index:06d}: {line}" for index, line in enumerate(raw.splitlines(), 1)
+    )
+    metadata["language"] = file_path.suffix.lower().lstrip(".")
+    return LoadedDocument(
+        text=numbered,
+        title=file_path.name,
+        media_type=media_type,
+        metadata=metadata,
+    )
+
+
+def _load_text_document(file_path: Path, metadata: dict[str, Any], media_type: str) -> LoadedDocument:
+    return LoadedDocument(
+        text=file_path.read_text(encoding="utf-8", errors="replace"),
+        title=file_path.name,
+        media_type=media_type,
+        metadata=metadata,
     )
 
 
@@ -210,29 +238,45 @@ def _load_pdf_document(path: Path, metadata: dict[str, Any]) -> LoadedDocument:
 
 
 def prepare_source(source: SourceInput, completion: Any | None = None) -> PreparedSource:
-    if source.kind == "text":
-        assert source.text is not None
-        raw = source.text.encode("utf-8")
-        return _text_source(source, raw, source.filename or "text.txt", source.title or "Text")
-    if source.kind == "url":
-        assert source.url is not None
-        raw, final_url, media_type = _fetch(source.url)
-        name = Path(urlparse(final_url).path).name or "page.html"
-        return _bytes_source(source, raw, name, source.title or final_url, final_url, media_type, completion)
-    if source.kind == "git":
-        assert source.url is not None
-        return _git_source(source, completion)
+    preparers = {
+        "text": _prepare_text_kind,
+        "url": _prepare_url_kind,
+        "git": _git_source,
+    }
+    preparer = preparers.get(source.kind)
+    if preparer is not None:
+        return preparer(source, completion)
+    return _prepare_local_source(source, completion)
 
+
+def _prepare_text_kind(source: SourceInput, completion: Any | None = None) -> PreparedSource:
+    del completion
+    assert source.text is not None
+    raw = source.text.encode("utf-8")
+    return _text_source(source, raw, source.filename or "text.txt", source.title or "Text")
+
+
+def _prepare_url_kind(source: SourceInput, completion: Any | None = None) -> PreparedSource:
+    assert source.url is not None
+    raw, final_url, media_type = _fetch(source.url)
+    name = Path(urlparse(final_url).path).name or "page.html"
+    return _bytes_source(source, raw, name, source.title or final_url, final_url, media_type, completion)
+
+
+def _prepare_uploaded_source(source: SourceInput, completion: Any | None) -> PreparedSource:
+    try:
+        raw = base64.b64decode(source.content_base64, validate=True)
+    except ValueError as exc:
+        raise SourceError("content_base64 is invalid") from exc
+    if len(raw) > MAX_FILE_BYTES:
+        raise SourceError("uploaded source exceeds the 25 MiB file limit")
+    name = source.filename or "upload.bin"
+    return _bytes_source(source, raw, name, source.title or name, None, None, completion)
+
+
+def _prepare_local_source(source: SourceInput, completion: Any | None) -> PreparedSource:
     if source.content_base64 is not None:
-        try:
-            raw = base64.b64decode(source.content_base64, validate=True)
-        except ValueError as exc:
-            raise SourceError("content_base64 is invalid") from exc
-        if len(raw) > MAX_FILE_BYTES:
-            raise SourceError("uploaded source exceeds the 25 MiB file limit")
-        name = source.filename or "upload.bin"
-        return _bytes_source(source, raw, name, source.title or name, None, None, completion)
-
+        return _prepare_uploaded_source(source, completion)
     assert source.path is not None
     path = Path(source.path).expanduser().resolve()
     if path.is_symlink():
@@ -308,53 +352,97 @@ def _text_source(source: SourceInput, raw: bytes, filename: str, title: str) -> 
 def _file_chunks(raw: bytes, filename: str) -> tuple[list[PreparedChunk], dict[str, Any]]:
     suffix = _suffix(filename)
     if suffix in CODE_SUFFIXES:
-        text = raw.decode("utf-8", errors="replace")
-        return _code_chunks(text, filename), {"language": suffix.lstrip("."), "source_type": "code"}
-    if suffix == ".ipynb":
-        return _notebook_chunks(raw, filename), {"source_type": "notebook"}
-    if suffix == ".pdf":
-        return _pdf_chunks(raw), {"source_type": "pdf"}
-    if suffix == ".docx":
-        return _docx_chunks(raw), {"source_type": "docx"}
-    if suffix == ".pptx":
-        return _pptx_chunks(raw), {"source_type": "pptx"}
-    if suffix == ".xlsx":
-        return _xlsx_chunks(raw), {"source_type": "xlsx"}
-    if suffix in {".html", ".htm"}:
-        parser = _TextHTMLParser()
-        parser.feed(raw.decode("utf-8", errors="replace"))
-        text = "\n".join(line.strip() for line in "".join(parser.parts).splitlines() if line.strip())
-        return _chunk_text(text, filename), {"source_type": "html"}
-    if suffix in {".json", ".jsonl", ".csv", ".yaml", ".yml"}:
-        return _structured_chunks(raw, filename), {"source_type": "structured"}
+        return _code_file_chunks(raw, filename)
+    chunker = _FILE_CHUNKERS.get(suffix)
+    if chunker is not None:
+        return chunker(raw, filename)
     media_type = mimetypes.guess_type(filename)[0] or ""
     if suffix in TEXT_SUFFIXES or media_type.startswith("text/"):
-        return _chunk_text(raw.decode("utf-8", errors="replace"), filename), {"source_type": "text"}
+        return _text_file_chunks(raw, filename)
     raise SourceError(f"unsupported source type: {suffix or media_type or 'binary'}")
 
 
-def _code_chunks(text: str, filename: str) -> list[PreparedChunk]:
+def _code_file_chunks(raw: bytes, filename: str) -> tuple[list[PreparedChunk], dict[str, Any]]:
     suffix = _suffix(filename)
-    language = suffix.lstrip(".")
-    lines = text.splitlines()
+    text = raw.decode("utf-8", errors="replace")
+    return _code_chunks(text, filename), {"language": suffix.lstrip("."), "source_type": "code"}
+
+
+def _html_file_chunks(raw: bytes, filename: str) -> tuple[list[PreparedChunk], dict[str, Any]]:
+    parser = _TextHTMLParser()
+    parser.feed(raw.decode("utf-8", errors="replace"))
+    text = "\n".join(line.strip() for line in "".join(parser.parts).splitlines() if line.strip())
+    return _chunk_text(text, filename), {"source_type": "html"}
+
+
+def _structured_file_chunks(raw: bytes, filename: str) -> tuple[list[PreparedChunk], dict[str, Any]]:
+    return _structured_chunks(raw, filename), {"source_type": "structured"}
+
+
+def _text_file_chunks(raw: bytes, filename: str) -> tuple[list[PreparedChunk], dict[str, Any]]:
+    return _chunk_text(raw.decode("utf-8", errors="replace"), filename), {"source_type": "text"}
+
+
+def _python_ast_spans(text: str) -> list[tuple[str, str, int, int]]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
     spans: list[tuple[str, str, int, int]] = []
-    if suffix == ".py":
-        try:
-            tree = ast.parse(text)
-            for node in tree.body:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    spans.append((node.name, node.__class__.__name__.replace("Def", "").lower(), node.lineno, getattr(node, "end_lineno", node.lineno)))
-        except SyntaxError:
-            pass
-    if not spans:
-        spans = _tree_sitter_spans(text, language)
-    if not spans:
-        pattern = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:def|class|function|interface|type|struct|enum|fn|func)\s+([A-Za-z_$][\w$]*)")
-        starts = [(match.group(1), index) for index, line in enumerate(lines, 1) if (match := pattern.match(line))]
-        for pos, (name, start) in enumerate(starts):
-            end = starts[pos + 1][1] - 1 if pos + 1 < len(starts) else len(lines)
-            spans.append((name, "symbol", start, end))
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        spans.append((
+            node.name,
+            node.__class__.__name__.replace("Def", "").lower(),
+            node.lineno,
+            getattr(node, "end_lineno", node.lineno),
+        ))
+    return spans
+
+
+def _regex_symbol_spans(lines: list[str]) -> list[tuple[str, str, int, int]]:
+    pattern = re.compile(
+        r"^\s*(?:export\s+)?(?:async\s+)?(?:def|class|function|interface|type|struct|enum|fn|func)\s+([A-Za-z_$][\w$]*)"
+    )
+    starts = [(match.group(1), index) for index, line in enumerate(lines, 1) if (match := pattern.match(line))]
+    spans: list[tuple[str, str, int, int]] = []
+    for pos, (name, start) in enumerate(starts):
+        end = starts[pos + 1][1] - 1 if pos + 1 < len(starts) else len(lines)
+        spans.append((name, "symbol", start, end))
+    return spans
+
+
+def _code_line_chunks(
+    filename: str,
+    language: str,
+    lines: list[str],
+    remaining: list[int],
+    imports: list[str],
+    file_hash: str,
+) -> list[PreparedChunk]:
+    chunks: list[PreparedChunk] = []
+    for start in range(0, len(remaining), 120):
+        group = remaining[start:start + 120]
+        if not group:
+            continue
+        numbered = "\n".join(f"{line_no:06d}: {lines[line_no - 1]}" for line_no in group)
+        chunks.append(PreparedChunk(numbered, {
+            "kind": "code_lines", "path": filename, "language": language,
+            "start_line": group[0], "end_line": group[-1],
+        }, {"imports": imports, "file_hash": file_hash}))
+    return chunks
+
+
+def _code_symbol_chunks(
+    text: str,
+    filename: str,
+    language: str,
+    lines: list[str],
+    spans: list[tuple[str, str, int, int]],
+) -> list[PreparedChunk]:
     imports = [line.strip() for line in lines if re.match(r"^\s*(?:import|from|require\(|use\s|#include)", line)][:40]
+    file_hash = hashlib.sha256(text.encode()).hexdigest()
     chunks: list[PreparedChunk] = []
     covered: set[int] = set()
     for name, symbol_kind, start, end in spans:
@@ -364,18 +452,24 @@ def _code_chunks(text: str, filename: str) -> list[PreparedChunk]:
         chunks.append(PreparedChunk(numbered, {
             "kind": "code_symbol", "path": filename, "language": language, "symbol": name,
             "symbol_kind": symbol_kind, "start_line": start, "end_line": end,
-        }, {"imports": imports, "file_hash": hashlib.sha256(text.encode()).hexdigest()}))
+        }, {"imports": imports, "file_hash": file_hash}))
     remaining = [index for index in range(1, len(lines) + 1) if index not in covered]
-    for start in range(0, len(remaining), 120):
-        group = remaining[start:start + 120]
-        if not group:
-            continue
-        numbered = "\n".join(f"{line_no:06d}: {lines[line_no - 1]}" for line_no in group)
-        chunks.append(PreparedChunk(numbered, {
-            "kind": "code_lines", "path": filename, "language": language,
-            "start_line": group[0], "end_line": group[-1],
-        }, {"imports": imports, "file_hash": hashlib.sha256(text.encode()).hexdigest()}))
-    return chunks or [PreparedChunk("", {"kind": "code_lines", "path": filename, "start_line": 1, "end_line": 0})]
+    chunks.extend(_code_line_chunks(filename, language, lines, remaining, imports, file_hash))
+    if chunks:
+        return chunks
+    return [PreparedChunk("", {"kind": "code_lines", "path": filename, "start_line": 1, "end_line": 0})]
+
+
+def _code_chunks(text: str, filename: str) -> list[PreparedChunk]:
+    suffix = _suffix(filename)
+    language = suffix.lstrip(".")
+    lines = text.splitlines()
+    spans = _python_ast_spans(text) if suffix == ".py" else []
+    if not spans:
+        spans = _tree_sitter_spans(text, language)
+    if not spans:
+        spans = _regex_symbol_spans(lines)
+    return _code_symbol_chunks(text, filename, language, lines, spans)
 
 
 def _tree_sitter_spans(text: str, language: str) -> list[tuple[str, str, int, int]]:
@@ -465,31 +559,115 @@ def _xlsx_chunks(raw: bytes) -> list[PreparedChunk]:
     return chunks
 
 
-def _structured_chunks(raw: bytes, filename: str) -> list[PreparedChunk]:
-    suffix = _suffix(filename)
-    text = raw.decode("utf-8", errors="replace")
-    if suffix == ".jsonl":
-        return [PreparedChunk(line, {"kind": "record", "record": index}) for index, line in enumerate(text.splitlines(), 1) if line.strip()]
-    if suffix == ".csv":
-        rows = csv.reader(io.StringIO(text))
-        return [PreparedChunk(" | ".join(row), {"kind": "row", "row": index}) for index, row in enumerate(rows, 1)]
-    if suffix == ".json":
-        value = json.loads(text)
-        values = value if isinstance(value, list) else [value]
-        return [PreparedChunk(json.dumps(item, ensure_ascii=False, sort_keys=True), {"kind": "record", "record": index}) for index, item in enumerate(values, 1)]
+def _jsonl_chunks(text: str, filename: str) -> list[PreparedChunk]:
+    del filename
+    return [
+        PreparedChunk(line, {"kind": "record", "record": index})
+        for index, line in enumerate(text.splitlines(), 1) if line.strip()
+    ]
+
+
+def _csv_chunks(text: str, filename: str) -> list[PreparedChunk]:
+    del filename
+    rows = csv.reader(io.StringIO(text))
+    return [PreparedChunk(" | ".join(row), {"kind": "row", "row": index}) for index, row in enumerate(rows, 1)]
+
+
+def _json_chunks(text: str, filename: str) -> list[PreparedChunk]:
+    del filename
+    value = json.loads(text)
+    values = value if isinstance(value, list) else [value]
+    return [
+        PreparedChunk(json.dumps(item, ensure_ascii=False, sort_keys=True), {"kind": "record", "record": index})
+        for index, item in enumerate(values, 1)
+    ]
+
+
+def _yaml_or_text_chunks(text: str, filename: str) -> list[PreparedChunk]:
     try:
         import yaml
     except ImportError:
         return _chunk_text(text, filename)
     values = list(yaml.safe_load_all(text))
-    return [PreparedChunk(json.dumps(item, ensure_ascii=False, default=str, sort_keys=True), {"kind": "document", "document": index}) for index, item in enumerate(values, 1) if item is not None]
+    return [
+        PreparedChunk(
+            json.dumps(item, ensure_ascii=False, default=str, sort_keys=True),
+            {"kind": "document", "document": index},
+        )
+        for index, item in enumerate(values, 1) if item is not None
+    ]
 
 
-def _image_source(source: SourceInput, raw: bytes, filename: str, title: str, uri: str | None, media_type: str, completion: Any | None) -> PreparedSource:
+_STRUCTURED_PARSERS = {
+    ".jsonl": _jsonl_chunks,
+    ".csv": _csv_chunks,
+    ".json": _json_chunks,
+}
+
+
+def _structured_chunks(raw: bytes, filename: str) -> list[PreparedChunk]:
+    suffix = _suffix(filename)
+    text = raw.decode("utf-8", errors="replace")
+    parser = _STRUCTURED_PARSERS.get(suffix)
+    if parser is not None:
+        return parser(text, filename)
+    return _yaml_or_text_chunks(text, filename)
+
+
+_FILE_CHUNKERS: dict[str, Callable[[bytes, str], tuple[list[PreparedChunk], dict[str, Any]]]] = {
+    ".ipynb": lambda raw, filename: (_notebook_chunks(raw, filename), {"source_type": "notebook"}),
+    ".pdf": lambda raw, filename: (_pdf_chunks(raw), {"source_type": "pdf"}),
+    ".docx": lambda raw, filename: (_docx_chunks(raw), {"source_type": "docx"}),
+    ".pptx": lambda raw, filename: (_pptx_chunks(raw), {"source_type": "pptx"}),
+    ".xlsx": lambda raw, filename: (_xlsx_chunks(raw), {"source_type": "xlsx"}),
+    ".html": _html_file_chunks,
+    ".htm": _html_file_chunks,
+    ".json": _structured_file_chunks,
+    ".jsonl": _structured_file_chunks,
+    ".csv": _structured_file_chunks,
+    ".yaml": _structured_file_chunks,
+    ".yml": _structured_file_chunks,
+}
+
+
+def _require_vision_completion(completion: Any | None) -> None:
     if completion is None or not hasattr(completion, "complete_multimodal"):
         raise SourceError("image ingestion requires a configured completion model with vision support")
     if getattr(completion, "vision_supported", None) is False:
         raise SourceError("the selected completion model is known not to support image input")
+
+
+def _labeled_section(label: str, value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return f"{label}:\n{value}"
+    return f"{label}:\n{json.dumps(value, ensure_ascii=False)}"
+
+
+def _image_description_text(payload: dict[str, Any]) -> str:
+    visible = str(payload.get("visible_text") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    parts = [
+        description,
+        _labeled_section("Visible text", visible),
+        _labeled_section("Tables/charts", payload.get("tables_or_charts") or []),
+        _labeled_section("Relationships", payload.get("relationships") or []),
+    ]
+    return "\n\n".join(part for part in parts if part)
+
+
+def _image_provenance(completion: Any, prompt: Any) -> dict[str, Any]:
+    settings = getattr(completion, "settings", None)
+    return {
+        "prompt": prompt.provenance(),
+        "provider": getattr(settings, "provider", completion.__class__.__name__),
+        "model": getattr(completion, "model", None),
+    }
+
+
+def _image_source(source: SourceInput, raw: bytes, filename: str, title: str, uri: str | None, media_type: str, completion: Any | None) -> PreparedSource:
+    _require_vision_completion(completion)
     prompt = load_prompt("image_facts")
     payload = completion.complete_multimodal(
         prompt.text,
@@ -497,19 +675,10 @@ def _image_source(source: SourceInput, raw: bytes, filename: str, title: str, ur
         raw,
         media_type,
     )
-    visible = str(payload.get("visible_text") or "").strip()
-    description = str(payload.get("description") or "").strip()
-    tables = payload.get("tables_or_charts") or []
-    relationships = payload.get("relationships") or []
-    text = "\n\n".join(part for part in [description, f"Visible text:\n{visible}" if visible else "", f"Tables/charts:\n{json.dumps(tables, ensure_ascii=False)}" if tables else "", f"Relationships:\n{json.dumps(relationships, ensure_ascii=False)}" if relationships else ""] if part)
+    text = _image_description_text(payload)
     if not text:
         raise SourceError("vision model returned no usable image description")
-    settings = getattr(completion, "settings", None)
-    provenance = {
-        "prompt": prompt.provenance(),
-        "provider": getattr(settings, "provider", completion.__class__.__name__),
-        "model": getattr(completion, "model", None),
-    }
+    provenance = _image_provenance(completion, prompt)
     return PreparedSource(
         source, "image", title, uri, filename, media_type, raw,
         [PreparedChunk(text, {"kind": "image", "filename": filename}, provenance)],
@@ -517,12 +686,47 @@ def _image_source(source: SourceInput, raw: bytes, filename: str, title: str, ur
     )
 
 
-def _directory_source(source: SourceInput, root: Path, completion: Any | None, *, git_metadata: dict[str, Any] | None = None) -> PreparedSource:
-    accepted, skipped = _collect_directory(root)
-    if not accepted:
-        raise SourceError("directory contains no supported source files")
+def _directory_file_chunks(
+    source: SourceInput,
+    raw: bytes,
+    relative: str,
+    completion: Any | None,
+) -> tuple[list[PreparedChunk], dict[str, Any]]:
+    if _suffix(relative) not in IMAGE_SUFFIXES:
+        return _file_chunks(raw, relative)
+    image = _image_source(
+        source, raw, relative, relative, None,
+        mimetypes.guess_type(relative)[0] or "application/octet-stream",
+        completion,
+    )
+    return image.chunks, image.metadata
+
+
+def _prepared_directory_chunk(
+    chunk: PreparedChunk,
+    relative: str,
+    metadata: dict[str, Any],
+    git_metadata: dict[str, Any] | None,
+) -> PreparedChunk:
+    provenance = {
+        key: value for key, value in (git_metadata or {}).items() if key in {"commit_sha", "remote_url"}
+    }
+    return PreparedChunk(
+        chunk.text,
+        {**chunk.locator, "path": relative, **provenance},
+        {**metadata, **chunk.metadata},
+    )
+
+
+def _bundle_directory(
+    source: SourceInput,
+    root: Path,
+    accepted: list[Path],
+    completion: Any | None,
+    git_metadata: dict[str, Any] | None,
+) -> tuple[list[PreparedChunk], list[str], bytes]:
     chunks: list[PreparedChunk] = []
-    manifest = []
+    manifest: list[str] = []
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         for path in accepted:
@@ -533,19 +737,31 @@ def _directory_source(source: SourceInput, root: Path, completion: Any | None, *
             entry.external_attr = 0o600 << 16
             bundle.writestr(entry, raw)
             manifest.append(relative)
-            if _suffix(relative) in IMAGE_SUFFIXES:
-                image = _image_source(source, raw, relative, relative, None, mimetypes.guess_type(relative)[0] or "application/octet-stream", completion)
-                file_chunks, metadata = image.chunks, image.metadata
-            else:
-                file_chunks, metadata = _file_chunks(raw, relative)
-            for chunk in file_chunks:
-                provenance = {key: value for key, value in (git_metadata or {}).items() if key in {"commit_sha", "remote_url"}}
-                chunks.append(PreparedChunk(chunk.text, {**chunk.locator, "path": relative, **provenance}, {**metadata, **chunk.metadata}))
-    manifest_text = "Repository/source manifest:\n" + "\n".join(manifest)
-    chunks.insert(0, PreparedChunk(manifest_text, {"kind": "manifest", "path": "."}, {"file_count": len(manifest)}))
+            file_chunks, metadata = _directory_file_chunks(source, raw, relative, completion)
+            chunks.extend(
+                _prepared_directory_chunk(chunk, relative, metadata, git_metadata)
+                for chunk in file_chunks
+            )
+    return chunks, manifest, buffer.getvalue()
+
+
+def _directory_source(source: SourceInput, root: Path, completion: Any | None, *, git_metadata: dict[str, Any] | None = None) -> PreparedSource:
+    accepted, skipped = _collect_directory(root)
+    if not accepted:
+        raise SourceError("directory contains no supported source files")
+    chunks, manifest, original = _bundle_directory(source, root, accepted, completion, git_metadata)
+    chunks.insert(0, PreparedChunk(
+        "Repository/source manifest:\n" + "\n".join(manifest),
+        {"kind": "manifest", "path": "."},
+        {"file_count": len(manifest)},
+    ))
     metadata = {**source.metadata, **(git_metadata or {}), "file_count": len(manifest), "source_type": "repository"}
     title = source.title or root.name
-    return PreparedSource(source, "directory" if not git_metadata else "git", title, str(root), f"{root.name}.zip", "application/zip", buffer.getvalue(), chunks, metadata, skipped)
+    kind = "directory" if not git_metadata else "git"
+    return PreparedSource(
+        source, kind, title, str(root), f"{root.name}.zip", "application/zip",
+        original, chunks, metadata, skipped,
+    )
 
 
 def _git_source(source: SourceInput, completion: Any | None) -> PreparedSource:
@@ -580,6 +796,28 @@ def _archive_source(source: SourceInput, raw: bytes, filename: str, title: str, 
         return PreparedSource(prepared.source, "archive", title, uri, filename, "application/zip", raw, prepared.chunks, {**prepared.metadata, "source_type": "archive"}, prepared.skipped_paths)
 
 
+def _ignored_directory_entry(path: Path, relative: str, patterns: Iterable[str]) -> bool:
+    parts = set(PurePosixPath(relative).parts)
+    if path.is_symlink():
+        return True
+    if parts & HARD_IGNORES:
+        return True
+    if path.name.lower() in SECRET_NAMES:
+        return True
+    if path.suffix.lower() in SECRET_SUFFIXES:
+        return True
+    return _matches_ignore(relative, patterns)
+
+
+def _supported_source_file(path: Path) -> bool:
+    suffix = _suffix(path.name)
+    media = mimetypes.guess_type(path.name)[0] or ""
+    supported = suffix in CODE_SUFFIXES | TEXT_SUFFIXES | OFFICE_SUFFIXES | IMAGE_SUFFIXES | {".pdf", ".html", ".htm", ".ipynb"} or media.startswith("text/")
+    if not supported:
+        return False
+    return path.stat().st_size <= MAX_FILE_BYTES
+
+
 def _collect_directory(root: Path) -> tuple[list[Path], list[str]]:
     patterns = _ignore_patterns(root)
     accepted: list[Path] = []
@@ -587,16 +825,12 @@ def _collect_directory(root: Path) -> tuple[list[Path], list[str]]:
     total = 0
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
-        parts = set(PurePosixPath(relative).parts)
-        if path.is_symlink() or parts & HARD_IGNORES or path.name.lower() in SECRET_NAMES or path.suffix.lower() in SECRET_SUFFIXES or _matches_ignore(relative, patterns):
+        if _ignored_directory_entry(path, relative, patterns):
             skipped.append(relative)
             continue
         if not path.is_file():
             continue
-        suffix = _suffix(path.name)
-        media = mimetypes.guess_type(path.name)[0] or ""
-        supported = suffix in CODE_SUFFIXES | TEXT_SUFFIXES | OFFICE_SUFFIXES | IMAGE_SUFFIXES | {".pdf", ".html", ".htm", ".ipynb"} or media.startswith("text/")
-        if not supported or path.stat().st_size > MAX_FILE_BYTES:
+        if not _supported_source_file(path):
             skipped.append(relative)
             continue
         total += path.stat().st_size
@@ -704,19 +938,39 @@ def _fetch(url: str) -> tuple[bytes, str, str]:
     return raw, final, media_type
 
 
-def _validate_public_url(url: str, *, https_only: bool = False) -> None:
-    parsed = urlparse(url)
+def _public_http_url(parsed: Any, *, https_only: bool) -> bool:
     allowed = {"https"} if https_only else {"http", "https"}
-    if parsed.scheme not in allowed or not parsed.hostname or parsed.username or parsed.password:
-        raise SourceError("source URL must be a public HTTP(S) URL without embedded credentials")
+    if parsed.scheme not in allowed:
+        return False
+    if not parsed.hostname:
+        return False
+    if parsed.username or parsed.password:
+        return False
+    return True
+
+
+def _resolve_url_addresses(parsed: Any) -> set[str]:
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+        return {
+            item[4][0]
+            for item in socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+        }
     except socket.gaierror as exc:
         raise SourceError(f"source host could not be resolved: {parsed.hostname}") from exc
+
+
+def _reject_non_global_addresses(addresses: Iterable[str]) -> None:
     for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if not ip.is_global:
+        if not ipaddress.ip_address(address).is_global:
             raise SourceError("private, loopback, link-local, and reserved source addresses are blocked")
+
+
+def _validate_public_url(url: str, *, https_only: bool = False) -> None:
+    parsed = urlparse(url)
+    if not _public_http_url(parsed, https_only=https_only):
+        raise SourceError("source URL must be a public HTTP(S) URL without embedded credentials")
+    _reject_non_global_addresses(_resolve_url_addresses(parsed))
 
 
 def _chunk_text(text: str, filename: str, *, chars: int = 3500) -> list[PreparedChunk]:

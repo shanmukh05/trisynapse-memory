@@ -20,6 +20,7 @@ Preserve these invariants:
 - Embedding failures are explicit; never introduce substitute vectors.
 - Every read and write honors its namespace.
 - Benchmark inputs must never add gold answers to retrievable memory.
+- Keep functions small: extract a named helper instead of deepening nested branches. Public APIs stay stable.
 
 Behavior changes require tests and an update to the relevant file in `docs/`.
 

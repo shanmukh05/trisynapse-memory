@@ -1,4 +1,9 @@
-"""SQLite persistence for ordered Trace evidence and disposable Recall data."""
+"""SQLite persistence for ordered memory-log evidence and disposable indexes.
+
+Owns append, validation, jobs, sources, query runs, and rebuildable retrieval
+tables. Indexes may be deleted and reconstructed; the memory log is the source
+of truth. Callers must not bypass this store to mutate evidence.
+"""
 
 from __future__ import annotations
 
@@ -79,6 +84,93 @@ def _normal_index_entity(value: str | None) -> str:
 def _namespace_sql_key(namespace: MemoryNamespace | dict[str, Any]) -> str:
     model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
     return _json(model.model_dump(mode="json", exclude_none=True))
+
+
+def _append_actor(actor: Actor | dict[str, Any] | None) -> Actor:
+    return actor if isinstance(actor, Actor) else Actor.model_validate(actor or {})
+
+
+def _append_namespace(namespace: MemoryNamespace | dict[str, Any] | None) -> MemoryNamespace:
+    return namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace or {})
+
+
+def _delta_list_query(
+    kinds: Iterable[str] | None,
+    group_prefix: str | None,
+    seq_cutoff: int | None,
+    after_seq: int | None,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if kinds:
+        kind_list = list(kinds)
+        clauses.append(f"kind IN ({','.join('?' for _ in kind_list)})")
+        params.extend(kind_list)
+    if group_prefix:
+        clauses.append("group_id LIKE ?")
+        params.append(f"{group_prefix}%")
+    if seq_cutoff is not None:
+        clauses.append("seq <= ?")
+        params.append(seq_cutoff)
+    if after_seq is not None:
+        clauses.append("seq > ?")
+        params.append(after_seq)
+    sql = "SELECT * FROM deltas"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    return sql + " ORDER BY seq", params
+
+
+def _exclude_retracted(deltas: list[MemoryRecord], targets: set[str]) -> list[MemoryRecord]:
+    return [delta for delta in deltas if delta.id not in targets]
+
+
+def _filter_records_by_scope(deltas: list[MemoryRecord], scope: dict[str, Any]) -> list[MemoryRecord]:
+    return [delta for delta in deltas if _scope_matches(delta.scope, scope)]
+
+
+def _filter_records_by_namespace(
+    deltas: list[MemoryRecord], namespace: MemoryNamespace | dict[str, Any],
+) -> list[MemoryRecord]:
+    requested_namespace = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
+    requested = requested_namespace.model_dump(exclude_none=True)
+    return [
+        delta for delta in deltas
+        if all(getattr(delta.namespace, key) == value for key, value in requested.items())
+    ]
+
+
+def _broken_evidence_refs(parsed: list[MemoryRecord], issues: list[str]) -> list[str]:
+    record_ids = {delta.id for delta in parsed}
+    broken: list[str] = []
+    for delta in parsed:
+        for evidence_id in delta.evidence_refs:
+            if evidence_id not in record_ids:
+                broken.append(f"{delta.id}->{evidence_id}")
+    if broken:
+        issues.append(f"{len(broken)} evidence references point to missing deltas")
+    return broken
+
+
+def _retrieval_document_fields(raw_fields: Any) -> dict[str, str]:
+    if not isinstance(raw_fields, dict):
+        return {}
+    return {
+        str(name): _field_text(value)
+        for name, value in raw_fields.items()
+        if _field_text(value)
+    }
+
+
+def _retrieval_source_type(delta: MemoryRecord, modality: str) -> str:
+    source_kind = delta.scope.get("source_kind") if isinstance(delta.scope, dict) else None
+    return str(delta.payload.get("source_type") or source_kind or modality)
+
+
+def _retrieval_index_fields(delta: MemoryRecord) -> tuple[dict[str, str], str, str]:
+    raw_fields = delta.payload.get("retrieval_fields") or {}
+    modality = str(delta.payload.get("modality") or "text")
+    return _retrieval_document_fields(raw_fields), modality, _retrieval_source_type(delta, modality)
 
 
 class SQLiteMemoryLogStore:
@@ -344,36 +436,55 @@ class SQLiteMemoryLogStore:
         )
         self._migrate_removal_audit_schema()
         self._migrate_snapshot_schema()
-        if "purge_audit" in tables:
-            self._connection.execute(
-                """INSERT OR IGNORE INTO removal_audit
-                   SELECT purge_id,target_ids_json,requested_by,reason,created_at
-                   FROM purge_audit"""
-            )
-            self._connection.execute("DROP TABLE purge_audit")
+        self._migrate_purge_audit(tables)
+        self._migrate_retrieval_document_text()
+        self._reset_stale_lexical_index()
+        self._reset_running_ingestion_runs()
+        self._interrupt_open_query_runs()
+        self._backfill_query_runs_from_traces()
+        self._backfill_missing_retrieval_index()
+        self._connection.commit()
+
+    def _migrate_purge_audit(self, tables: set[str]) -> None:
+        if "purge_audit" not in tables:
+            return
+        self._connection.execute(
+            """INSERT OR IGNORE INTO removal_audit
+               SELECT purge_id,target_ids_json,requested_by,reason,created_at
+               FROM purge_audit"""
+        )
+        self._connection.execute("DROP TABLE purge_audit")
+
+    def _migrate_retrieval_document_text(self) -> None:
         retrieval_columns = {
             row["name"] for row in self._connection.execute("PRAGMA table_info(retrieval_documents)").fetchall()
         }
-        if "text" not in retrieval_columns:
-            self._connection.execute(
-                "ALTER TABLE retrieval_documents ADD COLUMN text TEXT NOT NULL DEFAULT ''"
-            )
-            self._connection.execute(
-                """UPDATE retrieval_documents
-                   SET text=COALESCE((SELECT d.text FROM deltas d WHERE d.id=retrieval_documents.delta_id),'')"""
-            )
+        if "text" in retrieval_columns:
+            return
+        self._connection.execute(
+            "ALTER TABLE retrieval_documents ADD COLUMN text TEXT NOT NULL DEFAULT ''"
+        )
+        self._connection.execute(
+            """UPDATE retrieval_documents
+               SET text=COALESCE((SELECT d.text FROM deltas d WHERE d.id=retrieval_documents.delta_id),'')"""
+        )
+
+    def _reset_stale_lexical_index(self) -> None:
         tokenizer_row = self._connection.execute(
             "SELECT value FROM retrieval_index_metadata WHERE key='lexical_tokenizer_version'"
         ).fetchone()
-        if tokenizer_row is None or tokenizer_row["value"] != LEXICAL_TOKENIZER_VERSION:
-            self._connection.execute("DELETE FROM retrieval_terms")
-            self._connection.execute("DELETE FROM retrieval_graph_edges")
-            self._connection.execute("DELETE FROM retrieval_documents")
-            self._connection.execute(
-                """INSERT OR REPLACE INTO retrieval_index_metadata(key,value)
-                   VALUES('lexical_tokenizer_version',?)""",
-                (LEXICAL_TOKENIZER_VERSION,),
-            )
+        if tokenizer_row is not None and tokenizer_row["value"] == LEXICAL_TOKENIZER_VERSION:
+            return
+        self._connection.execute("DELETE FROM retrieval_terms")
+        self._connection.execute("DELETE FROM retrieval_graph_edges")
+        self._connection.execute("DELETE FROM retrieval_documents")
+        self._connection.execute(
+            """INSERT OR REPLACE INTO retrieval_index_metadata(key,value)
+               VALUES('lexical_tokenizer_version',?)""",
+            (LEXICAL_TOKENIZER_VERSION,),
+        )
+
+    def _reset_running_ingestion_runs(self) -> None:
         for row in self._connection.execute(
             "SELECT id,payload_json FROM ingestion_runs WHERE status='running'"
         ).fetchall():
@@ -384,6 +495,8 @@ class SQLiteMemoryLogStore:
                 "UPDATE ingestion_runs SET status='pending',updated_at=?,payload_json=? WHERE id=?",
                 (payload["updated_at"], _json(payload), row["id"]),
             )
+
+    def _interrupt_open_query_runs(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
         for row in self._connection.execute(
             "SELECT id,payload_json FROM query_runs WHERE status IN ('pending','running')"
@@ -396,6 +509,8 @@ class SQLiteMemoryLogStore:
                 "UPDATE query_runs SET status='interrupted',updated_at=?,payload_json=? WHERE id=?",
                 (now, _json(payload), row["id"]),
             )
+
+    def _backfill_query_runs_from_traces(self) -> None:
         existing_runs = {
             row["id"] for row in self._connection.execute("SELECT id FROM query_runs").fetchall()
         }
@@ -420,6 +535,8 @@ class SQLiteMemoryLogStore:
                 completed_at=trace.created_at,
             )
             self._put_query_run_uncommitted(run)
+
+    def _backfill_missing_retrieval_index(self) -> None:
         # The retrieval index is disposable and can be backfilled from Trace.
         for row in self._connection.execute(
             """SELECT d.* FROM deltas d
@@ -431,7 +548,6 @@ class SQLiteMemoryLogStore:
             "SELECT * FROM deltas WHERE kind='retraction' ORDER BY seq"
         ).fetchall():
             self._index_delta_uncommitted(self._connection, self._from_row(row))
-        self._connection.commit()
 
     def _migrate_delta_schema(self) -> None:
         """Remove legacy chain columns while preserving ordered evidence."""
@@ -770,68 +886,154 @@ class SQLiteMemoryLogStore:
         locator: dict[str, Any] | str | None = None,
         external_key: str | None = None,
     ) -> MemoryRecord:
-        if external_key:
-            existing = self.get_by_external_key(external_key)
-            if existing is not None:
-                return existing
-        actor_model = actor if isinstance(actor, Actor) else Actor.model_validate(actor or {})
-        namespace_model = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace or {})
+        existing = self.get_by_external_key(external_key) if external_key else None
+        if existing is not None:
+            return existing
+        actor_model = _append_actor(actor)
+        namespace_model = _append_namespace(namespace)
         observed = _parse_datetime(observed_at)
         written = datetime.now(timezone.utc)
         evidence = list(dict.fromkeys(evidence_refs))
         payload = dict(payload or {})
         with self._lock:
-            cursor = self._connection.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
-            try:
-                previous = cursor.execute("SELECT seq FROM deltas ORDER BY seq DESC LIMIT 1").fetchone()
-                seq = int(previous["seq"]) + 1 if previous else 1
-                delta = MemoryRecord(
-                    id=_new_id(),
-                    seq=seq,
-                    written_at=written,
-                    observed_at=observed,
-                    kind=kind,
-                    actor=actor_model,
-                    namespace=namespace_model,
-                    group_id=group_id,
-                    evidence_refs=evidence,
-                    confidence=confidence,
-                    privacy_scope={},
-                    scope=scope or {},
-                    payload=payload,
-                    text=text,
-                    subject=subject,
-                    relation=relation,
-                    object=object,
-                    temporal_anchor=temporal_anchor,
-                    source_ref=source_ref,
-                    locator=locator,
-                    external_key=external_key,
-                )
-                cursor.execute(
-                    """INSERT INTO deltas(
-                           id,seq,written_at,observed_at,kind,actor_json,namespace_json,
-                           group_id,evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,
-                           text,subject,relation,object,temporal_anchor,source_ref_json,locator_json,external_key
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    self._to_row(delta),
-                )
-                self._index_delta_uncommitted(cursor, delta)
-                if kind != "access":
-                    cursor.execute("UPDATE recall_cache SET stale=1 WHERE stale=0")
-                self._connection.commit()
-                return delta
-            except sqlite3.IntegrityError:
-                self._connection.rollback()
-                if external_key:
-                    existing = self.get_by_external_key(external_key)
-                    if existing is not None:
-                        return existing
-                raise
-            except Exception:
-                self._connection.rollback()
-                raise
+            return self._commit_appended_delta(
+                kind=kind,
+                text=text,
+                observed=observed,
+                written=written,
+                actor_model=actor_model,
+                namespace_model=namespace_model,
+                group_id=group_id,
+                evidence=evidence,
+                confidence=confidence,
+                scope=scope or {},
+                payload=payload,
+                subject=subject,
+                relation=relation,
+                object=object,
+                temporal_anchor=temporal_anchor,
+                source_ref=source_ref,
+                locator=locator,
+                external_key=external_key,
+            )
+
+    def _commit_appended_delta(
+        self,
+        *,
+        kind: str,
+        text: str,
+        observed: datetime | None,
+        written: datetime,
+        actor_model: Actor,
+        namespace_model: MemoryNamespace,
+        group_id: str | None,
+        evidence: list[str],
+        confidence: float,
+        scope: dict[str, Any],
+        payload: dict[str, Any],
+        subject: str | None,
+        relation: str | None,
+        object: str | None,
+        temporal_anchor: str | None,
+        source_ref: dict[str, Any] | str | None,
+        locator: dict[str, Any] | str | None,
+        external_key: str | None,
+    ) -> MemoryRecord:
+        cursor = self._connection.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            delta = self._new_appended_record(
+                cursor,
+                kind=kind,
+                text=text,
+                observed=observed,
+                written=written,
+                actor_model=actor_model,
+                namespace_model=namespace_model,
+                group_id=group_id,
+                evidence=evidence,
+                confidence=confidence,
+                scope=scope,
+                payload=payload,
+                subject=subject,
+                relation=relation,
+                object=object,
+                temporal_anchor=temporal_anchor,
+                source_ref=source_ref,
+                locator=locator,
+                external_key=external_key,
+            )
+            cursor.execute(
+                """INSERT INTO deltas(
+                       id,seq,written_at,observed_at,kind,actor_json,namespace_json,
+                       group_id,evidence_refs_json,confidence,privacy_scope_json,scope_json,payload_json,
+                       text,subject,relation,object,temporal_anchor,source_ref_json,locator_json,external_key
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                self._to_row(delta),
+            )
+            self._index_delta_uncommitted(cursor, delta)
+            if kind != "access":
+                cursor.execute("UPDATE recall_cache SET stale=1 WHERE stale=0")
+            self._connection.commit()
+            return delta
+        except sqlite3.IntegrityError:
+            self._connection.rollback()
+            existing = self.get_by_external_key(external_key) if external_key else None
+            if existing is not None:
+                return existing
+            raise
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def _new_appended_record(
+        self,
+        cursor: Any,
+        *,
+        kind: str,
+        text: str,
+        observed: datetime | None,
+        written: datetime,
+        actor_model: Actor,
+        namespace_model: MemoryNamespace,
+        group_id: str | None,
+        evidence: list[str],
+        confidence: float,
+        scope: dict[str, Any],
+        payload: dict[str, Any],
+        subject: str | None,
+        relation: str | None,
+        object: str | None,
+        temporal_anchor: str | None,
+        source_ref: dict[str, Any] | str | None,
+        locator: dict[str, Any] | str | None,
+        external_key: str | None,
+    ) -> MemoryRecord:
+        previous = cursor.execute("SELECT seq FROM deltas ORDER BY seq DESC LIMIT 1").fetchone()
+        seq = int(previous["seq"]) + 1 if previous else 1
+        return MemoryRecord(
+            id=_new_id(),
+            seq=seq,
+            written_at=written,
+            observed_at=observed,
+            kind=kind,
+            actor=actor_model,
+            namespace=namespace_model,
+            group_id=group_id,
+            evidence_refs=evidence,
+            confidence=confidence,
+            privacy_scope={},
+            scope=scope,
+            payload=payload,
+            text=text,
+            subject=subject,
+            relation=relation,
+            object=object,
+            temporal_anchor=temporal_anchor,
+            source_ref=source_ref,
+            locator=locator,
+            external_key=external_key,
+        )
 
     @staticmethod
     def _to_row(delta: MemoryRecord) -> tuple[Any, ...]:
@@ -905,39 +1107,30 @@ class SQLiteMemoryLogStore:
         after_seq: int | None = None,
         limit: int | None = None,
     ) -> list[MemoryRecord]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if kinds:
-            kind_list = list(kinds)
-            clauses.append(f"kind IN ({','.join('?' for _ in kind_list)})")
-            params.extend(kind_list)
-        if group_prefix:
-            clauses.append("group_id LIKE ?")
-            params.append(f"{group_prefix}%")
-        if seq_cutoff is not None:
-            clauses.append("seq <= ?")
-            params.append(seq_cutoff)
-        if after_seq is not None:
-            clauses.append("seq > ?")
-            params.append(after_seq)
-        sql = "SELECT * FROM deltas"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY seq"
+        sql, params = _delta_list_query(kinds, group_prefix, seq_cutoff, after_seq)
         deltas = [self._from_row(row) for row in self._connection.execute(sql, params).fetchall()]
+        return self._apply_delta_list_filters(
+            deltas, include_retracted=include_retracted, scope=scope, namespace=namespace, limit=limit,
+        )
+
+    def _apply_delta_list_filters(
+        self,
+        deltas: list[MemoryRecord],
+        *,
+        include_retracted: bool,
+        scope: dict[str, Any] | None,
+        namespace: MemoryNamespace | dict[str, Any] | None,
+        limit: int | None,
+    ) -> list[MemoryRecord]:
         if not include_retracted:
-            targets = self.retracted_ids()
-            deltas = [delta for delta in deltas if delta.id not in targets]
+            deltas = _exclude_retracted(deltas, self.retracted_ids())
         if scope:
-            deltas = [delta for delta in deltas if _scope_matches(delta.scope, scope)]
+            deltas = _filter_records_by_scope(deltas, scope)
         if namespace is not None:
-            requested_namespace = namespace if isinstance(namespace, MemoryNamespace) else MemoryNamespace.model_validate(namespace)
-            requested = requested_namespace.model_dump(exclude_none=True)
-            deltas = [
-                delta for delta in deltas
-                if all(getattr(delta.namespace, key) == value for key, value in requested.items())
-            ]
-        return deltas[:limit] if limit is not None else deltas
+            deltas = _filter_records_by_namespace(deltas, namespace)
+        if limit is None:
+            return deltas
+        return deltas[:limit]
 
     def retracted_ids(self) -> set[str]:
         rows = self._connection.execute("SELECT payload_json FROM deltas WHERE kind='retraction'").fetchall()
@@ -972,72 +1165,14 @@ class SQLiteMemoryLogStore:
         """Check database structure, ordered records, references, and source bytes."""
 
         issues: list[str] = []
-        malformed_record_ids: list[str] = []
-        broken_evidence_refs: list[str] = []
+        database_ok, rows = self._validate_database(issues)
+        parsed, sequence_contiguous, malformed_record_ids = self._validate_delta_rows(rows, issues)
+        broken_evidence_refs = _broken_evidence_refs(parsed, issues)
         missing_source_ids: list[str] = []
         corrupted_source_ids: list[str] = []
         source_blobs_checked = 0
-        database_ok = False
-        rows: list[sqlite3.Row] = []
-        try:
-            quick_check = [str(row[0]) for row in self._connection.execute("PRAGMA quick_check").fetchall()]
-            database_ok = quick_check == ["ok"]
-            if not database_ok:
-                issues.extend(f"SQLite: {message}" for message in quick_check)
-            rows = self._connection.execute("SELECT * FROM deltas ORDER BY seq").fetchall()
-        except sqlite3.Error as exc:
-            issues.append(f"SQLite validation failed: {exc}")
-
-        parsed: list[MemoryRecord] = []
-        sequence_contiguous = True
-        for expected_seq, row in enumerate(rows, 1):
-            delta_id = str(row["id"]) if "id" in row.keys() else f"row:{expected_seq}"
-            try:
-                if int(row["seq"]) != expected_seq:
-                    sequence_contiguous = False
-                parsed.append(self._from_row(row))
-            except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                malformed_record_ids.append(delta_id)
-                issues.append(f"Malformed delta {delta_id}: {exc}")
-        if not sequence_contiguous:
-            issues.append("Trace sequence numbers are not contiguous from 1")
-
-        record_ids = {delta.id for delta in parsed}
-        for delta in parsed:
-            for evidence_id in delta.evidence_refs:
-                if evidence_id not in record_ids:
-                    broken_evidence_refs.append(f"{delta.id}->{evidence_id}")
-        if broken_evidence_refs:
-            issues.append(f"{len(broken_evidence_refs)} evidence references point to missing deltas")
-
         if check_source_blobs and database_ok:
-            source_rows = self._connection.execute(
-                "SELECT id,payload_json FROM sources WHERE status!='removed' ORDER BY created_at"
-            ).fetchall()
-            source_root = (self.root / "sources").resolve()
-            for row in source_rows:
-                source_id = str(row["id"])
-                try:
-                    source = SourceRecord.model_validate_json(row["payload_json"])
-                    path = (self.root / source.blob_path).resolve()
-                    if source_root not in path.parents or not path.is_file():
-                        missing_source_ids.append(source_id)
-                        continue
-                    source_blobs_checked += 1
-                    digest = hashlib.sha256()
-                    with path.open("rb") as handle:
-                        for block in iter(lambda: handle.read(1024 * 1024), b""):
-                            digest.update(block)
-                    if digest.hexdigest() != source.content_hash:
-                        corrupted_source_ids.append(source_id)
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    corrupted_source_ids.append(source_id)
-                    issues.append(f"Invalid source {source_id}: {exc}")
-            if missing_source_ids:
-                issues.append(f"{len(missing_source_ids)} retained source blobs are missing")
-            if corrupted_source_ids:
-                issues.append(f"{len(corrupted_source_ids)} retained source blobs failed SHA-256 validation")
-
+            missing_source_ids, corrupted_source_ids, source_blobs_checked = self._validate_source_blobs(issues)
         return StoreValidation(
             ok=database_ok and not issues,
             database_ok=database_ok,
@@ -1050,6 +1185,81 @@ class SQLiteMemoryLogStore:
             broken_evidence_refs=broken_evidence_refs,
             issues=issues,
         )
+
+    def _validate_database(self, issues: list[str]) -> tuple[bool, list[sqlite3.Row]]:
+        try:
+            quick_check = [str(row[0]) for row in self._connection.execute("PRAGMA quick_check").fetchall()]
+            database_ok = quick_check == ["ok"]
+            if not database_ok:
+                issues.extend(f"SQLite: {message}" for message in quick_check)
+            rows = self._connection.execute("SELECT * FROM deltas ORDER BY seq").fetchall()
+            return database_ok, rows
+        except sqlite3.Error as exc:
+            issues.append(f"SQLite validation failed: {exc}")
+            return False, []
+
+    def _validate_delta_rows(
+        self, rows: list[sqlite3.Row], issues: list[str],
+    ) -> tuple[list[MemoryRecord], bool, list[str]]:
+        parsed: list[MemoryRecord] = []
+        malformed_record_ids: list[str] = []
+        sequence_contiguous = True
+        for expected_seq, row in enumerate(rows, 1):
+            delta_id = str(row["id"]) if "id" in row.keys() else f"row:{expected_seq}"
+            try:
+                if int(row["seq"]) != expected_seq:
+                    sequence_contiguous = False
+                parsed.append(self._from_row(row))
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                malformed_record_ids.append(delta_id)
+                issues.append(f"Malformed delta {delta_id}: {exc}")
+        if not sequence_contiguous:
+            issues.append("Trace sequence numbers are not contiguous from 1")
+        return parsed, sequence_contiguous, malformed_record_ids
+
+    def _validate_source_blob_row(
+        self, row: sqlite3.Row, source_root: Path,
+    ) -> tuple[bool, bool, int, str | None]:
+        source_id = str(row["id"])
+        try:
+            source = SourceRecord.model_validate_json(row["payload_json"])
+            path = (self.root / source.blob_path).resolve()
+            if source_root not in path.parents or not path.is_file():
+                return True, False, 0, None
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != source.content_hash:
+                return False, True, 1, None
+            return False, False, 1, None
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return False, True, 0, f"Invalid source {source_id}: {exc}"
+
+    def _validate_source_blobs(self, issues: list[str]) -> tuple[list[str], list[str], int]:
+        missing_source_ids: list[str] = []
+        corrupted_source_ids: list[str] = []
+        source_blobs_checked = 0
+        source_rows = self._connection.execute(
+            "SELECT id,payload_json FROM sources WHERE status!='removed' ORDER BY created_at"
+        ).fetchall()
+        source_root = (self.root / "sources").resolve()
+        for row in source_rows:
+            source_id = str(row["id"])
+            missing, corrupted, checked, error = self._validate_source_blob_row(row, source_root)
+            if missing:
+                missing_source_ids.append(source_id)
+                continue
+            source_blobs_checked += checked
+            if corrupted:
+                corrupted_source_ids.append(source_id)
+            if error:
+                issues.append(error)
+        if missing_source_ids:
+            issues.append(f"{len(missing_source_ids)} retained source blobs are missing")
+        if corrupted_source_ids:
+            issues.append(f"{len(corrupted_source_ids)} retained source blobs failed SHA-256 validation")
+        return missing_source_ids, corrupted_source_ids, source_blobs_checked
 
     def history(self, delta_id: str) -> list[MemoryRecord]:
         events = []
@@ -1502,48 +1712,47 @@ class SQLiteMemoryLogStore:
         """Incrementally maintain disposable lexical/document/graph indexes."""
 
         if delta.kind == "retraction":
-            targets = list(dict.fromkeys(delta.payload.get("target_record_ids") or []))
-            if targets:
-                placeholders = ",".join("?" for _ in targets)
-                cursor.execute(
-                    f"UPDATE retrieval_documents SET active=0 WHERE delta_id IN ({placeholders})",
-                    targets,
-                )
-                cursor.execute(
-                    f"DELETE FROM retrieval_terms WHERE delta_id IN ({placeholders})",
-                    targets,
-                )
-                cursor.execute(
-                    f"DELETE FROM retrieval_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
-                    [*targets, *targets],
-                )
-                affected_recall_ids = self._dependent_record_ids_uncommitted(cursor, targets)
-                affected_placeholders = ",".join("?" for _ in affected_recall_ids)
-                cursor.execute(
-                    f"""UPDATE recall_records SET active=0,stale=1
-                        WHERE EXISTS (
-                            SELECT 1 FROM json_each(recall_records.evidence_refs_json)
-                            WHERE json_each.value IN ({affected_placeholders})
-                        )""",
-                    affected_recall_ids,
-                )
+            self._index_retraction_uncommitted(cursor, delta)
             return
         if delta.kind not in {"raw_source", "fact"} or not delta.text or delta.text == "[REMOVED]":
             return
-
         namespace_key = _json(delta.namespace.model_dump(mode="json", exclude_none=True))
-        raw_fields = delta.payload.get("retrieval_fields") or {}
-        fields = {
-            str(name): _field_text(value)
-            for name, value in raw_fields.items()
-            if _field_text(value)
-        } if isinstance(raw_fields, dict) else {}
-        modality = str(delta.payload.get("modality") or "text")
-        source_type = str(
-            delta.payload.get("source_type")
-            or (delta.scope.get("source_kind") if isinstance(delta.scope, dict) else None)
-            or modality
+        self._index_document_uncommitted(cursor, delta, namespace_key)
+        self._index_group_edges_uncommitted(cursor, delta, namespace_key)
+        self._index_entity_edges_uncommitted(cursor, delta, namespace_key)
+
+    def _index_retraction_uncommitted(self, cursor: Any, delta: MemoryRecord) -> None:
+        targets = list(dict.fromkeys(delta.payload.get("target_record_ids") or []))
+        if not targets:
+            return
+        placeholders = ",".join("?" for _ in targets)
+        cursor.execute(
+            f"UPDATE retrieval_documents SET active=0 WHERE delta_id IN ({placeholders})",
+            targets,
         )
+        cursor.execute(
+            f"DELETE FROM retrieval_terms WHERE delta_id IN ({placeholders})",
+            targets,
+        )
+        cursor.execute(
+            f"DELETE FROM retrieval_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+            [*targets, *targets],
+        )
+        affected_recall_ids = self._dependent_record_ids_uncommitted(cursor, targets)
+        affected_placeholders = ",".join("?" for _ in affected_recall_ids)
+        cursor.execute(
+            f"""UPDATE recall_records SET active=0,stale=1
+                WHERE EXISTS (
+                    SELECT 1 FROM json_each(recall_records.evidence_refs_json)
+                    WHERE json_each.value IN ({affected_placeholders})
+                )""",
+            affected_recall_ids,
+        )
+
+    def _index_document_uncommitted(
+        self, cursor: Any, delta: MemoryRecord, namespace_key: str,
+    ) -> None:
+        fields, modality, source_type = _retrieval_index_fields(delta)
         document = RetrievalDocument(
             id=delta.id,
             text=delta.text,
@@ -1578,20 +1787,29 @@ class SQLiteMemoryLogStore:
             [(delta.id, namespace_key, term, frequency) for term, frequency in counts.items()],
         )
 
-        if delta.group_id:
-            previous = cursor.execute(
-                """SELECT delta_id FROM retrieval_documents
-                   WHERE namespace_key=? AND group_id=? AND active=1 AND seq<?
-                   ORDER BY seq DESC LIMIT 1""",
-                (namespace_key, delta.group_id, delta.seq),
-            ).fetchone()
-            if previous:
-                self._put_retrieval_edge_uncommitted(
-                    cursor, namespace_key, str(previous["delta_id"]), delta.id, "followed_by", 1.0
-                )
-                self._put_retrieval_edge_uncommitted(
-                    cursor, namespace_key, delta.id, str(previous["delta_id"]), "followed_by", 0.8
-                )
+    def _index_group_edges_uncommitted(
+        self, cursor: Any, delta: MemoryRecord, namespace_key: str,
+    ) -> None:
+        if not delta.group_id:
+            return
+        previous = cursor.execute(
+            """SELECT delta_id FROM retrieval_documents
+               WHERE namespace_key=? AND group_id=? AND active=1 AND seq<?
+               ORDER BY seq DESC LIMIT 1""",
+            (namespace_key, delta.group_id, delta.seq),
+        ).fetchone()
+        if not previous:
+            return
+        self._put_retrieval_edge_uncommitted(
+            cursor, namespace_key, str(previous["delta_id"]), delta.id, "followed_by", 1.0
+        )
+        self._put_retrieval_edge_uncommitted(
+            cursor, namespace_key, delta.id, str(previous["delta_id"]), "followed_by", 0.8
+        )
+
+    def _index_entity_edges_uncommitted(
+        self, cursor: Any, delta: MemoryRecord, namespace_key: str,
+    ) -> None:
         entities = {_normal_index_entity(delta.subject), _normal_index_entity(delta.object)} - {""}
         for entity in entities:
             rows = cursor.execute(

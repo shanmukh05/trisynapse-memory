@@ -1,6 +1,6 @@
 # Operations
 
-This guide covers installation, the terminal, providers, source safety, service operation, backups, and releases. Read [Architecture](architecture.md) for the memory model and [API](api.md) for code contracts.
+This guide covers installation, the terminal, providers, source safety, service operation, backups, benchmarks, and releases. Read [Architecture](architecture.md) for the memory model and [API](api.md) for code contracts.
 
 ## Install or upgrade
 
@@ -67,7 +67,8 @@ commands. The empty panels also explain how to create the first record.
 
 Queries and ingestion run on background workers. An animated status line reports
 the current stage and elapsed time, so model loading, hybrid retrieval, Deep
-Recall, answer generation, and source preprocessing do not freeze the interface.
+Recall (the `deep_summary` stage), answer generation, and source preprocessing
+do not freeze the interface.
 Completed query stages remain visible in the transcript and are also stored in the
 durable query run.
 
@@ -433,39 +434,31 @@ JavaScript packages, installers, and `uv.lock` together; the tag check prevents 
 release when any surface disagrees. Use the version you are actually releasing in
 place of `0.2.0`.
 
-Retrieval and end-to-end benchmark artifacts must remain separate. CLI and REST benchmark runs copy the active store model choices into their isolated benchmark store. End-to-end runs require a completion selection plus its credential and record provider/model and prompt version/hash provenance.
+## Benchmarks
 
-During a CLI run, one progress bar follows dataset loading, case ingestion, Recall
-preparation, each question, store validation, and artifact writing. Library
-callers can receive the same structured events without taking a dependency on the
-terminal UI:
-
-```python
-from trisynapse_memory.benchmarks import BenchmarkProgress, run_benchmark
-
-def report(event: BenchmarkProgress) -> None:
-    print(event.stage, event.completed, event.total, event.description)
-
-result = run_benchmark(
-    "locomo",
-    "data/locomo",
-    max_questions=100,
-    sampling="stratified",
-    on_progress=report,
-)
-```
-
-Partial LoCoMo runs default to deterministic stratification across conversations and categories. Reproduce the old first-questions behavior with `sampling="sequential"` or `--sampling sequential`.
-
-Use a different authenticated provider for judging to avoid coupling the answer and judge models:
+Run `bench omni` from the repository root with its virtual environment active. The wrapper prepares a pinned upstream checkout under `var/omnimemeval` and uses upstream ingestion orchestration, answer prompts, judging, metrics, and reports. Trisynapse supplies only the memory backend.
 
 ```bash
-trisynapse-memory bench run locomo data/locomo \
-  --mode end-to-end --max-questions 100 --sampling stratified \
-  --judge-provider anthropic --judge-model claude-sonnet-4-5
+trisynapse-memory bench omni setup --install
+trisynapse-memory bench omni prepare beam100k --download
+trisynapse-memory bench omni run beam100k --name beam100k-full
+trisynapse-memory bench omni inspect beam100k --name beam100k-full
 ```
 
-Benchmark artifact schema 4 records pre-answer retrieval hits, route candidates, query steps, abstention, exact evidence-ID recall, citation quality, sampling mode, provider/prompt provenance, and a practical store-validation result. Retrieval recall is calculated before answer generation, so an LLM abstention cannot turn a successful retrieval into a reported miss.
+`prepare` reuses local datasets when possible. The research suites are `locomo`, `personamem` (text / 32K), `halumem` (Medium), `beam100k`, `longmemeval` (S), and `beam10m`. Use an `OPENAI_API_KEY` for both reader and judge, or set `ANSWER_API_KEY` and `EVAL_API_KEY` separately. Supply credentials through the shell, `.env.local`, or `--env /path/to/file`. The default ingestion and answer model is `gpt-4.1-mini-2025-04-14`. Judged QA uses `gpt-4o-mini-2024-07-18` by default. PersonaMem scores answer choices directly.
+
+Run controls include `--backend`, `--top-k`, `--workers`, `--llm-workers`, and `--num-runs`. Pass `--retrieval-config settings.json` to set Trisynapse retrieval options for a run. OmniMemEval interprets `--num-runs` as answer repeats for PersonaMem and judge repeats for the other suites. A partial run can stop at `--to-step 2` for ingestion and retrieval, then continue with the same settings and `--name`, `--resume`, and `--from-step 3`. `--memory-model none --to-step 2` runs an offline smoke check with local embeddings. Use a fresh name for a different model, dataset, or retrieval setting. Streaming suites support `--last-unit` for a zero-based prefix of benchmark units.
+
+Each named run under `data/omnimemeval/runs/` includes the upstream per-question search results, answer inputs and outputs, applicable judge outputs, metrics and reports, as well as `manifest.json`, `run.log`, and a source snapshot. Trisynapse stores per-user Trace records, query traces, returned hits and locators, and ingestion model requests, responses, and usage under the run. The manifest records dataset hashes, model IDs, provider endpoint fingerprints, prompt hashes, package versions, and attempts. Runtime credentials are passed through the environment.
+
+The local runner remains available for product diagnostics. Example:
+
+```bash
+trisynapse-memory bench run locomo --data-root data/locomo --mode retrieval --max-questions 25
+trisynapse-memory bench gate --mode retrieval --data-root data
+```
+
+Local YAML profiles live at `data/<suite>/bench.yaml`. The submitted experiment artifacts and earlier runs are under `data/archive/2026-11-20/`.
 
 ## Troubleshooting
 

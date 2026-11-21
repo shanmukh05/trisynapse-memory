@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -12,15 +13,31 @@ from trisynapse_memory.engine import MemoryEngine
 from trisynapse_memory.engine.models import MemoryNamespace, MemoryQueryResult, SearchHit
 
 
+def benchmark_tokens(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", value.lower())
+
+
+def overlap(left: str, right: str) -> bool:
+    """Check whether the candidate contains half of the reference's long words."""
+    left_tokens = {item for item in benchmark_tokens(left) if len(item) > 3}
+    right_tokens = set(benchmark_tokens(right))
+    return bool(left_tokens) and len(left_tokens & right_tokens) / len(left_tokens) >= 0.5
+
+
 @dataclass(frozen=True)
 class BenchmarkQuestion:
-    """A normalized question produced by a dataset adapter."""
+    """A normalized question produced by a dataset adapter.
+
+    ``choices`` are MCQ distractors. End-to-end PersonaMem scoring uses them
+    with ``gold``; retrieval still searches ``question`` only.
+    """
 
     id: str
     question: str
     gold: str
     evidence: Any = None
     evidence_text: str = ""
+    choices: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

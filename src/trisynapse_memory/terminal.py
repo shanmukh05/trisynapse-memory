@@ -1,4 +1,10 @@
-"""Interactive Textual terminal for Trisynapse Memory."""
+"""Interactive Textual terminal for Trisynapse Memory.
+
+Owns the operator TUI: grounded query prompt, slash commands, and the
+provider/model picker. Engine I/O stays in ``MemoryEngine``; this module only
+renders status and starts the same operations the CLI exposes. Do not invent
+store or retrieval semantics here.
+"""
 
 from __future__ import annotations
 
@@ -124,24 +130,34 @@ def _expects_memory_id(value: str, command: str) -> bool:
     return command == "/remove" or " " not in remainder
 
 
+def _path_lookup(fragment: str) -> tuple[Path, str, str]:
+    if "/" not in fragment:
+        return Path("."), fragment, ""
+    raw_directory, prefix = fragment.rsplit("/", 1)
+    lookup = Path(raw_directory or "/" if fragment.startswith("/") else raw_directory or ".").expanduser()
+    display_prefix = f"{raw_directory}/" if raw_directory else "/" if fragment.startswith("/") else ""
+    return lookup, prefix, display_prefix
+
+
+def _matching_path_children(lookup: Path, prefix: str) -> list[Path]:
+    return sorted(
+        (
+            child
+            for child in lookup.iterdir()
+            if " " not in child.name and child.name.casefold().startswith(prefix.casefold())
+        ),
+        key=lambda child: (not child.is_dir(), child.name.casefold()),
+    )
+
+
 def _path_suggestions(fragment: str, *, limit: int = 8) -> list[str]:
     """Return safe, display-ready path completions for an unfinished token."""
 
     if fragment.startswith(("http://", "https://")) or any(character in fragment for character in "\"'"):
         return []
-    if "/" in fragment:
-        raw_directory, prefix = fragment.rsplit("/", 1)
-        lookup = Path(raw_directory or "/" if fragment.startswith("/") else raw_directory or ".").expanduser()
-        display_prefix = f"{raw_directory}/" if raw_directory else "/" if fragment.startswith("/") else ""
-    else:
-        prefix = fragment
-        lookup = Path(".")
-        display_prefix = ""
+    lookup, prefix, display_prefix = _path_lookup(fragment)
     try:
-        children = sorted(
-            (child for child in lookup.iterdir() if " " not in child.name and child.name.casefold().startswith(prefix.casefold())),
-            key=lambda child: (not child.is_dir(), child.name.casefold()),
-        )
+        children = _matching_path_children(lookup, prefix)
     except OSError:
         return []
     return [f"{display_prefix}{child.name}{'/' if child.is_dir() else ''}" for child in children[:limit]]
@@ -158,10 +174,10 @@ class MemorySuggester(Suggester):
         if not value.startswith("/"):
             return None
         if " " not in value:
-            for command in COMMAND_HELP:
-                if command.casefold().startswith(value.casefold()) and command != value:
-                    return command + (" " if command in COMMANDS_WITH_ARGUMENTS else "")
-            return None
+            return _complete_command(value)
+        return self._complete_argument(value)
+
+    def _complete_argument(self, value: str) -> str | None:
         command = value.split(" ", 1)[0].casefold()
         fragment = value.rsplit(" ", 1)[-1]
         base = value[: len(value) - len(fragment)]
@@ -169,10 +185,34 @@ class MemorySuggester(Suggester):
             paths = _path_suggestions(fragment, limit=1)
             return base + paths[0] if paths else None
         if command in MEMORY_ID_COMMANDS and _expects_memory_id(value, command):
-            for memory_id in self._memory_ids():
-                if memory_id.casefold().startswith(fragment.casefold()) and memory_id != fragment:
-                    return base + memory_id
+            return _complete_memory_id(base, fragment, self._memory_ids())
         return None
+
+
+def _complete_command(value: str) -> str | None:
+    for command in COMMAND_HELP:
+        if command.casefold().startswith(value.casefold()) and command != value:
+            return command + (" " if command in COMMANDS_WITH_ARGUMENTS else "")
+    return None
+
+
+def _complete_memory_id(base: str, fragment: str, memory_ids: list[str]) -> str | None:
+    for memory_id in memory_ids:
+        if memory_id.casefold().startswith(fragment.casefold()) and memory_id != fragment:
+            return base + memory_id
+    return None
+
+
+def _model_matches_fragment(item: ModelDescriptor, fragment: str) -> bool:
+    if not fragment:
+        return True
+    return fragment in item.id.casefold() or fragment in item.display_name.casefold()
+
+
+def _model_choice_label(item: ModelDescriptor) -> str:
+    vision = " · vision" if item.vision else ""
+    context = f" · {item.context_length:,} ctx" if item.context_length else ""
+    return f"{item.display_name}{vision}{context}"
 
 
 class CompletionInput(Input):
@@ -309,23 +349,17 @@ class ModelSelectorScreen(ModalScreen[bool]):
 
     def _filter_models(self) -> None:
         fragment = self.query_one("#model-search", Input).value.casefold().strip()
-        values = [
-            item for item in self.models
-            if not fragment or fragment in item.id.casefold() or fragment in item.display_name.casefold()
-        ]
+        values = [item for item in self.models if _model_matches_fragment(item, fragment)]
         choice = self.query_one("#model-choice", Select)
-        choice.set_options([
-            (
-                f"{item.display_name}{' · vision' if item.vision else ''}{f' · {item.context_length:,} ctx' if item.context_length else ''}",
-                item.id,
-            )
-            for item in values[:500]
-        ])
+        choice.set_options([(_model_choice_label(item), item.id) for item in values[:500]])
+        self._select_current_filtered_model(choice, values)
+
+    def _select_current_filtered_model(self, choice: Select, values: list[ModelDescriptor]) -> None:
         configuration = self.engine.get_model_configuration()
         current = configuration.completion if self._role() == ProviderRole.COMPLETION else configuration.embedding
-        if current.provider == self.query_one("#model-provider", Select).value and any(
-            item.id == current.model for item in values
-        ):
+        if current.provider != self.query_one("#model-provider", Select).value:
+            return
+        if any(item.id == current.model for item in values):
             choice.value = current.model
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -345,48 +379,55 @@ class ModelSelectorScreen(ModalScreen[bool]):
         if event.button.id == "model-refresh":
             self._load_models(refresh=True)
             return
-        role = self._role()
         provider_value = self.query_one("#model-provider", Select).value
         if provider_value is Select.BLANK:
             self.query_one("#model-message", Static).update("[red]Choose a provider.[/]")
             return
-        provider = str(provider_value)
+        try:
+            self._handle_model_action(str(event.button.id), str(provider_value))
+        except Exception as exc:
+            self.query_one("#model-message", Static).update(f"[red]{exc}[/]")
+
+    def _handle_model_action(self, button_id: str, provider: str) -> None:
+        selection = self._selection_from_form(provider)
+        if button_id == "model-test":
+            self.query_one("#model-message", Static).update(
+                "[cyan]Testing connection… This may incur a provider charge.[/]"
+            )
+            self._test_connection(self._role(), selection)
+            return
+        self._apply_model_selection(self._role(), selection)
+
+    def _selection_from_form(self, provider: str) -> ProviderSelection:
         model_value = self.query_one("#model-choice", Select).value
         manual = self.query_one("#model-search", Input).value.strip()
         model = None if provider == "none" else (
             str(model_value) if model_value is not Select.BLANK else manual or None
         )
-        try:
-            selection = ProviderSelection(
-                provider=provider,
-                model=model,
-                base_url=self.query_one("#model-base-url", Input).value or None,
-            )
-            if event.button.id == "model-test":
-                self.query_one("#model-message", Static).update(
-                    "[cyan]Testing connection… This may incur a provider charge.[/]"
-                )
-                self._test_connection(role, selection)
-                return
-            configuration = self.engine.get_model_configuration()
-            changed_embedding = role == ProviderRole.EMBEDDING and selection != configuration.embedding
-            if changed_embedding and not self.query_one("#model-rebuild", Checkbox).value:
-                self.query_one("#model-message", Static).update(
-                    "[yellow]Select Yes to approve the required embedding rebuild.[/]"
-                )
-                return
-            if role == ProviderRole.COMPLETION:
-                configuration.completion = selection
-            else:
-                configuration.embedding = selection
+        return ProviderSelection(
+            provider=provider,
+            model=model,
+            base_url=self.query_one("#model-base-url", Input).value or None,
+        )
+
+    def _apply_model_selection(self, role: ProviderRole, selection: ProviderSelection) -> None:
+        configuration = self.engine.get_model_configuration()
+        changed_embedding = role == ProviderRole.EMBEDDING and selection != configuration.embedding
+        if changed_embedding and not self.query_one("#model-rebuild", Checkbox).value:
             self.query_one("#model-message", Static).update(
-                "[cyan]Rebuilding embedding index…[/]"
-                if changed_embedding
-                else "[cyan]Saving model configuration…[/]"
+                "[yellow]Select Yes to approve the required embedding rebuild.[/]"
             )
-            self._save_model_configuration(configuration, changed_embedding)
-        except Exception as exc:
-            self.query_one("#model-message", Static).update(f"[red]{exc}[/]")
+            return
+        if role == ProviderRole.COMPLETION:
+            configuration.completion = selection
+        else:
+            configuration.embedding = selection
+        self.query_one("#model-message", Static).update(
+            "[cyan]Rebuilding embedding index…[/]"
+            if changed_embedding
+            else "[cyan]Saving model configuration…[/]"
+        )
+        self._save_model_configuration(configuration, changed_embedding)
 
     @work(thread=True, group="model-test", exclusive=True)
     def _test_connection(self, role: ProviderRole, selection: ProviderSelection) -> None:
@@ -895,23 +936,24 @@ class MemoryTerminal(App[None]):
             return "[dim]Press Enter for a grounded query with citations · type / for operations[/]"
         command = value.split(" ", 1)[0].casefold()
         if " " not in value and command not in COMMAND_HELP:
-            matches = [
-                f"[bold]{name}[/] [dim]{description}[/]"
-                for name, (_, description) in COMMAND_HELP.items()
-                if name.startswith(command)
-            ]
-            return "   ".join(matches[:4]) or "[red]No matching command[/] · use /help"
+            return _matching_command_hints(command)
         if command not in COMMAND_HELP:
             return "[red]Unknown command[/] · use /help"
+        return self._command_usage_hint(command, value)
+
+    def _command_usage_hint(self, command: str, value: str) -> str:
         usage, description = COMMAND_HELP[command]
-        context: list[str] = []
-        fragment = value.rsplit(" ", 1)[-1] if " " in value else ""
-        if command == "/ingest" and " " in value:
-            context = _path_suggestions(fragment, limit=3)
-        elif command in MEMORY_ID_COMMANDS and _expects_memory_id(value, command):
-            context = [memory_id for memory_id in self._memory_ids() if memory_id.startswith(fragment)][:3]
+        context = self._recommendation_context(command, value)
         suffix = f" · [cyan]{'   '.join(context)}[/]" if context else ""
         return f"[bold]{usage}[/] [dim]— {description}[/]{suffix}"
+
+    def _recommendation_context(self, command: str, value: str) -> list[str]:
+        fragment = value.rsplit(" ", 1)[-1] if " " in value else ""
+        if command == "/ingest" and " " in value:
+            return _path_suggestions(fragment, limit=3)
+        if command in MEMORY_ID_COMMANDS and _expects_memory_id(value, command):
+            return [memory_id for memory_id in self._memory_ids() if memory_id.startswith(fragment)][:3]
+        return []
 
     def _memory_ids(self) -> list[str]:
         page = self.engine.list(namespace=self.namespace, limit=500, include_retracted=True)
@@ -921,114 +963,130 @@ class MemoryTerminal(App[None]):
         parts = shlex.split(value)
         command = parts[0].lower()
         args = parts[1:]
-        activity = self.query_one("#activity", RichLog)
-        log = activity
-        if command in {"/exit", "/quit"}:
-            self.exit()
-        elif command == "/clear":
-            log.clear()
-        elif command == "/help":
-            log.write(
-                "[bold]Query[/] plain text\n"
-                "/ingest SOURCE...  /sources  /search QUERY  /timeline  /history ID\n"
-                "/correct ID TEXT  /forget ID REASON  /remove ID... --yes  /jobs\n"
-                "/namespace [PROJECT]  /model [completion|embedding]  /check  /config  /clear  /exit"
-            )
-        elif command == "/ingest":
-            if not args:
-                raise ValueError("usage: /ingest SOURCE...")
-            self.query_one(TabbedContent).active = "sources-tab"
-            sources = [_source_from_argument(item) for item in args]
-            self._start_operation(
-                f"Reading and preprocessing {len(sources)} source{'s' if len(sources) != 1 else ''}"
-            )
-            self._run_ingestion(sources)
-        elif command == "/sources":
-            self._start_operation("Loading retained sources")
-            self._run_command(
-                lambda: self.engine.list_sources(namespace=self.namespace),
-                self._sources_finished,
-            )
-        elif command == "/search":
-            if not args:
-                raise ValueError("usage: /search QUERY")
-            self._start_operation("Filtering private search data")
-            self._run_search(" ".join(args))
-        elif command in {"/timeline", "/jobs"}:
-            if command == "/timeline":
-                self._start_operation("Loading Trace timeline")
-                self._run_command(
-                    lambda: self.engine.list(namespace=self.namespace),
-                    self._timeline_finished,
-                )
-            else:
-                self._start_operation("Loading durable jobs")
-                self._run_command(self.engine.list_jobs, self._jobs_finished)
-        elif command == "/history":
-            if not args:
-                raise ValueError("usage: /history ID")
-            self._start_operation("Loading memory history")
-            self._run_command(
-                lambda: self.engine.history(args[0], namespace=self.namespace),
-                self._history_finished,
-            )
-        elif command == "/correct":
-            if len(args) < 2:
-                raise ValueError("usage: /correct ID TEXT")
-            self._start_operation("Writing memory correction")
-            self._run_command(
-                lambda: self.engine.correct(
-                    record_id=args[0],
-                    text=" ".join(args[1:]),
-                    namespace=self.namespace,
-                ),
-                self._memory_operation_finished,
-            )
-        elif command == "/forget":
-            if len(args) < 2:
-                raise ValueError("usage: /forget ID REASON")
-            self._start_operation("Retracting memory")
-            self._run_command(
-                lambda: self.engine.forget(
-                    record_id=args[0],
-                    reason=" ".join(args[1:]),
-                    namespace=self.namespace,
-                ),
-                self._memory_operation_finished,
-            )
-        elif command == "/remove":
-            if "--yes" not in args:
-                raise ValueError("physical removal cannot be undone; use /remove ID... --yes")
-            record_ids = [item for item in args if item != "--yes"]
-            if not record_ids:
-                raise ValueError("usage: /remove ID... --yes")
-            self._start_operation(f"Removing {len(record_ids)} memory record(s)")
-            self._run_command(
-                lambda: self.engine.remove(
-                    record_ids=record_ids,
-                    reason="interactive removal",
-                    namespace=self.namespace,
-                ),
-                self._memory_operation_finished,
-            )
-        elif command == "/namespace":
-            if args:
-                self.namespace = MemoryNamespace(project_id=args[0])
-            log.write(str(self.namespace.model_dump(exclude_none=True)))
-            self._update_config_view()
-            self._refresh_panels()
-        elif command == "/model":
-            role = ProviderRole(args[0]) if args else ProviderRole.COMPLETION
-            self.push_screen(ModelSelectorScreen(self.engine, role), self._model_updated)
-        elif command == "/check":
-            self._start_operation("Checking installation and memory store")
-            self._run_command(self.engine.check, self._check_finished)
-        elif command == "/config":
-            self.query_one(TabbedContent).active = "config-tab"
-            self._update_config_view()
-            activity.write("[green]Configuration opened.[/]")
-        else:
+        self.query_one("#activity", RichLog)
+        handler = _SLASH_COMMANDS.get(command)
+        if handler is None:
             raise ValueError(f"unknown command: {command}; use /help")
+        handler(self, args)
+
+    def _cmd_exit(self, _args: list[str]) -> None:
+        self.exit()
+
+    def _cmd_clear(self, _args: list[str]) -> None:
+        self.query_one("#activity", RichLog).clear()
+
+    def _cmd_help(self, _args: list[str]) -> None:
+        self.query_one("#activity", RichLog).write(
+            "[bold]Query[/] plain text\n"
+            "/ingest SOURCE...  /sources  /search QUERY  /timeline  /history ID\n"
+            "/correct ID TEXT  /forget ID REASON  /remove ID... --yes  /jobs\n"
+            "/namespace [PROJECT]  /model [completion|embedding]  /check  /config  /clear  /exit"
+        )
+
+    def _cmd_ingest(self, args: list[str]) -> None:
+        if not args:
+            raise ValueError("usage: /ingest SOURCE...")
+        self.query_one(TabbedContent).active = "sources-tab"
+        sources = [_source_from_argument(item) for item in args]
+        self._start_operation(
+            f"Reading and preprocessing {len(sources)} source{'s' if len(sources) != 1 else ''}"
+        )
+        self._run_ingestion(sources)
+
+    def _cmd_sources(self, _args: list[str]) -> None:
+        self._start_operation("Loading retained sources")
+        self._run_command(
+            lambda: self.engine.list_sources(namespace=self.namespace),
+            self._sources_finished,
+        )
+
+    def _cmd_search(self, args: list[str]) -> None:
+        if not args:
+            raise ValueError("usage: /search QUERY")
+        self._start_operation("Filtering private search data")
+        self._run_search(" ".join(args))
+
+    def _cmd_timeline(self, _args: list[str]) -> None:
+        self._start_operation("Loading Trace timeline")
+        self._run_command(
+            lambda: self.engine.list(namespace=self.namespace),
+            self._timeline_finished,
+        )
+
+    def _cmd_jobs(self, _args: list[str]) -> None:
+        self._start_operation("Loading durable jobs")
+        self._run_command(self.engine.list_jobs, self._jobs_finished)
+
+    def _cmd_history(self, args: list[str]) -> None:
+        if not args:
+            raise ValueError("usage: /history ID")
+        self._start_operation("Loading memory history")
+        self._run_command(
+            lambda: self.engine.history(args[0], namespace=self.namespace),
+            self._history_finished,
+        )
+
+    def _cmd_correct(self, args: list[str]) -> None:
+        if len(args) < 2:
+            raise ValueError("usage: /correct ID TEXT")
+        self._start_operation("Writing memory correction")
+        self._run_command(
+            lambda: self.engine.correct(
+                record_id=args[0],
+                text=" ".join(args[1:]),
+                namespace=self.namespace,
+            ),
+            self._memory_operation_finished,
+        )
+
+    def _cmd_forget(self, args: list[str]) -> None:
+        if len(args) < 2:
+            raise ValueError("usage: /forget ID REASON")
+        self._start_operation("Retracting memory")
+        self._run_command(
+            lambda: self.engine.forget(
+                record_id=args[0],
+                reason=" ".join(args[1:]),
+                namespace=self.namespace,
+            ),
+            self._memory_operation_finished,
+        )
+
+    def _cmd_remove(self, args: list[str]) -> None:
+        if "--yes" not in args:
+            raise ValueError("physical removal cannot be undone; use /remove ID... --yes")
+        record_ids = [item for item in args if item != "--yes"]
+        if not record_ids:
+            raise ValueError("usage: /remove ID... --yes")
+        self._start_operation(f"Removing {len(record_ids)} memory record(s)")
+        self._run_command(
+            lambda: self.engine.remove(
+                record_ids=record_ids,
+                reason="interactive removal",
+                namespace=self.namespace,
+            ),
+            self._memory_operation_finished,
+        )
+
+    def _cmd_namespace(self, args: list[str]) -> None:
+        if args:
+            self.namespace = MemoryNamespace(project_id=args[0])
+        self.query_one("#activity", RichLog).write(str(self.namespace.model_dump(exclude_none=True)))
+        self._update_config_view()
+        self._refresh_panels()
+
+    def _cmd_model(self, args: list[str]) -> None:
+        role = ProviderRole(args[0]) if args else ProviderRole.COMPLETION
+        self.push_screen(ModelSelectorScreen(self.engine, role), self._model_updated)
+
+    def _cmd_check(self, _args: list[str]) -> None:
+        self._start_operation("Checking installation and memory store")
+        self._run_command(self.engine.check, self._check_finished)
+
+    def _cmd_config(self, _args: list[str]) -> None:
+        self.query_one(TabbedContent).active = "config-tab"
+        self._update_config_view()
+        self.query_one("#activity", RichLog).write("[green]Configuration opened.[/]")
 
     def _refresh_status(self) -> None:
         storage_ready = self.engine.store.is_ready()
@@ -1068,6 +1126,36 @@ class MemoryTerminal(App[None]):
             self._refresh_status()
             self._update_config_view()
             self.query_one("#activity", RichLog).write("[green]Model configuration updated.[/]")
+
+
+def _matching_command_hints(command: str) -> str:
+    matches = [
+        f"[bold]{name}[/] [dim]{description}[/]"
+        for name, (_, description) in COMMAND_HELP.items()
+        if name.startswith(command)
+    ]
+    return "   ".join(matches[:4]) or "[red]No matching command[/] · use /help"
+
+
+_SLASH_COMMANDS: dict[str, Callable[[MemoryTerminal, list[str]], None]] = {
+    "/exit": MemoryTerminal._cmd_exit,
+    "/quit": MemoryTerminal._cmd_exit,
+    "/clear": MemoryTerminal._cmd_clear,
+    "/help": MemoryTerminal._cmd_help,
+    "/ingest": MemoryTerminal._cmd_ingest,
+    "/sources": MemoryTerminal._cmd_sources,
+    "/search": MemoryTerminal._cmd_search,
+    "/timeline": MemoryTerminal._cmd_timeline,
+    "/jobs": MemoryTerminal._cmd_jobs,
+    "/history": MemoryTerminal._cmd_history,
+    "/correct": MemoryTerminal._cmd_correct,
+    "/forget": MemoryTerminal._cmd_forget,
+    "/remove": MemoryTerminal._cmd_remove,
+    "/namespace": MemoryTerminal._cmd_namespace,
+    "/model": MemoryTerminal._cmd_model,
+    "/check": MemoryTerminal._cmd_check,
+    "/config": MemoryTerminal._cmd_config,
+}
 
 
 def _source_from_argument(value: str) -> SourceInput:

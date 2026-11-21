@@ -1,4 +1,10 @@
-"""Generic coding-agent lifecycle events for automatic capture and context injection."""
+"""Generic coding-agent lifecycle events for automatic capture and context injection.
+
+Owns the event schema and the capture path that turns a hook payload into a
+raw source (or a compiled profile). Durable text is chosen by event type;
+``MemoryEngine`` still owns persistence. Session-start and pre-compact events
+are read-only context lookups and must not write the log.
+"""
 
 from __future__ import annotations
 
@@ -62,21 +68,52 @@ def capture_agent_event(engine: MemoryEngine, event: AgentEvent | dict[str, Any]
 
 
 def _event_text(event: AgentEvent) -> str:
-    if event.type == "user_prompt":
-        return f"User prompt: {event.content or ''}".strip()
-    if event.type == "pre_tool":
-        return f"Tool planned: {event.tool_name or 'unknown'} input={_bounded(event.input)}"
-    if event.type in {"post_tool", "post_tool_failure"}:
-        status = "failed" if event.type == "post_tool_failure" else "completed"
-        return f"Tool {event.tool_name or 'unknown'} {status}. Output: {(event.output or '')[:8000]}".strip()
-    if event.type in {"subagent_start", "subagent_stop"}:
-        return f"{event.type.replace('_', ' ')}: {event.content or _bounded(event.metadata)}"
-    if event.type in {"stop", "session_end"}:
-        return f"Session ended: {event.content or 'No explicit summary supplied.'}"
-    return event.content or ""
+    formatter = _EVENT_TEXT.get(event.type)
+    if formatter is None:
+        return event.content or ""
+    return formatter(event)
+
+
+def _user_prompt_text(event: AgentEvent) -> str:
+    return f"User prompt: {event.content or ''}".strip()
+
+
+def _pre_tool_text(event: AgentEvent) -> str:
+    return f"Tool planned: {event.tool_name or 'unknown'} input={_bounded(event.input)}"
+
+
+def _post_tool_text(event: AgentEvent) -> str:
+    return _tool_result_text(event, "completed")
+
+
+def _post_tool_failure_text(event: AgentEvent) -> str:
+    return _tool_result_text(event, "failed")
+
+
+def _tool_result_text(event: AgentEvent, status: str) -> str:
+    return f"Tool {event.tool_name or 'unknown'} {status}. Output: {(event.output or '')[:8000]}".strip()
+
+
+def _subagent_text(event: AgentEvent) -> str:
+    return f"{event.type.replace('_', ' ')}: {event.content or _bounded(event.metadata)}"
+
+
+def _session_end_text(event: AgentEvent) -> str:
+    return f"Session ended: {event.content or 'No explicit summary supplied.'}"
+
+
+_EVENT_TEXT = {
+    "user_prompt": _user_prompt_text,
+    "pre_tool": _pre_tool_text,
+    "post_tool": _post_tool_text,
+    "post_tool_failure": _post_tool_failure_text,
+    "subagent_start": _subagent_text,
+    "subagent_stop": _subagent_text,
+    "stop": _session_end_text,
+    "session_end": _session_end_text,
+}
 
 
 def _bounded(value: Any) -> str:
     text = str(value or "")
     return text[:8000]
-

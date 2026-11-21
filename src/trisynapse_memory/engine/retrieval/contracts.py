@@ -173,18 +173,14 @@ class TemporalRoute:
         asks_when = plan.query_kind == "temporal"
         if not cues and not asks_when:
             return []
-        event_terms = set(plan.terms) - {"when", "what", "year", "date", "did", "does", "was", "were", "before", "after", "last", "next"}
-        scores = []
-        for item in context.items.values():
-            blob = f"{item.temporal_anchor or ''} {item.observed_at or ''} {item.index_text}".casefold()
-            cue_score = sum(cue in blob for cue in cues) / max(len(cues), 1)
-            lexical = len(event_terms & set(lexical_tokens(item.index_text))) / max(len(event_terms), 1)
-            has_time = bool(item.temporal_anchor or item.observed_at)
-            score = 0.55 * cue_score + 0.35 * lexical + (0.10 if has_time else 0.0)
-            if asks_when and not has_time:
-                score *= 0.45
-            scores.append((item.id, score))
-        return _sorted_scores(scores)
+        event_terms = set(plan.terms) - {
+            "when", "what", "year", "date", "did", "does", "was", "were",
+            "before", "after", "last", "next",
+        }
+        return _sorted_scores(
+            _temporal_item_score(item, cues, event_terms, asks_when)
+            for item in context.items.values()
+        )
 
 
 class GraphRoute:
@@ -309,6 +305,22 @@ def route_weights(profile: str, overrides: dict[str, float] | None = None) -> di
     weights.update(PROFILE_ROUTE_WEIGHTS.get(profile, {}))
     weights.update(overrides or {})
     return weights
+
+
+def _temporal_item_score(
+    item: Any,
+    cues: list[str],
+    event_terms: set[str],
+    asks_when: bool,
+) -> tuple[str, float]:
+    blob = f"{item.temporal_anchor or ''} {item.observed_at or ''} {item.index_text}".casefold()
+    cue_score = sum(cue in blob for cue in cues) / max(len(cues), 1)
+    lexical = len(event_terms & set(lexical_tokens(item.index_text))) / max(len(event_terms), 1)
+    has_time = bool(item.temporal_anchor or item.observed_at)
+    score = 0.55 * cue_score + 0.35 * lexical + (0.10 if has_time else 0.0)
+    if asks_when and not has_time:
+        score *= 0.45
+    return item.id, score
 
 
 def _sorted_scores(values: Any) -> list[tuple[str, float]]:

@@ -1,4 +1,10 @@
-"""LongMemEval dataset adapter."""
+"""LongMemEval dataset adapter.
+
+Owns haystack-session flattening and session-id evidence scoring for
+LongMemEval JSON lists. The shared runner still ingests through
+``MemoryEngine``. ``lme:`` group prefixes and source-ref ids must stay stable
+so published recall metrics remain comparable.
+"""
 
 from __future__ import annotations
 
@@ -67,30 +73,38 @@ class LongMemEvalAdapter(BenchmarkAdapter):
         *,
         retrieval_hits: list[SearchHit] | None = None,
     ) -> dict[str, Any]:
-        retrieval_hits = retrieval_hits or []
         prefix = f"lme:{question.id}:"
-        cited_sessions = {
-            str(citation.source_ref.get("id", "")).removeprefix(prefix)
-            for citation in result.citations
-            if isinstance(citation.source_ref, dict)
-        }
-        retrieved_sessions = {
-            str(hit.source_ref.get("id", "")).removeprefix(prefix)
-            for hit in retrieval_hits
-            if isinstance(hit.source_ref, dict)
-        }
+        cited_sessions = _source_session_ids(result.citations, prefix)
+        retrieved_sessions = _source_session_ids(retrieval_hits or [], prefix)
         evidence = set(question.evidence or ())
-        retrieved_evidence = evidence & retrieved_sessions
-        cited_evidence = evidence & cited_sessions
-        return {
-            **question.metadata,
-            "gold_evidence_ids": sorted(evidence),
-            "retrieved_ids": sorted(retrieved_sessions),
-            "cited_ids": sorted(cited_sessions),
-            "evidence_hit": bool(retrieved_evidence),
-            "evidence_hit_at_k": bool(retrieved_evidence),
-            "evidence_recall_at_k": len(retrieved_evidence) / len(evidence) if evidence else None,
-            "all_evidence_retrieved": bool(evidence) and evidence <= retrieved_sessions,
-            "citation_evidence_recall": len(cited_evidence) / len(evidence) if evidence else None,
-            "citation_precision": len(cited_evidence) / len(cited_sessions) if cited_sessions else None,
-        }
+        return _session_overlap_metadata(question.metadata, evidence, retrieved_sessions, cited_sessions)
+
+
+def _source_session_ids(items: Iterable[Any], prefix: str) -> set[str]:
+    return {
+        str(item.source_ref.get("id", "")).removeprefix(prefix)
+        for item in items
+        if isinstance(item.source_ref, dict)
+    }
+
+
+def _session_overlap_metadata(
+    metadata: dict[str, Any],
+    evidence: set[str],
+    retrieved_sessions: set[str],
+    cited_sessions: set[str],
+) -> dict[str, Any]:
+    retrieved_evidence = evidence & retrieved_sessions
+    cited_evidence = evidence & cited_sessions
+    return {
+        **metadata,
+        "gold_evidence_ids": sorted(evidence),
+        "retrieved_ids": sorted(retrieved_sessions),
+        "cited_ids": sorted(cited_sessions),
+        "evidence_hit": bool(retrieved_evidence),
+        "evidence_hit_at_k": bool(retrieved_evidence),
+        "evidence_recall_at_k": len(retrieved_evidence) / len(evidence) if evidence else None,
+        "all_evidence_retrieved": bool(evidence) and evidence <= retrieved_sessions,
+        "citation_evidence_recall": len(cited_evidence) / len(evidence) if evidence else None,
+        "citation_precision": len(cited_evidence) / len(cited_sessions) if cited_sessions else None,
+    }

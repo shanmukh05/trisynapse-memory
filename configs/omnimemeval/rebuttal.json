@@ -1,0 +1,380 @@
+{
+  "defaults": {
+    "memory_model": "gpt-4.1-mini-2025-04-14",
+    "embedding_model": "all-MiniLM-L6-v2",
+    "answer_model": "gpt-4.1-mini-2025-04-14",
+    "judge_model": "gpt-4o-mini-2024-07-18",
+    "top_k": 20,
+    "workers": 4,
+    "llm_workers": 10,
+    "num_runs": 1
+  },
+  "groups": {
+    "first": ["locomo-full", "locomo-raw-hybrid"],
+    "beam100k-halumem": ["beam100k-full", "halumem-qa"],
+    "fast": [
+      "locomo-full",
+      "locomo-raw-hybrid",
+      "personamem-pilot",
+      "beam100k-full",
+      "locomo-raw-bm25",
+      "locomo-raw-dense",
+      "locomo-no-graph",
+      "locomo-no-claims",
+      "locomo-no-summaries",
+      "locomo-no-reranker",
+      "locomo-no-rrf",
+      "locomo-raw-readout",
+      "locomo-ranked-readout"
+    ],
+    "robustness": [
+      "locomo-full-repeat-2",
+      "locomo-full-repeat-3",
+      "locomo-full-second-judge",
+      "locomo-raw-hybrid-repeat-2",
+      "locomo-raw-hybrid-repeat-3",
+      "locomo-raw-hybrid-second-judge"
+    ],
+    "sensitivity": [
+      "locomo-gate-low",
+      "locomo-gate-high",
+      "locomo-rrf-low",
+      "locomo-rrf-high",
+      "locomo-topk-low",
+      "locomo-topk-high"
+    ],
+    "locomo-personamem-full": [
+      "locomo-full",
+      "locomo-raw-hybrid",
+      "locomo-raw-bm25",
+      "locomo-raw-dense",
+      "locomo-no-graph",
+      "locomo-no-claims",
+      "locomo-no-summaries",
+      "locomo-no-reranker",
+      "locomo-no-rrf",
+      "locomo-raw-readout",
+      "locomo-ranked-readout",
+      "locomo-full-repeat-2",
+      "locomo-full-repeat-3",
+      "locomo-full-second-judge",
+      "locomo-raw-hybrid-repeat-2",
+      "locomo-raw-hybrid-repeat-3",
+      "locomo-raw-hybrid-second-judge",
+      "locomo-gate-low",
+      "locomo-gate-high",
+      "locomo-rrf-low",
+      "locomo-rrf-high",
+      "locomo-topk-low",
+      "locomo-topk-high",
+      "personamem-full"
+    ]
+  },
+  "runs": [
+    {
+      "name": "locomo-ingest",
+      "suite": "locomo",
+      "priority": "first",
+      "options": {
+        "to_step": 1
+      }
+    },
+    {
+      "name": "locomo-full",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/full.json"
+      }
+    },
+    {
+      "name": "locomo-raw-hybrid",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/raw-hybrid.json"
+      }
+    },
+    {
+      "name": "locomo-memos",
+      "suite": "locomo",
+      "priority": "matched-baseline",
+      "options": {
+        "backend": "memos"
+      }
+    },
+    {
+      "name": "locomo-raw-bm25",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/raw-bm25.json"
+      }
+    },
+    {
+      "name": "locomo-raw-dense",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/raw-dense.json"
+      }
+    },
+    {
+      "name": "locomo-no-graph",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/no-graph.json"
+      }
+    },
+    {
+      "name": "locomo-no-claims",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/no-claims.json"
+      }
+    },
+    {
+      "name": "locomo-no-summaries",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/no-summaries.json"
+      }
+    },
+    {
+      "name": "locomo-no-reranker",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/no-reranker.json"
+      }
+    },
+    {
+      "name": "locomo-no-rrf",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/no-rrf.json"
+      }
+    },
+    {
+      "name": "locomo-raw-readout",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/raw-readout.json"
+      }
+    },
+    {
+      "name": "locomo-ranked-readout",
+      "suite": "locomo",
+      "priority": "ablation",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/ranked-readout.json"
+      }
+    },
+    {
+      "name": "personamem-pilot",
+      "suite": "personamem",
+      "priority": "next-dataset",
+      "options": {
+        "last_unit": 15
+      }
+    },
+    {
+      "name": "personamem-memos-pilot",
+      "suite": "personamem",
+      "priority": "matched-baseline",
+      "options": {
+        "last_unit": 15,
+        "backend": "memos"
+      }
+    },
+    {
+      "name": "beam100k-full",
+      "suite": "beam100k",
+      "priority": "next-dataset",
+      "options": {}
+    },
+    {
+      "name": "personamem-full",
+      "suite": "personamem",
+      "priority": "stretch",
+      "options": {}
+    },
+    {
+      "name": "personamem-memos-full",
+      "suite": "personamem",
+      "priority": "matched-baseline",
+      "options": {
+        "backend": "memos"
+      }
+    },
+    {
+      "name": "halumem-qa",
+      "suite": "halumem",
+      "priority": "stretch",
+      "options": {}
+    },
+    {
+      "name": "locomo-full-repeat-2",
+      "suite": "locomo",
+      "priority": "robustness",
+      "options": {
+        "reuse": "locomo-full",
+        "from_step": 3,
+        "retrieval_config": "locomo/full.json"
+      }
+    },
+    {
+      "name": "locomo-full-repeat-3",
+      "suite": "locomo",
+      "priority": "robustness",
+      "options": {
+        "reuse": "locomo-full",
+        "from_step": 3,
+        "retrieval_config": "locomo/full.json"
+      }
+    },
+    {
+      "name": "locomo-full-second-judge",
+      "suite": "locomo",
+      "priority": "robustness",
+      "options": {
+        "reuse": "locomo-full",
+        "from_step": 4,
+        "judge_model": "gpt-4.1-2025-04-14",
+        "retrieval_config": "locomo/full.json"
+      }
+    },
+    {
+      "name": "locomo-raw-hybrid-repeat-2",
+      "suite": "locomo",
+      "priority": "robustness",
+      "options": {
+        "reuse": "locomo-raw-hybrid",
+        "from_step": 3,
+        "retrieval_config": "locomo/raw-hybrid.json"
+      }
+    },
+    {
+      "name": "locomo-raw-hybrid-repeat-3",
+      "suite": "locomo",
+      "priority": "robustness",
+      "options": {
+        "reuse": "locomo-raw-hybrid",
+        "from_step": 3,
+        "retrieval_config": "locomo/raw-hybrid.json"
+      }
+    },
+    {
+      "name": "locomo-raw-hybrid-second-judge",
+      "suite": "locomo",
+      "priority": "robustness",
+      "options": {
+        "reuse": "locomo-raw-hybrid",
+        "from_step": 4,
+        "judge_model": "gpt-4.1-2025-04-14",
+        "retrieval_config": "locomo/raw-hybrid.json"
+      }
+    },
+    {
+      "name": "locomo-gate-low",
+      "suite": "locomo",
+      "priority": "sensitivity",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/gate-low.json"
+      }
+    },
+    {
+      "name": "locomo-gate-high",
+      "suite": "locomo",
+      "priority": "sensitivity",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/gate-high.json"
+      }
+    },
+    {
+      "name": "locomo-rrf-low",
+      "suite": "locomo",
+      "priority": "sensitivity",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/rrf-low.json"
+      }
+    },
+    {
+      "name": "locomo-rrf-high",
+      "suite": "locomo",
+      "priority": "sensitivity",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "retrieval_config": "locomo/rrf-high.json"
+      }
+    },
+    {
+      "name": "locomo-topk-low",
+      "suite": "locomo",
+      "priority": "sensitivity",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "top_k": 16,
+        "retrieval_config": "locomo/full.json"
+      }
+    },
+    {
+      "name": "locomo-topk-high",
+      "suite": "locomo",
+      "priority": "sensitivity",
+      "options": {
+        "reuse": "locomo-ingest",
+        "from_step": 2,
+        "top_k": 24,
+        "retrieval_config": "locomo/full.json"
+      }
+    },
+    {
+      "name": "longmemeval-s",
+      "suite": "longmemeval",
+      "priority": "later",
+      "options": {}
+    },
+    {
+      "name": "beam10m-full",
+      "suite": "beam10m",
+      "priority": "later",
+      "options": {}
+    }
+  ]
+}

@@ -1,4 +1,8 @@
-"""Data contracts for the ingest, memory-log, and index engine."""
+"""Public data contracts for ingest, the memory log, retrieval, and inspection.
+
+These Pydantic models are the shared schema for Python, REST, and Studio.
+Engine modules import from here; they must not invent parallel payload shapes.
+"""
 
 from __future__ import annotations
 
@@ -267,7 +271,15 @@ class RetrievalConfiguration(EngineModel):
     max_refinement_rounds: int = Field(default=2, ge=0, le=2)
     graph_hops: int = Field(default=2, ge=0, le=4)
     confidence_margin: float = Field(default=0.018, ge=0, le=1)
+    confidence_floor: float = Field(default=0.12, ge=0, le=1)
     deep_summary_enabled: bool = True
+    claims_enabled: bool = True
+    group_summaries_enabled: bool = True
+    reranker_enabled: bool = True
+    raw_candidates_only: bool = False
+    readout: Literal["grounded", "raw_sources", "ranked"] = "grounded"
+    fusion: Literal["weighted_rrf", "round_robin"] = "weighted_rrf"
+    rrf_rank_constant: int = Field(default=60, ge=1)
     answer_abstain_threshold: float = Field(default=0.10, ge=0, le=1)
     retrieval_profile: Literal[
         "auto", "balanced", "precise", "broad", "mixed", "code", "table",
@@ -446,16 +458,25 @@ class SourceInput(EngineModel):
 
     @model_validator(mode="after")
     def _has_payload(self) -> "SourceInput":
-        choices = [self.path, self.url, self.text, self.content_base64]
-        if sum(value is not None for value in choices) != 1:
-            raise ValueError("source requires exactly one of path, url, text, or content_base64")
-        if self.kind == "git" and self.url is None:
-            raise ValueError("git sources require url")
-        if self.kind == "url" and self.url is None:
-            raise ValueError("url sources require url")
-        if self.kind in {"directory", "archive"} and self.path is None and self.content_base64 is None:
-            raise ValueError(f"{self.kind} sources require path or content_base64")
+        error = _source_payload_error(self)
+        if error:
+            raise ValueError(error)
         return self
+
+
+def _source_payload_error(source: SourceInput) -> str | None:
+    provided = sum(
+        value is not None for value in (source.path, source.url, source.text, source.content_base64)
+    )
+    if provided != 1:
+        return "source requires exactly one of path, url, text, or content_base64"
+    if source.kind == "git" and source.url is None:
+        return "git sources require url"
+    if source.kind == "url" and source.url is None:
+        return "url sources require url"
+    if source.kind in {"directory", "archive"} and source.path is None and source.content_base64 is None:
+        return f"{source.kind} sources require path or content_base64"
+    return None
 
 
 class SourceRecord(EngineModel):

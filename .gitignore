@@ -18,7 +18,13 @@ var/
 .env.*
 !.env.example
 design_docs/
-data/
+data/**
+!data/*/
+!data/*/bench.yaml
+data/dolphinbench/release/
+data/dolphinbench/runs/
 docs/local/
 .cursor/
 packages/studio/test-results/
+
+aamas_2027_template/

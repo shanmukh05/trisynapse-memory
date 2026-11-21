@@ -23,11 +23,16 @@ from trisynapse_memory.engine.providers.embedding import (
 )
 from trisynapse_memory.engine.providers.registry import (
     AnthropicCompletion,
+    OpenAICompatibleCompletion,
     ProviderSettings,
+    complete_json_parallel,
     completion_from_settings,
     embedding_cache_key,
     fetch_model_catalog,
+    gemini_json_thinking_config,
     list_provider_descriptors,
+    openai_json_chat_payload,
+    parse_json_response,
 )
 from trisynapse_memory.engine.providers import registry as provider_module
 
@@ -108,6 +113,30 @@ def test_anthropic_uses_native_messages_and_image_shapes(monkeypatch) -> None:
     image = calls[1]["payload"]["messages"][0]["content"][0]
     assert image["type"] == "image"
     assert image["source"]["media_type"] == "image/png"
+
+
+def test_openai_json_omits_temperature_for_gpt_5_models() -> None:
+    luna = openai_json_chat_payload("gpt-5.6-luna", [{"role": "user", "content": "hi"}])
+    mini = openai_json_chat_payload("gpt-4o-mini", [{"role": "user", "content": "hi"}])
+    routed = openai_json_chat_payload("openai/gpt-5.6-luna", [{"role": "user", "content": "hi"}])
+    assert "temperature" not in luna
+    assert "temperature" not in routed
+    assert mini["temperature"] == 0
+
+
+def test_openai_compatible_luna_complete_json_omits_temperature(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    def fake_post(url, payload, api_key, timeout):
+        calls.append({"url": url, "payload": payload})
+        return {"choices": [{"message": {"content": '{"status":"ok"}'}}]}
+
+    monkeypatch.setattr(provider_module, "_post_json", fake_post)
+    completion = OpenAICompatibleCompletion(
+        ProviderSettings(provider="openai", model="gpt-5.6-luna", api_key="secret")
+    )
+    assert completion.complete_json("system", "user") == {"status": "ok"}
+    assert "temperature" not in calls[0]["payload"]
 
 
 def test_qwen_models_are_catalog_entries_not_a_direct_provider(monkeypatch) -> None:
@@ -274,3 +303,73 @@ def test_cli_exposes_check_and_model_commands(tmp_path) -> None:
     assert disabled.exit_code == 0
     obsolete = "doc" + "tor"
     assert runner.invoke(app, [obsolete]).exit_code != 0
+
+
+def test_parse_json_response_accepts_fences_and_trailing_text() -> None:
+    payload = {"facts": [{"text": "Maya prefers tea."}]}
+    encoded = json.dumps(payload)
+    assert parse_json_response(encoded) == payload
+    assert parse_json_response(f"```json\n{encoded}\n```") == payload
+    assert parse_json_response(f"{encoded}\nHere is another object\n{{\"facts\": []}}") == payload
+    assert parse_json_response(f"Sure.\n{encoded}\n") == payload
+    with pytest.raises(ValueError, match="invalid JSON"):
+        parse_json_response("not json")
+    with pytest.raises(ValueError, match="not an object"):
+        parse_json_response("[1, 2]")
+
+
+def test_complete_json_parallel_retries_invalid_json_then_succeeds() -> None:
+    calls = {"n": 0}
+
+    def complete(system: str, user: str) -> dict:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ValueError("completion returned invalid JSON: Unterminated string starting at")
+        return {"id": user}
+
+    assert complete_json_parallel(complete, [("sys", "ok")]) == [{"id": "ok"}]
+    assert calls["n"] == 3
+
+
+def test_complete_json_parallel_keeps_successful_items_when_one_fails() -> None:
+    seen: list[str] = []
+
+    def complete(system: str, user: str) -> dict:
+        if user == "bad":
+            raise ValueError("completion returned invalid JSON: Unterminated string starting at")
+        return {"id": user}
+
+    with pytest.raises(ValueError, match="invalid JSON"):
+        complete_json_parallel(
+            complete,
+            [("sys", "a"), ("sys", "bad"), ("sys", "c")],
+            max_workers=3,
+            on_item=lambda _index, payload: seen.append(str(payload["id"])),
+        )
+    assert set(seen) == {"a", "c"}
+
+
+def test_complete_json_parallel_preserves_request_order() -> None:
+    def complete(system: str, user: str) -> dict:
+        return {"id": user, "system": system}
+
+    results = complete_json_parallel(
+        complete,
+        [("sys-a", "a"), ("sys-b", "b"), ("sys-c", "c")],
+        max_workers=3,
+    )
+    assert [item["id"] for item in results] == ["a", "b", "c"]
+    assert [item["system"] for item in results] == ["sys-a", "sys-b", "sys-c"]
+
+
+def test_gemini_json_thinking_config_for_flash_models() -> None:
+    from google.genai import types
+
+    flash = gemini_json_thinking_config("gemini-3.5-flash", types)
+    assert flash is not None
+    assert flash.thinking_level == types.ThinkingLevel.MINIMAL
+    budgeted = gemini_json_thinking_config("gemini-2.5-flash", types)
+    assert budgeted is not None
+    assert budgeted.thinking_budget == 0
+    assert gemini_json_thinking_config("gemini-2.5-flash-lite", types) is None
+    assert gemini_json_thinking_config("gemini-3-pro-preview", types) is None

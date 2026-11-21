@@ -1,0 +1,29 @@
+# uv run python -m trisynapse_memory.benchmarks data/locomo/bench.yaml --profile ingest/retrieval/end-to-end
+suite: locomo
+data_root: .
+
+models:
+  completion:
+    provider: gemini
+    model: gemini-3.7-flash
+  embedding:
+    provider: sentence-transformers
+    model: all-MiniLM-L6-v2
+
+sampling: stratified
+
+profiles:
+  ingest:
+    stage: ingest
+    mode: end-to-end
+  retrieval:
+    stage: query
+    mode: retrieval
+    # max_questions: 100
+  end-to-end:
+    stage: query
+    mode: end-to-end
+    # max_questions: 25
+    judge:
+      provider: gemini
+      model: gemini-3.7-flash

@@ -1,4 +1,10 @@
-"""Typer/Rich command line and Textual entry point."""
+"""Typer/Rich command line and Textual entry point.
+
+Owns operator commands for ingest, models, jobs, and benchmarks. The
+interactive TTY path opens ``terminal.run_terminal``; other commands call
+``MemoryEngine`` directly. This module does not invent store or retrieval
+semantics — it only validates flags and prints results.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,7 @@ import os
 import secrets
 import sys
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -16,7 +23,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from rich.table import Table
 
 from trisynapse_memory.engine import MemoryEngine, SourceInput
-from trisynapse_memory.engine.models import MemoryNamespace, ProviderRole, ProviderSelection
+from trisynapse_memory.engine.models import MemoryNamespace, ModelConfiguration, ProviderRole, ProviderSelection
 
 
 _T = TypeVar("_T")
@@ -161,7 +168,7 @@ def _run_with_status(ctx: typer.Context, description: str, operation: Callable[[
 
 def _run_benchmark_with_progress(
     ctx: typer.Context,
-    max_questions: int,
+    max_questions: int | None,
     operation: Callable[[Callable[[Any], None] | None], _T],
 ) -> _T:
     """Render structured benchmark events as one stable progress bar."""
@@ -186,7 +193,7 @@ def _run_benchmark_with_progress(
                 task_id,
                 description=event.description,
                 completed=event.completed,
-                total=max(event.total, 1),
+                total=max(event.total, 1) if event.total else None,
             )
 
         return operation(update)
@@ -679,62 +686,70 @@ def models_test(ctx: typer.Context, role: ProviderRole = typer.Option(..., "--ro
 @bench_app.command("run")
 def bench_run(
     ctx: typer.Context,
-    suite: str,
+    suite: str | None = typer.Argument(None, help="Benchmark suite, or omit when --config sets it"),
     data_root: str | None = None,
-    max_questions: int = 25,
-    mode: str = "retrieval",
-    sampling: str = typer.Option("auto", help="auto, stratified, or sequential"),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        help="YAML benchmark config, dataset directory, or packaged suite name",
+    ),
+    profile: str | None = typer.Option(None, help="Named profile from the YAML config (ingest, retrieval, end-to-end)"),
+    max_questions: int | None = typer.Option(
+        None,
+        help="Cap evaluated questions. Omit to use YAML; 0 evaluates the full dataset.",
+    ),
+    mode: str | None = typer.Option(None, help="retrieval or end-to-end"),
+    sampling: str | None = typer.Option(None, help="auto, stratified, or sequential"),
+    stage: str | None = typer.Option(None, help="auto, ingest, or query"),
+    rebuild_store: bool = typer.Option(False, help="Delete the persisted model store before ingesting"),
     judge_provider: str | None = typer.Option(None, help="Optional independent judge provider"),
     judge_model: str | None = typer.Option(None, help="Model for the independent judge"),
     judge_base_url: str | None = typer.Option(None, help="Custom judge provider base URL"),
 ) -> None:
-    state = _state(ctx)
-    if sampling not in {"auto", "stratified", "sequential"}:
-        raise typer.BadParameter("sampling must be auto, stratified, or sequential")
-    if bool(judge_provider) != bool(judge_model):
-        raise typer.BadParameter("--judge-provider and --judge-model must be provided together")
-    judge_selection = (
-        ProviderSelection(provider=judge_provider, model=judge_model, base_url=judge_base_url)
-        if judge_provider and judge_model
-        else None
-    )
-    engine = state.engine()
-    model_configuration = engine.get_model_configuration()
-    engine.close()
-    if suite in {"halumem", "memorydoc"}:
-        from trisynapse_memory.benchmarks import run_trace_recall_smoke
+    from trisynapse_memory.benchmarks import run_benchmark
+    from trisynapse_memory.benchmarks.config import load_benchmark_config, run_resolved_benchmark
 
-        value = _run_benchmark_with_progress(
-            ctx,
-            max_questions,
-            lambda on_progress: run_trace_recall_smoke(
-                suite,
-                data_root or f"data/{suite}",
-                max_questions=max_questions,
-                mode=mode,
-                model_configuration=model_configuration,
-                on_progress=on_progress,
-                sampling=sampling,
-                judge_selection=judge_selection,
-            ),
+    _validate_bench_flags(sampling, stage, mode, judge_provider, judge_model)
+    judge_selection = _bench_judge_selection(judge_provider, judge_model, judge_base_url)
+    config = _coerce_bench_config(config, profile, suite)
+    if config is None:
+        if suite is None:
+            raise typer.BadParameter("suite is required unless --config is set")
+        run = partial(
+            run_benchmark,
+            suite,
+            data_root or f"data/{suite}",
+            max_questions=max_questions if max_questions != 0 else None,
+            mode=mode or "retrieval",
+            model_configuration=_bench_model_configuration(ctx),
+            sampling=sampling or "auto",
+            stage=stage or "auto",
+            rebuild_store=rebuild_store,
+            judge_selection=judge_selection,
         )
     else:
-        from trisynapse_memory.benchmarks import run_trace_recall_benchmark
-
-        value = _run_benchmark_with_progress(
-            ctx,
-            max_questions,
-            lambda on_progress: run_trace_recall_benchmark(
-                suite,
-                data_root or f"data/{suite}",
+        try:
+            resolved = load_benchmark_config(
+                config,
+                profile=profile,
+                suite=suite,
+                data_root=data_root,
                 max_questions=max_questions,
                 mode=mode,
-                model_configuration=model_configuration,
-                on_progress=on_progress,
                 sampling=sampling,
-                judge_selection=judge_selection,
-            ),
+                stage=stage,
+                rebuild_store=True if rebuild_store else None,
+                judge=judge_selection.model_dump(mode="json") if judge_selection is not None else None,
+            )
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        run = partial(
+            run_resolved_benchmark,
+            resolved,
+            fallback_model_configuration=None if resolved.models is not None else _bench_model_configuration(ctx),
         )
+        max_questions = resolved.max_questions
+    value = _run_benchmark_with_progress(ctx, max_questions, lambda on_progress: run(on_progress=on_progress))
     _emit(ctx, value)
 
 
@@ -750,6 +765,60 @@ def bench_gate(ctx: typer.Context, data_root: str = "data", mode: str = "retriev
     _emit(ctx, value)
     if not value["passed"]:
         raise typer.Exit(1)
+
+
+@bench_app.command(
+    "omni",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True, "help_option_names": []},
+)
+def bench_omni(ctx: typer.Context) -> None:
+    """Prepare, run, or inspect a published OmniMemEval benchmark."""
+    from trisynapse_memory.benchmarks.omnimemeval import main
+
+    raise typer.Exit(main(ctx.args or ["--help"]))
+
+
+def _validate_bench_flags(
+    sampling: str | None,
+    stage: str | None,
+    mode: str | None,
+    judge_provider: str | None,
+    judge_model: str | None,
+) -> None:
+    if sampling is not None and sampling not in {"auto", "stratified", "sequential"}:
+        raise typer.BadParameter("sampling must be auto, stratified, or sequential")
+    if stage is not None and stage not in {"auto", "ingest", "query"}:
+        raise typer.BadParameter("stage must be auto, ingest, or query")
+    if mode is not None and mode not in {"retrieval", "end-to-end"}:
+        raise typer.BadParameter("mode must be retrieval or end-to-end")
+    if bool(judge_provider) != bool(judge_model):
+        raise typer.BadParameter("--judge-provider and --judge-model must be provided together")
+
+
+def _bench_judge_selection(
+    judge_provider: str | None,
+    judge_model: str | None,
+    judge_base_url: str | None,
+) -> ProviderSelection | None:
+    if not (judge_provider and judge_model):
+        return None
+    return ProviderSelection(provider=judge_provider, model=judge_model, base_url=judge_base_url)
+
+
+def _coerce_bench_config(config: Path | None, profile: str | None, suite: str | None) -> Path | None:
+    if config is not None or profile is None:
+        return config
+    if suite is None:
+        raise typer.BadParameter("suite or --config is required with --profile")
+    return Path(suite)
+
+
+def _bench_model_configuration(ctx: typer.Context) -> ModelConfiguration:
+    engine = _state(ctx).engine()
+    try:
+        return engine.get_model_configuration()
+    finally:
+        engine.close()
 
 
 def _source_argument(value: str) -> SourceInput:

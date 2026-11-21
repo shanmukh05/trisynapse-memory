@@ -304,6 +304,7 @@ Namespaces isolate memory by project and optionally by user, agent, and session.
 | [Algorithms](docs/algorithms.md) | Study mathematical formulas, RRF, confidence margin, and grounding |
 | [API and interfaces](docs/api.md) | Use Python, REST, SSE, TypeScript, or CLI contracts |
 | [Operations](docs/operations.md) | Configure providers, deploy Studio, back up, restore, or troubleshoot |
+| [Benchmark results](docs/benchmarks.md) | Find active OmniMemEval results and benchmark protocols |
 | [Release notes](docs/releases/) | See what changed in each version |
 | [Contributing](CONTRIBUTING.md) | Set up development and submit changes |
 | [Security](SECURITY.md) | Understand the deployment boundary or report a vulnerability |
@@ -332,16 +333,16 @@ pnpm --filter @trisynapse/trisynapse-memory check
 pnpm --filter @trisynapse/studio test
 ```
 
-Benchmark adapters support LoCoMo, LongMemEval, HaluMem, and MemoryDoc. Retrieval mode measures the evidence pipeline without answer-generation calls; end-to-end mode adds provider-backed formation, answering, and judging.
+Use OmniMemEval for shared-harness quality measurements. Supported suites include LoCoMo, PersonaMem-v2, HaluMem-Medium, BEAM-100K, LongMemEval-S, and optional BEAM-10M.
 
 ```bash
-trisynapse-memory bench run locomo \
-  --mode retrieval --data-root data/locomo --max-questions 100
-
-trisynapse-memory bench gate --mode retrieval --data-root data
+trisynapse-memory bench omni setup --install
+trisynapse-memory bench omni prepare locomo --download
+trisynapse-memory bench omni run locomo --name locomo-full
+trisynapse-memory bench omni inspect locomo --name locomo-full
 ```
 
-See the [benchmark operations guide](docs/operations.md) before treating a result as a release gate.
+The runtime reads OpenAI credentials from your shell or `.env.local`. Use `--backend memos` with the required MemOS credentials for a comparison in the same harness. The local `bench run` and `bench gate` commands serve Trace & Recall diagnostics and release checks. See the [benchmark operations guide](docs/operations.md#benchmarks) for stage and artifact details.
 
 ## License
 

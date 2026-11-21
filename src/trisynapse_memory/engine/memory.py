@@ -1,4 +1,9 @@
-"""Public ingest, memory-log, and index memory engine."""
+"""Public ingest, memory-log, and index memory engine.
+
+MemoryEngine is the orchestration facade. Graph assembly, provider
+bootstrap, ingestion commits, and job-handler details live in private
+helpers in this module.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ import shutil
 import time
 import zipfile
 from collections import defaultdict
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,7 +28,8 @@ from trisynapse_memory.engine.indexes.claims import (
 )
 from trisynapse_memory.engine.indexes import inspect as index_inspect
 from trisynapse_memory.engine.providers.embedding import Embedder, SentenceTransformerEmbedder, UnavailableEmbedder
-from trisynapse_memory.engine.ingest.pipeline import extract_facts, ingest_document, ingest_raw_source
+from trisynapse_memory.engine.ingest.pipeline import extract_facts_many, ingest_document, ingest_raw_source
+from trisynapse_memory.engine.providers.registry import DEFAULT_COMPLETION_PARALLEL_WORKERS
 from trisynapse_memory.engine.models import (
     Actor,
     Citation,
@@ -71,6 +78,7 @@ from trisynapse_memory.engine.providers.registry import (
     EmbeddingRebuildRequired,
     ProviderError,
     ProviderSettings,
+    complete_json_parallel,
     completion_from_settings,
     embedder_from_settings,
     embedding_cache_key,
@@ -79,6 +87,7 @@ from trisynapse_memory.engine.providers.registry import (
     provider_descriptor,
     provider_provenance,
     settings_from_selection,
+    skippable_completion_error,
     validate_selection,
 )
 from trisynapse_memory.engine.retrieval.engine import HybridRetriever, RetrieverConfig, classify_query
@@ -204,44 +213,18 @@ class MemoryEngine:
         managed_embedding = embedder is None and embedding_provider is None and embedding_model == "all-MiniLM-L6-v2"
         managed_completion = completion is None and completion_provider is None
         provider_errors: dict[str, str] = {}
-        if embedder is not None:
-            provider = embedder
-        else:
-            embedding_settings = embedding_provider or settings_from_selection(configuration.embedding)
-            if embedding_provider is None and embedding_model != "all-MiniLM-L6-v2":
-                embedding_settings = ProviderSettings(
-                    provider="sentence-transformers", model=embedding_model
-                )
-            try:
-                provider = embedder_from_settings(embedding_settings)
-                if isinstance(provider, SentenceTransformerEmbedder):
-                    provider.local_files_only = local_files_only
-            except ProviderError as exc:
-                provider_errors["embedding"] = str(exc)
-                selection = configuration.embedding
-                provider = UnavailableEmbedder(
-                    selection.model or "unknown",
-                    embedding_cache_key(
-                        selection.provider, selection.base_url, selection.model or "unknown"
-                    ),
-                    str(exc),
-                )
-        if completion is not None:
-            completion_callable = completion
-        else:
-            completion_settings = completion_provider or settings_from_selection(configuration.completion)
-            try:
-                completion_callable = completion_from_settings(completion_settings)
-            except ProviderError as exc:
-                provider_errors["completion"] = str(exc)
-                completion_callable = None
-        legacy_names = retrieval_routes.names if retrieval_routes else RouteRegistry().names
-        if extension_registry is not None:
-            if tuple(extensions):
-                raise ValueError("pass extensions or extension_registry, not both")
-            registry = _finalize_extension_registry(extension_registry, legacy_names)
-        else:
-            registry = _build_extension_registry(extensions, legacy_route_names=legacy_names)
+        provider = _resolve_open_embedder(
+            embedder,
+            embedding_provider,
+            embedding_model,
+            configuration,
+            local_files_only,
+            provider_errors,
+        )
+        completion_callable = _resolve_open_completion(
+            completion, completion_provider, configuration, provider_errors
+        )
+        registry = _resolve_open_registry(extensions, extension_registry, retrieval_routes)
         engine = cls(
             store,
             embedder=provider,
@@ -352,32 +335,10 @@ class MemoryEngine:
         wait: bool = False,
         expected_revision: int | None = None,
     ) -> ModelConfigurationChange:
-        requested = (
-            configuration
-            if isinstance(configuration, ModelConfiguration)
-            else ModelConfiguration.model_validate(configuration)
-        )
+        requested = _coerce_model_configuration(configuration)
         validate_selection(requested.completion, ProviderRole.COMPLETION)
         validate_selection(requested.embedding, ProviderRole.EMBEDDING)
-        selection_warnings: list[str] = []
-        for role, selection in (
-            (ProviderRole.COMPLETION, requested.completion),
-            (ProviderRole.EMBEDDING, requested.embedding),
-        ):
-            if selection.provider == "none":
-                continue
-            descriptor = self.store.find_cached_model(selection.provider, selection.model or "")
-            if descriptor is not None and role not in descriptor.roles:
-                raise ProviderError(
-                    f"model {selection.model} is not cataloged for {role.value}"
-                )
-            if descriptor is None and not (
-                selection.provider == "sentence-transformers"
-                and selection.model == "all-MiniLM-L6-v2"
-            ):
-                selection_warnings.append(
-                    f"{selection.provider}/{selection.model} was accepted as an unverified custom model ID"
-                )
+        selection_warnings = _model_selection_warnings(self.store, requested)
         current, pending, _, _ = self.store.get_model_configuration_state()
         expected = expected_revision if expected_revision is not None else requested.revision
         if expected != current.revision:
@@ -388,38 +349,63 @@ class MemoryEngine:
         completion_changed = requested.completion != current.completion
         if pending is not None and embedding_changed:
             raise ValueError("an embedding rebuild is already pending")
-
         if completion_changed:
-            active = current.model_copy(deep=True)
-            active.completion = requested.completion
-            current = self.store.save_model_configuration(
-                active, expected_revision=current.revision
-            )
-
+            current = self._save_completion_selection(current, requested.completion)
         if not embedding_changed:
-            self._sync_model_configuration(force=True)
-            return ModelConfigurationChange(
-                status="applied",
-                configuration=current,
-                message="; ".join(selection_warnings) or None,
-            )
+            return self._applied_model_change(current, selection_warnings)
+        return self._apply_embedding_configuration(
+            current,
+            requested,
+            selection_warnings,
+            confirm_embedding_rebuild=confirm_embedding_rebuild,
+            wait=wait,
+        )
 
+    def _save_completion_selection(
+        self, current: ModelConfiguration, completion: ProviderSelection
+    ) -> ModelConfiguration:
+        active = current.model_copy(deep=True)
+        active.completion = completion
+        return self.store.save_model_configuration(
+            active, expected_revision=current.revision
+        )
+
+    def _applied_model_change(
+        self,
+        current: ModelConfiguration,
+        warnings: list[str],
+        extra_messages: tuple[str, ...] = (),
+    ) -> ModelConfigurationChange:
+        self._sync_model_configuration(force=True)
+        parts = [*extra_messages, *warnings]
+        return ModelConfigurationChange(
+            status="applied",
+            configuration=current,
+            message="; ".join(parts) or None,
+        )
+
+    def _apply_embedding_configuration(
+        self,
+        current: ModelConfiguration,
+        requested: ModelConfiguration,
+        warnings: list[str],
+        *,
+        confirm_embedding_rebuild: bool,
+        wait: bool,
+    ) -> ModelConfigurationChange:
         if not self.store.has_searchable_content():
             active = current.model_copy(deep=True)
             active.embedding = requested.embedding
             current = self.store.save_model_configuration(
                 active, expected_revision=current.revision
             )
-            self._sync_model_configuration(force=True)
-            return ModelConfigurationChange(
-                status="applied",
-                configuration=current,
-                message="; ".join([
+            return self._applied_model_change(
+                current,
+                warnings,
+                extra_messages=(
                     "Embedding configuration changed immediately because the store is empty.",
-                    *selection_warnings,
-                ]),
+                ),
             )
-
         if not confirm_embedding_rebuild:
             raise EmbeddingRebuildRequired(
                 "changing the embedding provider, endpoint, or model requires a complete vector rebuild; "
@@ -430,7 +416,10 @@ class MemoryEngine:
         job = self.store.enqueue_job(
             "rebuild_embeddings",
             {"embedding": requested.embedding.model_dump(mode="json")},
-            dedup_key=f"rebuild-embeddings:{current.revision}:{requested.embedding.provider}:{requested.embedding.base_url}:{requested.embedding.model}",
+            dedup_key=(
+                f"rebuild-embeddings:{current.revision}:{requested.embedding.provider}:"
+                f"{requested.embedding.base_url}:{requested.embedding.model}"
+            ),
             max_attempts=3,
         )
         self.store.stage_embedding_configuration(target, job.id)
@@ -442,18 +431,22 @@ class MemoryEngine:
             rebuild_required=True,
             message="; ".join([
                 "The old embedding index remains active until the rebuild succeeds.",
-                *selection_warnings,
+                *warnings,
             ]),
         )
-        if wait:
-            for _ in range(1000):
-                state = self.store.get_job(job.id)
-                if state is None or state.status in {"completed", "failed"}:
-                    break
-                self.run_jobs(max_jobs=1)
-            self._sync_model_configuration(force=True)
-            return self.get_model_configuration_status()
-        return change
+        if not wait:
+            return change
+        self._wait_for_job(job)
+        self._sync_model_configuration(force=True)
+        return self.get_model_configuration_status()
+
+    def _wait_for_job(self, job: MemoryJob) -> MemoryJob | None:
+        for _ in range(1000):
+            state = self.store.get_job(job.id)
+            if state is None or state.status in {"completed", "failed"}:
+                break
+            self.run_jobs(max_jobs=1)
+        return self.store.get_job(job.id)
 
     def test_model_connection(
         self,
@@ -462,11 +455,7 @@ class MemoryEngine:
     ) -> ConnectionTestResult:
         provider_role = role if isinstance(role, ProviderRole) else ProviderRole(role)
         current = self.get_model_configuration()
-        selected = (
-            current.completion if provider_role == ProviderRole.COMPLETION else current.embedding
-        ) if selection is None else (
-            selection if isinstance(selection, ProviderSelection) else ProviderSelection.model_validate(selection)
-        )
+        selected = _coerce_connection_selection(provider_role, current, selection)
         validate_selection(selected, provider_role)
         if selected.provider == "none":
             return ConnectionTestResult(
@@ -474,20 +463,11 @@ class MemoryEngine:
                 message="No completion provider is selected.", billed_request=False,
             )
         try:
+            vision = None
             if provider_role == ProviderRole.COMPLETION:
-                completion = completion_from_settings(settings_from_selection(selected))
-                assert completion is not None
-                completion.complete_json(
-                    "Return only JSON.",
-                    'Reply with exactly {"status":"ok"}.',
-                )
-                vision = hasattr(completion, "complete_multimodal")
+                vision = _probe_completion(selected)
             else:
-                embedder = embedder_from_settings(settings_from_selection(selected))
-                vectors = embedder.encode(["Trisynapse connection test"])
-                if len(vectors) != 1 or not vectors[0]:
-                    raise ProviderError("embedding provider returned an empty vector")
-                vision = None
+                _probe_embedding(selected)
             return ConnectionTestResult(
                 ok=True, role=provider_role, provider=selected.provider,
                 model=selected.model, message="Connection succeeded.",
@@ -524,32 +504,18 @@ class MemoryEngine:
     def check(self) -> dict[str, Any]:
         """Return local installation, provider, store, and job diagnostics."""
 
-        import importlib.util
         import shutil as system_shutil
-        import socket
 
         self._sync_model_configuration(force=True)
         path = Path(self.store_path)
         mode = path.stat().st_mode & 0o777 if path.exists() else None
-        port_free = True
-        with socket.socket() as sock:
-            try:
-                sock.bind(("127.0.0.1", 8765))
-            except OSError:
-                port_free = False
         status = self.get_model_configuration_status()
         providers = {item.id: item for item in self.list_providers()}
-        completion = status.configuration.completion
-        embedding = status.configuration.embedding
-        required = [
-            item for item in (completion, embedding)
-            if item.provider not in {"none", "sentence-transformers", "openai-compatible"}
-        ]
-        missing = [
-            providers[item.provider].credential_env for item in required
-            if not providers[item.provider].credential_configured
-        ]
+        missing = _missing_provider_credentials(
+            providers, status.configuration.completion, status.configuration.embedding
+        )
         storage = self.validate_store()
+        runs = self.list_ingestion_runs(namespace=self.default_namespace)
         return {
             "ok": storage.ok and os.access(path, os.W_OK) and not missing,
             "version": self.VERSION,
@@ -567,24 +533,12 @@ class MemoryEngine:
                 "name": self.token_counter.name,
                 "exact": self.token_counter.exact,
             },
-            "source_extras": {
-                name: importlib.util.find_spec(module) is not None
-                for name, module in {
-                    "pdf": "pypdf", "office": "docx", "spreadsheets": "openpyxl",
-                    "tree_sitter": "tree_sitter_language_pack", "tokens": "tiktoken",
-                }.items()
-            },
-            "port_8765_available": port_free,
+            "source_extras": _source_extra_availability(),
+            "port_8765_available": _port_8765_free(),
             "pending_jobs": len(self.list_jobs(status="pending")),
             "failed_jobs": len(self.list_jobs(status="failed")),
-            "pending_runs": sum(
-                run.status in {"pending", "running"}
-                for run in self.list_ingestion_runs(namespace=self.default_namespace)
-            ),
-            "failed_runs": sum(
-                run.status in {"failed", "partial"}
-                for run in self.list_ingestion_runs(namespace=self.default_namespace)
-            ),
+            "pending_runs": sum(run.status in {"pending", "running"} for run in runs),
+            "failed_runs": sum(run.status in {"failed", "partial"} for run in runs),
             "warning": "Retained originals are permission-restricted but not encrypted.",
         }
 
@@ -778,11 +732,24 @@ class MemoryEngine:
             on_progress("Loading source and model configuration")
         self._sync_model_configuration()
         run = self.get_ingestion_run(run_id)
-        inputs = run.inputs
-        memory_namespace = run.namespace
         run.status = "running"
         run.updated_at = datetime.now(timezone.utc)
         self.store.put_ingestion_run(run)
+        prepared, failures = self._prepare_ingestion_sources(
+            run.inputs, max_workers, on_progress
+        )
+        _enforce_retained_source_limit(run.inputs, prepared, failures)
+        results = self._commit_ingestion_results(
+            run.inputs, prepared, failures, run.namespace, run.id, on_progress
+        )
+        return self._finalize_ingestion_run(run, results, on_progress)
+
+    def _prepare_ingestion_sources(
+        self,
+        inputs: list[SourceInput],
+        max_workers: int,
+        on_progress: Callable[[str], None] | None,
+    ) -> tuple[dict[int, PreparedSource], dict[int, str]]:
         prepared: dict[int, PreparedSource] = {}
         failures: dict[int, str] = {}
         source_context = SourcePreparationContext(completion=self.completion)
@@ -801,31 +768,46 @@ class MemoryEngine:
                     on_progress(
                         f"Preprocessed source {prepared_count} of {len(inputs)}"
                     )
-        retained_bytes = 0
-        for index in range(len(inputs)):
-            if index not in prepared:
-                continue
-            candidate_bytes = retained_bytes + len(prepared[index].original)
-            if candidate_bytes > 250 * 1024 * 1024:
-                failures[index] = "ingestion run exceeds the 250 MiB retained-source limit"
-                del prepared[index]
-            else:
-                retained_bytes = candidate_bytes
+        return prepared, failures
+
+    def _commit_ingestion_results(
+        self,
+        inputs: list[SourceInput],
+        prepared: dict[int, PreparedSource],
+        failures: dict[int, str],
+        namespace: MemoryNamespace,
+        run_id: str,
+        on_progress: Callable[[str], None] | None,
+    ) -> list[SourceIngestionResult]:
         results: list[SourceIngestionResult] = []
         for index, item in enumerate(inputs):
             if on_progress:
                 on_progress(f"Writing source {index + 1} of {len(inputs)} to Trace")
             if index in failures:
-                results.append(SourceIngestionResult(index=index, source_key=item.source_key, kind=item.kind, status="failed", error=failures[index]))
+                results.append(SourceIngestionResult(
+                    index=index, source_key=item.source_key, kind=item.kind,
+                    status="failed", error=failures[index],
+                ))
                 continue
             try:
-                results.append(self._commit_source(index, prepared[index], memory_namespace, run_id=run.id))
+                results.append(self._commit_source(
+                    index, prepared[index], namespace, run_id=run_id
+                ))
             except Exception as exc:
-                results.append(SourceIngestionResult(index=index, source_key=item.source_key, kind=item.kind, status="failed", error=str(exc)))
-        succeeded = sum(item.status in {"success", "skipped"} for item in results)
-        failed = sum(item.status == "failed" for item in results)
+                results.append(SourceIngestionResult(
+                    index=index, source_key=item.source_key, kind=item.kind,
+                    status="failed", error=str(exc),
+                ))
+        return results
+
+    def _finalize_ingestion_run(
+        self,
+        run: IngestionRun,
+        results: list[SourceIngestionResult],
+        on_progress: Callable[[str], None] | None,
+    ) -> IngestionRun:
         run.results = results
-        run.status = "failed" if failed and not succeeded else "partial" if failed else "completed"
+        run.status = _ingestion_run_status(results)
         run.updated_at = datetime.now(timezone.utc)
         self.store.put_ingestion_run(run)
         if on_progress:
@@ -840,9 +822,9 @@ class MemoryEngine:
         *,
         run_id: str | None = None,
     ) -> SourceIngestionResult:
-        source_key = prepared.source.source_key or prepared.uri or f"upload:{prepared.filename}:{prepared.content_hash}"
+        source_key = _prepared_source_key(prepared)
         previous = self.store.latest_source(source_key, namespace)
-        if previous is not None and previous.status == "active" and previous.content_hash == prepared.content_hash:
+        if _is_unchanged_source(previous, prepared):
             # A no-op ingestion still verifies and repairs its content-addressed
             # retained blob before returning the existing source version.
             store_blob(self.store.root, prepared.original, filename=prepared.filename)
@@ -851,15 +833,7 @@ class MemoryEngine:
                 status="skipped", group_id=f"source:{previous.id}:v{previous.version}", record_ids=previous.record_ids,
                 skipped_paths=prepared.skipped_paths,
             )
-        identity = json.dumps(
-            {
-                "namespace": namespace.model_dump(mode="json", exclude_none=True),
-                "source_key": source_key,
-                "content_hash": prepared.content_hash,
-            },
-            sort_keys=True,
-        )
-        source_id = f"src_{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
+        source_id = _source_identity_id(namespace, source_key, prepared.content_hash)
         version = (previous.version + 1) if previous else 1
         group_id = f"source:{source_id}:v{version}"
         blob_path = store_blob(self.store.root, prepared.original, filename=prepared.filename)
@@ -867,28 +841,9 @@ class MemoryEngine:
             "type": prepared.kind, "id": source_id, "source_key": source_key, "title": prepared.title,
             "version": version, "content_hash": prepared.content_hash, "uri": prepared.uri,
         }
-        deltas: list[MemoryRecord] = []
-        for chunk_index, chunk in enumerate(prepared.chunks):
-            if not chunk.text.strip():
-                continue
-            modality, source_type, retrieval_fields = _source_retrieval_descriptor(
-                prepared, chunk
-            )
-            delta = self.ingest_raw_source(
-                chunk.text,
-                group_id=group_id,
-                source_ref=source_ref,
-                locator={**chunk.locator, "chunk_index": chunk_index, "metadata": chunk.metadata},
-                scope={**prepared.source.scope, "source_id": source_id, "source_kind": prepared.kind},
-                external_key=f"source:{source_id}:chunk:{chunk_index}:{hashlib.sha256(chunk.text.encode()).hexdigest()[:16]}",
-                namespace=namespace,
-                modality=modality,
-                source_type=source_type,
-                retrieval_fields=retrieval_fields,
-                process=False,
-                schedule=False,
-            )
-            deltas.append(delta)
+        deltas = self._ingest_prepared_chunks(
+            prepared, source_id, source_ref, group_id, namespace
+        )
         if not deltas:
             raise ValueError("source produced no usable text chunks")
         record = SourceRecord(
@@ -913,18 +868,65 @@ class MemoryEngine:
             previous_source_id=previous.id if previous else None,
         )
         self.store.put_source(record)
-        if previous is not None and previous.status == "active":
-            for delta_id in previous.record_ids:
-                if delta_id not in self.store.retracted_ids():
-                    self.retract(record_id=delta_id, reason=f"source replaced by {source_id}", requested_by="source-ingestion", namespace=namespace)
-            previous.status = "superseded"
-            previous.removed_at = datetime.now(timezone.utc)
-            self.store.put_source(previous)
+        self._supersede_previous_source(previous, source_id, namespace)
         self._schedule_group(group_id, namespace)
         return SourceIngestionResult(
             index=index, source_id=source_id, source_key=source_key, kind=prepared.kind,
             status="success", group_id=group_id, record_ids=record.record_ids, skipped_paths=prepared.skipped_paths,
         )
+
+    def _ingest_prepared_chunks(
+        self,
+        prepared: PreparedSource,
+        source_id: str,
+        source_ref: dict[str, Any],
+        group_id: str,
+        namespace: MemoryNamespace,
+    ) -> list[MemoryRecord]:
+        deltas: list[MemoryRecord] = []
+        for chunk_index, chunk in enumerate(prepared.chunks):
+            if not chunk.text.strip():
+                continue
+            modality, source_type, retrieval_fields = _source_retrieval_descriptor(
+                prepared, chunk
+            )
+            deltas.append(self.ingest_raw_source(
+                chunk.text,
+                group_id=group_id,
+                source_ref=source_ref,
+                locator={**chunk.locator, "chunk_index": chunk_index, "metadata": chunk.metadata},
+                scope={**prepared.source.scope, "source_id": source_id, "source_kind": prepared.kind},
+                external_key=f"source:{source_id}:chunk:{chunk_index}:{hashlib.sha256(chunk.text.encode()).hexdigest()[:16]}",
+                namespace=namespace,
+                modality=modality,
+                source_type=source_type,
+                retrieval_fields=retrieval_fields,
+                process=False,
+                schedule=False,
+            ))
+        return deltas
+
+    def _supersede_previous_source(
+        self,
+        previous: SourceRecord | None,
+        source_id: str,
+        namespace: MemoryNamespace,
+    ) -> None:
+        if previous is None or previous.status != "active":
+            return
+        retracted = self.store.retracted_ids()
+        for delta_id in previous.record_ids:
+            if delta_id in retracted:
+                continue
+            self.retract(
+                record_id=delta_id,
+                reason=f"source replaced by {source_id}",
+                requested_by="source-ingestion",
+                namespace=namespace,
+            )
+        previous.status = "superseded"
+        previous.removed_at = datetime.now(timezone.utc)
+        self.store.put_source(previous)
 
     def retry_ingestion(self, run_id: str) -> IngestionRun:
         retry = self.create_retry_ingestion(run_id)
@@ -968,23 +970,8 @@ class MemoryEngine:
             self._resolve_namespace(namespace), include_removed=include_removed
         )
         values = [self._hydrate_source(item) for item in values]
-        if search:
-            term = search.lower()
-            values = [
-                item for item in values
-                if term in " ".join(filter(None, [item.title, item.source_key, item.uri, item.filename])).lower()
-            ]
-        allowed_kinds = set(kinds or [])
-        if allowed_kinds:
-            values = [item for item in values if item.kind in allowed_kinds]
-        if status:
-            values = [item for item in values if item.status == status]
-        if sort == "oldest":
-            values.sort(key=lambda item: item.created_at)
-        elif sort == "title":
-            values.sort(key=lambda item: item.title.lower())
-        elif sort != "newest":
-            raise ValueError("sort must be newest, oldest, or title")
+        values = _filter_sources(values, search=search, kinds=kinds, status=status)
+        _sort_sources(values, sort)
         if limit is not None:
             values = values[cursor:cursor + limit]
         return values
@@ -999,31 +986,7 @@ class MemoryEngine:
         return self._hydrate_source(source)
 
     def _hydrate_source(self, source: SourceRecord) -> SourceRecord:
-        path = self.store.root / source.blob_path
-        update: dict[str, Any] = {}
-        if not source.filename:
-            derived_filename = source.metadata.get("filename")
-            if not derived_filename:
-                for delta_id in source.record_ids:
-                    delta = self.store.get(delta_id)
-                    if delta is not None and isinstance(delta.locator, dict) and delta.locator.get("path"):
-                        derived_filename = Path(str(delta.locator["path"])).name
-                        break
-            update["filename"] = str(derived_filename or source.title)
-        if not source.byte_size and path.is_file():
-            update["byte_size"] = path.stat().st_size
-        if not source.chunk_count:
-            update["chunk_count"] = len(source.record_ids)
-        if not source.preview_type:
-            update["preview_type"] = str(source.metadata.get("source_type") or source.kind)
-        skipped_paths = source.metadata.get("skipped_paths") or []
-        if not source.skipped_count and skipped_paths:
-            update["skipped_count"] = len(skipped_paths)
-        if not source.ingestion_run_id:
-            for run in self.store.list_ingestion_runs(source.namespace, limit=10_000):
-                if any(result.source_id == source.id for result in run.results):
-                    update["ingestion_run_id"] = run.id
-                    break
+        update = _source_hydrate_updates(self.store, source)
         if not update:
             return source
         hydrated = source.model_copy(update=update)
@@ -1043,30 +1006,8 @@ class MemoryEngine:
         source = self.get_source(source_id, namespace=namespace)
         if source.status == "removed":
             raise KeyError(f"unknown source: {source_id}")
-        values: list[SourcePreviewItem] = []
-        manifest: list[str] = []
         selected_ids = source.record_ids[cursor:cursor + limit + 1]
-        for delta_id in selected_ids[:limit]:
-            delta = self.store.get(delta_id)
-            if delta is None:
-                continue
-            locator = delta.locator
-            locator_metadata = (
-                locator.get("metadata", {}) if isinstance(locator, dict) else {}
-            )
-            kind = (
-                str(locator.get("kind") or delta.kind)
-                if isinstance(locator, dict) else delta.kind
-            )
-            if kind == "manifest":
-                manifest = [line for line in delta.text.splitlines()[1:] if line.strip()]
-            values.append(SourcePreviewItem(
-                record_id=delta.id,
-                kind=kind,
-                text=delta.text,
-                locator=locator,
-                metadata=locator_metadata,
-            ))
+        values, manifest = _source_preview_items(self.store, selected_ids[:limit])
         return SourcePreview(
             source_id=source.id,
             preview_type=source.preview_type or source.kind,
@@ -1097,28 +1038,58 @@ class MemoryEngine:
         group_id: str,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> list[MemoryRecord]:
+        return self.run_fact_extraction_many([group_id], namespace=namespace)
+
+    def run_fact_extraction_many(
+        self,
+        group_ids: Sequence[str],
+        *,
+        namespace: MemoryNamespace | dict[str, Any] | None = None,
+        max_workers: int = DEFAULT_COMPLETION_PARALLEL_WORKERS,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[MemoryRecord]:
         self._sync_model_configuration()
         if self.completion is None:
             raise RuntimeError("run_fact_extraction requires a configured completion provider")
-        return extract_facts(self.store, group_id, self.completion, namespace=self._resolve_namespace(namespace))
+        return extract_facts_many(
+            self.store,
+            group_ids,
+            self.completion,
+            namespace=self._resolve_namespace(namespace),
+            max_workers=max_workers,
+            on_progress=on_progress,
+        )
 
     def build_group_summary(
         self,
         group_ids: list[str] | None = None,
         *,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
+        max_workers: int = DEFAULT_COMPLETION_PARALLEL_WORKERS,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> list[GroupSummaryView]:
         self._sync_model_configuration()
         memory_namespace = self._resolve_namespace(namespace)
         deltas = self.store.list_records(
             kinds=["raw_source", "fact", "note"], namespace=memory_namespace
         )
-        views = build_group_summary_views(deltas, complete_json=self.completion, group_ids=group_ids)
-        for view in views:
-            view.namespace = memory_namespace
-            view.cache_key = f"{view.cache_key}:{_namespace_key(memory_namespace)}"
-            self.store.put_group_summary(view)
-        return views
+        existing, targets, pending_ids = _group_summary_plan(
+            self.store, memory_namespace, deltas, group_ids
+        )
+        if not pending_ids:
+            return _cached_group_summaries(targets, existing, on_progress)
+        already = len(targets) - len(pending_ids)
+        views = build_group_summary_views(
+            deltas,
+            complete_json=self.completion,
+            group_ids=pending_ids,
+            max_workers=max_workers,
+            on_progress=_group_summary_progress(on_progress, already, len(targets)),
+            on_view=lambda view: _persist_group_summary(
+                self.store, view, memory_namespace
+            ),
+        )
+        return _merge_group_summaries(targets, existing, views)
 
     def retract(
         self,
@@ -1265,7 +1236,14 @@ class MemoryEngine:
         history: list[dict[str, Any]] | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
         on_step: Callable[[QueryStep], None] | None = None,
+        answer_question: str | None = None,
     ) -> MemoryQueryResult:
+        """Retrieve with ``question``; generate from ``answer_question`` when set.
+
+        Benchmark MCQ options belong in ``answer_question`` so they do not
+        enter the retriever query.
+        """
+
         del history
         memory_namespace = self._resolve_namespace(namespace)
         run = self._new_query_run(
@@ -1281,6 +1259,7 @@ class MemoryEngine:
             scope=scope,
             abstain_threshold=abstain_threshold,
             on_step=on_step,
+            answer_question=answer_question,
         )
 
     def _new_query_run(
@@ -1343,33 +1322,8 @@ class MemoryEngine:
         persist: bool = True,
     ) -> MemorySearchResult:
         self._sync_model_configuration()
-        if not self._retriever_override:
-            self.retriever_config = _retriever_config(self.get_retrieval_configuration())
+        retriever = self._hybrid_retriever()
         effective_top_k = top_k or run.retrieval_configuration.default_top_k
-        retriever = HybridRetriever(
-            self.store,
-            self.embedder,
-            self.embedding_index,
-            self.retriever_config,
-            planner=self.query_planner,
-            routes=self.retrieval_routes,
-            branches=self.extensions.retrieval_branches,
-            fusion_strategy=self.fusion_strategy,
-            reranker=self.candidate_reranker,
-            unavailable_branches={
-                name
-                for name in self.extensions.retrieval_branches.names
-                if (
-                    (owner := self.extensions.owner("retrieval", name)) is not None
-                    and (state := next(
-                        (item for item in self.store.extension_states() if item.extension_id == owner),
-                        None,
-                    )) is not None
-                    and state.status != "available"
-                )
-            },
-            token_counter=self.token_counter,
-        )
         started = time.perf_counter()
         result = retriever.search(
             run.query,
@@ -1390,6 +1344,36 @@ class MemoryEngine:
                 self.store.put_query_run(run)
         return result
 
+    def _hybrid_retriever(self) -> HybridRetriever:
+        if not self._retriever_override:
+            self.retriever_config = _retriever_config(self.get_retrieval_configuration())
+        return HybridRetriever(
+            self.store,
+            self.embedder,
+            self.embedding_index,
+            self.retriever_config,
+            planner=self.query_planner,
+            routes=self.retrieval_routes,
+            branches=self.extensions.retrieval_branches,
+            fusion_strategy=self.fusion_strategy,
+            reranker=self.candidate_reranker,
+            unavailable_branches=self._unavailable_retrieval_branches(),
+            token_counter=self.token_counter,
+        )
+
+    def _unavailable_retrieval_branches(self) -> set[str]:
+        unavailable: set[str] = set()
+        states = {item.extension_id: item for item in self.store.extension_states()}
+        for name in self.extensions.retrieval_branches.names:
+            owner = self.extensions.owner("retrieval", name)
+            if owner is None:
+                continue
+            state = states.get(owner)
+            if state is None or state.status == "available":
+                continue
+            unavailable.add(name)
+        return unavailable
+
     def _execute_query(
         self,
         run: QueryRun,
@@ -1400,6 +1384,7 @@ class MemoryEngine:
         scope: dict[str, Any] | None,
         abstain_threshold: float | None,
         on_step: Callable[[QueryStep], None] | None = None,
+        answer_question: str | None = None,
     ) -> MemoryQueryResult:
         started = time.perf_counter()
         search_result = self._execute_search(
@@ -1407,55 +1392,25 @@ class MemoryEngine:
             # ``default_top_k`` controls ordinary search results. Answer
             # generation gets the larger grounded context window unless the
             # caller explicitly requests a limit.
-            top_k=(
-                top_k
-                if top_k is not None
-                else run.retrieval_configuration.max_context_items
-            ),
+            top_k=_query_context_top_k(top_k, run),
             group_prefix=group_prefix,
             scope=scope,
             finish=False,
             on_step=on_step,
         )
         hits = search_result.hits
-        threshold = (
-            run.retrieval_configuration.answer_abstain_threshold
-            if abstain_threshold is None else abstain_threshold
-        )
-        relevant = bool(hits and hits[0].score >= threshold)
+        threshold = _query_abstain_threshold(run, abstain_threshold)
+        relevant = _hits_are_relevant(hits, threshold)
         generation_started = time.perf_counter()
-        cited_hits = hits
-        if self.completion is not None and relevant:
-            payload = self.completion(
-                load_prompt("answer").text,
-                _answer_prompt(original_question, hits),
-            )
-            answer = str(payload.get("answer") or "").strip()
-            abstain = bool(payload.get("abstain", False)) or not answer
-            requested_citations = payload.get("citation_ids")
-            if requested_citations is not None:
-                if not isinstance(requested_citations, list):
-                    raise ValueError("answer citation_ids must be a list")
-                requested_ids = {str(value) for value in requested_citations}
-                cited_hits = [hit for hit in hits if hit.item_id in requested_ids]
-                if answer and not abstain and not cited_hits:
-                    answer = "I don't have enough grounded evidence to answer that."
-                    abstain = True
-        elif relevant:
-            answer = _extractive_answer(original_question, hits)
-            abstain = not answer
-        else:
-            answer = "I don't have enough grounded evidence to answer that."
-            abstain = True
-        citations = _citations(cited_hits if not abstain else [])
-        provenance = {
-            **provider_provenance(self.completion, kind="completion"),
-            "prompt": load_prompt("answer").provenance() if self.completion is not None else None,
-        }
+        answer, abstain, cited_hits = _query_answer(
+            self.completion, answer_question or original_question, hits, relevant
+        )
+        citations = _citations([] if abstain else cited_hits)
+        provenance = _query_generation_provenance(self.completion)
         self._append_query_step(run, QueryStep(
             id=f"{run.id}:{len(run.steps)}:answer",
             phase="answer",
-            label="Generate grounded answer" if relevant else "Abstain without enough evidence",
+            label=_query_answer_label(relevant),
             sequence=len(run.steps),
             input={"evidence_ids": [hit.item_id for hit in hits], "threshold": threshold},
             output={"answer": answer, "abstain": abstain, "citation_ids": [item.record_id for item in citations]},
@@ -1765,24 +1720,14 @@ class MemoryEngine:
         memory_namespace = self._resolve_namespace(namespace)
         grouped: dict[str, list[MemoryRecord]] = defaultdict(list)
         for delta in self.store.list_records(scope=self._scope(memory_namespace, scope), namespace=memory_namespace):
-            if delta.group_id:
-                grouped[delta.group_id].append(delta)
+            if not delta.group_id:
+                continue
+            grouped[delta.group_id].append(delta)
         fresh = {view.group_id: not view.stale for view in self.store.group_summary_views(namespace=memory_namespace)}
-        result = []
-        for group_id, deltas in sorted(grouped.items()):
-            observed = [item.observed_at for item in deltas if item.observed_at]
-            result.append(
-                RecordGroupInfo(
-                    group_id=group_id,
-                    record_count=len(deltas),
-                    raw_source_count=sum(item.kind == "raw_source" for item in deltas),
-                    fact_count=sum(item.kind == "fact" for item in deltas),
-                    first_observed_at=min(observed) if observed else None,
-                    last_observed_at=max(observed) if observed else None,
-                    stale=not fresh.get(group_id, False),
-                )
-            )
-        return result
+        return [
+            _record_group_info(group_id, deltas, fresh)
+            for group_id, deltas in sorted(grouped.items())
+        ]
 
     def export_graph(
         self,
@@ -1792,24 +1737,11 @@ class MemoryEngine:
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> dict[str, Any] | str:
         memory_namespace = self._resolve_namespace(namespace)
-        deltas = self.store.list_records(
-            kinds=["raw_source", "fact"],
-            scope=self._scope(memory_namespace, scope),
-            namespace=memory_namespace,
+        graph = _claim_export_graph(
+            _namespace_claims(
+                self.store, memory_namespace, self._scope(memory_namespace, scope)
+            )
         )
-        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
-        claims = compile_claims([item for item in deltas if item.kind == "fact"], observations)
-        nodes = []
-        edges = []
-        seen: set[str] = set()
-        for claim in claims:
-            for label in (claim.subject, claim.object):
-                if label and label not in seen:
-                    seen.add(label)
-                    nodes.append({"id": label, "label": label})
-            if claim.subject and claim.object:
-                edges.append({"source": claim.subject, "target": claim.object, "relation": claim.relation, "confidence": claim.confidence, "status": claim.status})
-        graph = {"nodes": nodes, "edges": edges}
         if format == "json":
             return graph
         if format != "graphml":
@@ -1828,168 +1760,40 @@ class MemoryEngine:
         cursor: str | None = None,
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> MemoryGraphPage:
-        if view not in {"knowledge", "lineage", "log", "retrieval"}:
-            raise ValueError("view must be knowledge, lineage, log, or retrieval")
-        if limit < 1 or limit > 2000:
-            raise ValueError("limit must be between 1 and 2000")
+        _validate_memory_graph_args(view, limit)
         memory_namespace = self._resolve_namespace(namespace)
         if view == "retrieval":
             return index_inspect.retrieval_graph_page(
                 self, memory_namespace, seed_id=source_id or group_id, limit=limit
             )
-        deltas = self.store.list_records(
-            namespace=memory_namespace, include_retracted=True
+        deltas = _filter_graph_deltas(
+            self.store.list_records(namespace=memory_namespace, include_retracted=True),
+            group_id=group_id,
+            source_id=source_id,
         )
-        if group_id:
-            deltas = [item for item in deltas if item.group_id == group_id]
-        if source_id:
-            deltas = [item for item in deltas if item.scope.get("source_id") == source_id]
-        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
-        claims = compile_claims(
-            [item for item in deltas if item.kind == "fact"], observations
-        )
+        claims = _memory_graph_claims(deltas)
         nodes: dict[str, MemoryGraphNode] = {}
         edges: dict[str, MemoryGraphEdge] = {}
-
-        def add_node(node: MemoryGraphNode) -> None:
-            nodes.setdefault(node.id, node)
-
-        def add_edge(edge: MemoryGraphEdge) -> None:
-            edges.setdefault(edge.id, edge)
-
         if view in {"lineage", "log"}:
-            source_values = self.list_sources(
-                namespace=memory_namespace, include_removed=True
+            _add_source_lineage_nodes(
+                nodes,
+                edges,
+                self.list_sources(namespace=memory_namespace, include_removed=True),
+                source_id,
             )
-            if source_id:
-                source_values = [item for item in source_values if item.id == source_id]
-            for source in source_values:
-                add_node(MemoryGraphNode(
-                    id=source.id, type="source", label=source.title,
-                    subtitle=source.kind, status=source.status,
-                    data={"source_key": source.source_key, "version": source.version, "media_type": source.media_type},
-                ))
-                if source.previous_source_id:
-                    add_edge(MemoryGraphEdge(
-                        id=f"source-version:{source.id}:{source.previous_source_id}",
-                        source=source.id, target=source.previous_source_id,
-                        type="supersedes", label="supersedes",
-                    ))
-            previous_by_group: dict[str, str] = {}
-            for delta in deltas:
-                add_node(MemoryGraphNode(
-                    id=delta.id, type="log", label=(delta.text or delta.kind)[:90],
-                    subtitle=delta.kind, status="retracted" if delta.id in self.store.retracted_ids() else "active",
-                    data={
-                        "kind": delta.kind, "seq": delta.seq, "group_id": delta.group_id,
-                        "observed_at": delta.observed_at.isoformat() if delta.observed_at else None,
-                        "source_ref": delta.source_ref, "locator": delta.locator,
-                    },
-                ))
-                current_source = str(delta.scope.get("source_id") or "")
-                if current_source:
-                    add_edge(MemoryGraphEdge(
-                        id=f"source-trace:{current_source}:{delta.id}", source=current_source,
-                        target=delta.id, type="produced", label="produced",
-                    ))
-                if delta.group_id:
-                    group_node = f"group:{delta.group_id}"
-                    add_node(MemoryGraphNode(
-                        id=group_node, type="group", label=delta.group_id,
-                        subtitle="record group",
-                    ))
-                    add_edge(MemoryGraphEdge(
-                        id=f"episode-trace:{group_node}:{delta.id}", source=group_node,
-                        target=delta.id, type="contains", label="contains",
-                    ))
-                    previous = previous_by_group.get(delta.group_id)
-                    if view == "log" and previous:
-                        add_edge(MemoryGraphEdge(
-                            id=f"follows:{previous}:{delta.id}", source=previous,
-                            target=delta.id, type="followed_by", label="then",
-                        ))
-                    previous_by_group[delta.group_id] = delta.id
-                for evidence_id in delta.evidence_refs:
-                    add_edge(MemoryGraphEdge(
-                        id=f"evidence:{evidence_id}:{delta.id}", source=evidence_id,
-                        target=delta.id, type="supports", label="supports",
-                    ))
-
+            _add_log_delta_nodes(
+                view, nodes, edges, deltas, self.store.retracted_ids()
+            )
         if view in {"knowledge", "lineage"}:
-            for claim in claims:
-                claim_id = f"claim:{claim.id}"
-                add_node(MemoryGraphNode(
-                    id=claim_id, type="claim", label=claim.text[:100],
-                    subtitle=claim.relation, status=claim.status,
-                    data={"confidence": claim.confidence, "source_record_ids": claim.source_record_ids},
-                ))
-                for role, label in (("subject", claim.subject), ("object", claim.object)):
-                    if not label:
-                        continue
-                    concept_id = f"concept:{hashlib.sha256(label.lower().encode()).hexdigest()[:16]}"
-                    add_node(MemoryGraphNode(id=concept_id, type="concept", label=label, subtitle=role))
-                    if role == "subject":
-                        add_edge(MemoryGraphEdge(
-                            id=f"claim-subject:{concept_id}:{claim_id}", source=concept_id,
-                            target=claim_id, type="subject", label=claim.relation or "claim",
-                            weight=claim.confidence,
-                        ))
-                    else:
-                        add_edge(MemoryGraphEdge(
-                            id=f"claim-object:{claim_id}:{concept_id}", source=claim_id,
-                            target=concept_id, type="object", label=claim.relation or "relates to",
-                            weight=claim.confidence,
-                        ))
-                if view == "lineage":
-                    for evidence_id in dict.fromkeys(claim.source_record_ids + claim.raw_source_ids):
-                        add_edge(MemoryGraphEdge(
-                            id=f"claim-ground:{evidence_id}:{claim_id}", source=evidence_id,
-                            target=claim_id, type="grounds", label="grounds",
-                        ))
-            if view == "lineage":
-                for recall in self.store.group_summary_views(namespace=memory_namespace):
-                    add_node(MemoryGraphNode(
-                        id=recall.id, type="index", label=recall.concept_or_topic,
-                        subtitle="Batch summary", status="stale" if recall.stale else "fresh",
-                        data={"group_id": recall.group_id, "summary": recall.summary},
-                    ))
-                    for trace_id in recall.source_log_ids:
-                        add_edge(MemoryGraphEdge(
-                            id=f"recall-ground:{trace_id}:{recall.id}", source=trace_id,
-                            target=recall.id, type="summarizes", label="summarizes",
-                        ))
-
-        all_nodes = list(nodes.values())
-        allowed = set(node_types or [])
-        if allowed:
-            all_nodes = [item for item in all_nodes if item.type in allowed]
-        if search:
-            term = search.lower()
-            matched = {item.id for item in all_nodes if term in f"{item.label} {item.subtitle or ''}".lower()}
-            neighbor_ids = {
-                endpoint for edge in edges.values()
-                if edge.source in matched or edge.target in matched
-                for endpoint in (edge.source, edge.target)
-            }
-            all_nodes = [item for item in all_nodes if item.id in matched | neighbor_ids]
-        counts: dict[str, int] = defaultdict(int)
-        for item in all_nodes:
-            counts[item.type] += 1
-        offset = int(cursor or 0)
-        page_nodes = all_nodes[offset:offset + limit]
-        page_ids = {item.id for item in page_nodes}
-        page_edges = [
-            edge for edge in edges.values()
-            if edge.source in page_ids and edge.target in page_ids
-        ]
-        truncated = offset + limit < len(all_nodes)
-        return MemoryGraphPage(
-            view=view,
-            nodes=page_nodes,
-            edges=page_edges,
-            counts=dict(counts),
-            truncated=truncated,
-            next_cursor=str(offset + limit) if truncated else None,
+            _add_knowledge_claim_graph(
+                view,
+                nodes,
+                edges,
+                claims,
+                self.store.group_summary_views(namespace=memory_namespace),
+            )
+        return _paginate_memory_graph(
+            view, nodes, edges, search, node_types, limit, cursor
         )
 
     def memory_graph_neighbors(
@@ -2006,18 +1810,7 @@ class MemoryEngine:
                 self, memory_namespace, seed_id=node_id, limit=limit
             )
         graph = self.memory_graph(view, limit=2000, namespace=namespace)
-        edges = [edge for edge in graph.edges if node_id in {edge.source, edge.target}][:limit]
-        ids = {node_id}
-        for edge in edges:
-            ids.update((edge.source, edge.target))
-        nodes = [node for node in graph.nodes if node.id in ids]
-        return MemoryGraphPage(
-            view=graph.view,
-            nodes=nodes,
-            edges=edges,
-            counts={key: sum(1 for node in nodes if node.type == key) for key in {item.type for item in nodes}},
-            truncated=len(graph.edges) > len(edges),
-        )
+        return _neighbor_subgraph(graph, node_id, limit)
 
     def memory_catalog(
         self,
@@ -2120,18 +1913,11 @@ class MemoryEngine:
         namespace: MemoryNamespace | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         memory_namespace = self._resolve_namespace(namespace)
-        deltas = self.store.list_records(
-            kinds=["raw_source", "fact"],
-            scope=self._scope(memory_namespace, scope),
-            namespace=memory_namespace,
+        profile = _profile_from_claims(
+            _namespace_claims(
+                self.store, memory_namespace, self._scope(memory_namespace, scope)
+            )
         )
-        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
-        claims = compile_claims([item for item in deltas if item.kind == "fact"], observations)
-        ordered = sorted(claims, key=lambda item: item.confidence, reverse=True)
-        profile = {
-            "static": [item.text for item in ordered if item.confidence >= 0.7][:12],
-            "dynamic": [item.text for item in ordered if item.confidence < 0.7][:12],
-        }
         if query:
             profile["search_results"] = [
                 hit.model_dump(mode="json")
@@ -2194,15 +1980,11 @@ class MemoryEngine:
             last_projected_seq=previous.last_projected_seq if previous else 0,
             status="rebuild_required",
         ))
-        if wait:
-            for _ in range(1000):
-                current = self.store.get_job(job.id)
-                if current is None or current.status in {"completed", "failed"}:
-                    break
-                self.run_jobs(max_jobs=1)
-            current = self.store.get_job(job.id)
-            if current is not None:
-                return current
+        if not wait:
+            return job
+        current = self._wait_for_job(job)
+        if current is not None:
+            return current
         return job
 
     def run_jobs(self, *, max_jobs: int = 100) -> list[MemoryJob]:
@@ -2231,41 +2013,33 @@ class MemoryEngine:
         return completed
 
     def _record_extension_job_failure(self, job: MemoryJob, error: str) -> None:
-        if job.kind.startswith("ingest:"):
-            capability, name = "ingest", job.kind.removeprefix("ingest:")
-        elif job.kind.startswith("index:") and job.kind.endswith(":project"):
-            capability, name = "index", job.kind.removeprefix("index:").removesuffix(":project")
-        elif job.kind.startswith("extension:") and job.kind.endswith(":rebuild"):
-            extension_id = job.kind.removeprefix("extension:").removesuffix(":rebuild")
-            spec = self.extensions.extensions.get(extension_id)
-            if spec is None:
-                return
-            previous = next(
-                (state for state in self.store.extension_states() if state.extension_id == extension_id),
-                None,
-            )
-            self.store.put_extension_state(ExtensionState(
-                extension_id=extension_id,
-                installed_version=spec.version,
-                engine_api=spec.engine_api,
-                storage_revision=spec.storage_revision,
-                last_projected_seq=previous.last_projected_seq if previous else 0,
-                status="degraded",
-                last_error=error[:1000],
-            ))
-            return
-        else:
-            return
-        owner = self.extensions.owner(capability, name)
+        owner = self._extension_job_owner(job)
         if owner is None:
             return
-        spec = self.extensions.extensions[owner]
+        self._mark_extension_degraded(owner, error)
+
+    def _extension_job_owner(self, job: MemoryJob) -> str | None:
+        kind = job.kind
+        if kind.startswith("ingest:"):
+            return self.extensions.owner("ingest", kind.removeprefix("ingest:"))
+        if kind.startswith("index:") and kind.endswith(":project"):
+            return self.extensions.owner(
+                "index", kind.removeprefix("index:").removesuffix(":project")
+            )
+        if kind.startswith("extension:") and kind.endswith(":rebuild"):
+            return kind.removeprefix("extension:").removesuffix(":rebuild")
+        return None
+
+    def _mark_extension_degraded(self, extension_id: str, error: str) -> None:
+        spec = self.extensions.extensions.get(extension_id)
+        if spec is None:
+            return
         previous = next(
-            (state for state in self.store.extension_states() if state.extension_id == owner),
+            (state for state in self.store.extension_states() if state.extension_id == extension_id),
             None,
         )
         self.store.put_extension_state(ExtensionState(
-            extension_id=owner,
+            extension_id=extension_id,
             installed_version=spec.version,
             engine_api=spec.engine_api,
             storage_revision=spec.storage_revision,
@@ -2294,28 +2068,14 @@ class MemoryEngine:
         existing = {state.extension_id: state for state in self.store.extension_states()}
         for extension_id, spec in self.extensions.extensions.items():
             previous = existing.get(extension_id)
-            status = "available"
-            has_persistent_recall = any(
-                channel.spec.persistent
-                and self.extensions.owner("index", channel.spec.id) == extension_id
-                for channel in self.extensions.index_channels.channels
-            )
             revision_changed = bool(
                 previous
                 and previous.storage_revision != spec.storage_revision
-                and has_persistent_recall
+                and _extension_has_persistent_recall(self.extensions, extension_id)
             )
-            if revision_changed:
-                status = "rebuild_required"
-            self.store.put_extension_state(ExtensionState(
-                extension_id=extension_id,
-                installed_version=spec.version,
-                engine_api=spec.engine_api,
-                storage_revision=spec.storage_revision,
-                last_projected_seq=previous.last_projected_seq if previous else 0,
-                status=status,
-                last_error=previous.last_error if previous and status != "available" else None,
-            ))
+            self.store.put_extension_state(
+                _extension_state_for_sync(extension_id, spec, previous, revision_changed)
+            )
             if revision_changed:
                 self.rebuild_extension(extension_id)
 
@@ -2324,66 +2084,70 @@ class MemoryEngine:
         if not force and configuration.revision == self._config_revision:
             return
         if self._managed_completion:
-            try:
-                self.completion = completion_from_settings(
-                    settings_from_selection(configuration.completion)
-                )
-                descriptor = self.store.find_cached_model(
-                    configuration.completion.provider,
-                    configuration.completion.model or "",
-                )
-                if self.completion is not None and descriptor is not None:
-                    self.completion.vision_supported = descriptor.vision
-                self._provider_errors.pop("completion", None)
-            except ProviderError as exc:
-                self.completion = None
-                self._provider_errors["completion"] = str(exc)
+            self._sync_managed_completion(configuration)
         if self._managed_embedding:
-            try:
-                self.embedder = embedder_from_settings(
-                    settings_from_selection(configuration.embedding)
-                )
-                self._provider_errors.pop("embedding", None)
-            except ProviderError as exc:
-                selection = configuration.embedding
-                self.embedder = UnavailableEmbedder(
-                    selection.model or "unknown",
-                    embedding_cache_key(
-                        selection.provider, selection.base_url, selection.model or "unknown"
-                    ),
-                    str(exc),
-                )
-                self._provider_errors["embedding"] = str(exc)
+            self._sync_managed_embedding(configuration)
         if not self._token_counter_override:
             self.token_counter = token_counter_for(self.completion)
         self._config_revision = configuration.revision
+
+    def _sync_managed_completion(self, configuration: ModelConfiguration) -> None:
+        try:
+            self.completion = completion_from_settings(
+                settings_from_selection(configuration.completion)
+            )
+            descriptor = self.store.find_cached_model(
+                configuration.completion.provider,
+                configuration.completion.model or "",
+            )
+            if self.completion is not None and descriptor is not None:
+                self.completion.vision_supported = descriptor.vision
+            self._provider_errors.pop("completion", None)
+        except ProviderError as exc:
+            self.completion = None
+            self._provider_errors["completion"] = str(exc)
+
+    def _sync_managed_embedding(self, configuration: ModelConfiguration) -> None:
+        try:
+            self.embedder = embedder_from_settings(
+                settings_from_selection(configuration.embedding)
+            )
+            self._provider_errors.pop("embedding", None)
+        except ProviderError as exc:
+            selection = configuration.embedding
+            self.embedder = UnavailableEmbedder(
+                selection.model or "unknown",
+                embedding_cache_key(
+                    selection.provider, selection.base_url, selection.model or "unknown"
+                ),
+                str(exc),
+            )
+            self._provider_errors["embedding"] = str(exc)
 
     def _prewarm_embedding_cache(self, embedder: Embedder) -> None:
         deltas = self.store.list_records(
             kinds=["raw_source", "fact", "note"],
             include_retracted=False,
         )
-        observations = {item.id: item for item in deltas if item.kind == "raw_source"}
-        claims = compile_claims(
-            [item for item in deltas if item.kind == "fact"], observations
-        )
-        texts = [
-            item.text for item in deltas
-            if item.kind in {"raw_source", "fact"} and item.text.strip()
-        ]
-        texts.extend(item.text for item in claims if item.text.strip())
-        texts.extend(
-            " ".join([view.summary, view.concept_or_topic, *view.alt_phrasings])
-            for view in self.store.group_summary_views()
-            if view.summary.strip()
-        )
         unique = {
             hashlib.sha256(text.encode("utf-8")).hexdigest(): text
-            for text in texts
+            for text in _embedding_prewarm_texts(self.store, deltas)
         }
         cache_key = str(getattr(embedder, "cache_key", embedder.model_name))
         existing = self.embedding_index.get(list(unique), cache_key)
-        missing = [(text_hash, text) for text_hash, text in unique.items() if text_hash not in existing]
+        missing = [
+            (text_hash, text)
+            for text_hash, text in unique.items()
+            if text_hash not in existing
+        ]
+        self._put_missing_embeddings(embedder, missing, cache_key)
+
+    def _put_missing_embeddings(
+        self,
+        embedder: Embedder,
+        missing: list[tuple[str, str]],
+        cache_key: str,
+    ) -> None:
         for offset in range(0, len(missing), 64):
             batch = missing[offset : offset + 64]
             vectors = embedder.encode([text for _, text in batch])
@@ -2469,8 +2233,21 @@ def _finalize_extension_registry(
 ) -> EngineExtensionRegistry:
     if registry.frozen:
         return registry
+    _ensure_builtin_source_handler(registry)
+    _register_builtin_job_handlers(registry)
+    _register_ingest_job_handlers(registry)
+    _register_index_job_handlers(registry)
+    _register_extension_rebuild_handlers(registry)
+    registry.validate_and_freeze(legacy_route_names)
+    return registry
+
+
+def _ensure_builtin_source_handler(registry: EngineExtensionRegistry) -> None:
     if "builtin.sources" not in registry.source_handlers.names:
         registry.source_handlers.register(BuiltinSourceHandler())
+
+
+def _register_builtin_job_handlers(registry: EngineExtensionRegistry) -> None:
     for kind, handler in (
         ("extract_facts", _job_extract_facts),
         ("summarize_group", _job_summarize_group),
@@ -2479,28 +2256,33 @@ def _finalize_extension_registry(
     ):
         if kind not in registry.job_handlers.names:
             registry.job_handlers.register(handler, kind=kind)
+
+
+def _register_ingest_job_handlers(registry: EngineExtensionRegistry) -> None:
     for name in registry.ingest_processors.names:
         kind = f"ingest:{name}"
         if kind not in registry.job_handlers.names:
             registry.job_handlers.register(_job_ingest_processor, kind=kind)
+
+
+def _register_index_job_handlers(registry: EngineExtensionRegistry) -> None:
     for channel_id in registry.index_channels.names:
         channel = registry.index_channels.get(channel_id)
-        if channel is not None and callable(getattr(channel, "project", None)):
-            kind = f"index:{channel_id}:project"
-            if kind not in registry.job_handlers.names:
-                registry.job_handlers.register(_job_index_projection, kind=kind)
+        if channel is None or not callable(getattr(channel, "project", None)):
+            continue
+        kind = f"index:{channel_id}:project"
+        if kind not in registry.job_handlers.names:
+            registry.job_handlers.register(_job_index_projection, kind=kind)
+
+
+def _register_extension_rebuild_handlers(registry: EngineExtensionRegistry) -> None:
     for extension_id in registry.extensions:
-        if any(
-            channel.spec.persistent
-            and registry.owner("index", channel.spec.id) == extension_id
-            for channel in registry.index_channels.channels
-        ):
-            registry.job_handlers.register(
-                _job_extension_rebuild,
-                kind=f"extension:{extension_id}:rebuild",
-            )
-    registry.validate_and_freeze(legacy_route_names)
-    return registry
+        if not _extension_has_persistent_recall(registry, extension_id):
+            continue
+        registry.job_handlers.register(
+            _job_extension_rebuild,
+            kind=f"extension:{extension_id}:rebuild",
+        )
 
 
 def _job_extract_facts(engine: MemoryEngine, job: MemoryJob) -> None:
@@ -2531,12 +2313,20 @@ def _job_execute_query(engine: MemoryEngine, job: MemoryJob) -> None:
     engine.execute_query_run(str(job.payload["query_id"]))
 
 
+def _job_namespace(job: MemoryJob) -> MemoryNamespace:
+    return MemoryNamespace.model_validate(job.payload.get("namespace") or {})
+
+
+def _job_evidence_version(engine: MemoryEngine, job: MemoryJob) -> int:
+    return int(job.payload.get("evidence_version") or engine.store.max_seq())
+
+
 def _job_ingest_processor(engine: MemoryEngine, job: MemoryJob) -> None:
     name = str(job.payload.get("processor") or job.kind.removeprefix("ingest:"))
     processor = engine.extensions.ingest_processors.get(name)
     if processor is None:
         raise RuntimeError(f"ingest processor is unavailable: {name}")
-    namespace = MemoryNamespace.model_validate(job.payload.get("namespace") or {})
+    namespace = _job_namespace(job)
     group_id = str(job.payload.get("group_id") or "")
     evidence = engine.store.list_records(
         kinds=processor.spec.input_kinds,
@@ -2547,42 +2337,16 @@ def _job_ingest_processor(engine: MemoryEngine, job: MemoryJob) -> None:
     proposed = processor.process(evidence, IngestContext(
         namespace=namespace,
         group_id=group_id,
-        evidence_version=int(
-            job.payload.get("evidence_version") or engine.store.max_seq()
-        ),
+        evidence_version=_job_evidence_version(engine, job),
         completion=engine.completion,
     ))
     available = {item.id: item for item in evidence}
     for item in proposed:
-        if not isinstance(item, ProposedRecord):
-            raise TypeError(f"ingest processor {name} returned a non-ProposedRecord value")
-        if item.kind not in processor.spec.output_kinds:
-            raise ValueError(f"ingest processor {name} returned disallowed kind {item.kind}")
-        if not item.evidence_refs or any(ref not in available for ref in item.evidence_refs):
-            raise ValueError(f"ingest processor {name} returned invalid evidence references")
-        primary = available[item.evidence_refs[0]]
-        engine.store.append(
-            kind=item.kind,
-            text=item.text,
-            group_id=group_id,
-            evidence_refs=item.evidence_refs,
-            confidence=item.confidence,
-            subject=item.subject,
-            relation=item.relation,
-            object=item.object,
-            temporal_anchor=item.temporal_anchor,
-            actor=Actor(type="ingest_pipeline", id=name),
-            namespace=namespace,
-            scope=primary.scope,
-            payload={**dict(item.payload), "producer": name},
-            source_ref=item.source_ref if item.source_ref is not None else primary.source_ref,
-            locator=item.locator if item.locator is not None else primary.locator,
-            external_key=item.external_key,
+        _append_proposed_ingest_record(
+            engine, name, processor, item, available, group_id, namespace
         )
     engine._record_extension_success(
-        "ingest",
-        name,
-        int(job.payload.get("evidence_version") or engine.store.max_seq()),
+        "ingest", name, _job_evidence_version(engine, job)
     )
 
 
@@ -2662,6 +2426,18 @@ def _answer_prompt(question: str, hits: list[Any]) -> str:
     )
 
 
+_CHUNK_KIND_MODALITY = {
+    "code_symbol": "code",
+    "code_lines": "code",
+    "row": "table",
+    "cell": "table",
+    "image": "image",
+    "message": "conversation",
+    "message_index": "conversation",
+    "dialog": "conversation",
+}
+
+
 def _source_retrieval_descriptor(
     prepared: PreparedSource,
     chunk: PreparedChunk,
@@ -2674,54 +2450,14 @@ def _source_retrieval_descriptor(
             chunk.source_type or prepared.kind,
             dict(chunk.retrieval_fields),
         )
-
     locator = chunk.locator
-    chunk_kind = str(locator.get("kind") or "")
     source_type = str(
         chunk.metadata.get("source_type")
         or prepared.metadata.get("source_type")
         or prepared.kind
     )
-    if chunk_kind in {"code_symbol", "code_lines"}:
-        modality = "code"
-    elif chunk_kind == "notebook_cell":
-        modality = "code" if locator.get("cell_type") == "code" else "document"
-    elif chunk_kind in {"row", "cell"} or source_type in {"csv", "xlsx", "spreadsheet"}:
-        modality = "table"
-    elif chunk_kind == "image" or source_type == "image" or prepared.kind == "image":
-        modality = "image"
-    elif chunk_kind in {"message", "message_index", "dialog"}:
-        modality = "conversation"
-    else:
-        modality = "document"
-
-    fields: dict[str, Any] = {
-        "title": prepared.title,
-        "filename": prepared.filename,
-        "path": locator.get("path") or prepared.filename,
-        "section": locator.get("section"),
-        "page": locator.get("page"),
-        "slide": locator.get("slide"),
-        "sheet": locator.get("sheet"),
-        "row": locator.get("row"),
-        "symbol": locator.get("symbol"),
-        "symbol_kind": locator.get("symbol_kind"),
-        "language": locator.get("language") or chunk.metadata.get("language") or prepared.metadata.get("language"),
-        "imports": chunk.metadata.get("imports"),
-        "headers": chunk.metadata.get("headers") or prepared.metadata.get("headers"),
-    }
-    if modality == "image":
-        fields["visible_text"] = chunk.text
-        fields["description"] = chunk.text
-    elif modality == "table":
-        fields["record"] = chunk.text
-    elif modality == "code":
-        fields["code"] = chunk.text
-    else:
-        fields["content"] = chunk.text
-    return modality, source_type, {
-        key: value for key, value in fields.items() if value is not None and value != ""
-    }
+    modality = _chunk_modality(str(locator.get("kind") or ""), source_type, prepared, locator)
+    return modality, source_type, _chunk_retrieval_fields(prepared, chunk, locator, modality)
 
 
 def _retriever_config(value: RetrievalConfiguration) -> RetrieverConfig:
@@ -2732,8 +2468,16 @@ def _retriever_config(value: RetrievalConfiguration) -> RetrieverConfig:
         per_source_context_tokens=value.per_source_context_tokens,
         graph_hops=value.graph_hops,
         margin_threshold=value.confidence_margin,
+        confidence_floor=value.confidence_floor,
         max_refinement_rounds=value.max_refinement_rounds,
         deep_summary_enabled=value.deep_summary_enabled,
+        claims_enabled=value.claims_enabled,
+        group_summaries_enabled=value.group_summaries_enabled,
+        reranker_enabled=value.reranker_enabled,
+        raw_candidates_only=value.raw_candidates_only,
+        readout=value.readout,
+        fusion=value.fusion,
+        rrf_rank_constant=value.rrf_rank_constant,
         retrieval_profile=value.retrieval_profile,
         enabled_routes=tuple(value.enabled_routes),
         route_weights=dict(value.route_weights),
@@ -2804,3 +2548,1110 @@ def _namespace(value: MemoryNamespace | dict[str, Any] | None) -> MemoryNamespac
 def _namespace_key(namespace: MemoryNamespace) -> str:
     serialized = json.dumps(namespace.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def _open_embedding_settings(
+    embedding_provider: ProviderSettings | None,
+    embedding_model: str,
+    configuration: ModelConfiguration,
+) -> ProviderSettings:
+    if embedding_provider is not None:
+        return embedding_provider
+    if embedding_model != "all-MiniLM-L6-v2":
+        return ProviderSettings(provider="sentence-transformers", model=embedding_model)
+    return settings_from_selection(configuration.embedding)
+
+
+def _unavailable_embedder(configuration: ModelConfiguration, error: str) -> UnavailableEmbedder:
+    selection = configuration.embedding
+    model = selection.model or "unknown"
+    return UnavailableEmbedder(
+        model,
+        embedding_cache_key(selection.provider, selection.base_url, model),
+        error,
+    )
+
+
+def _resolve_open_embedder(
+    embedder: Embedder | None,
+    embedding_provider: ProviderSettings | None,
+    embedding_model: str,
+    configuration: ModelConfiguration,
+    local_files_only: bool,
+    provider_errors: dict[str, str],
+) -> Embedder:
+    if embedder is not None:
+        return embedder
+    try:
+        provider = embedder_from_settings(
+            _open_embedding_settings(embedding_provider, embedding_model, configuration)
+        )
+        if isinstance(provider, SentenceTransformerEmbedder):
+            provider.local_files_only = local_files_only
+        return provider
+    except ProviderError as exc:
+        provider_errors["embedding"] = str(exc)
+        return _unavailable_embedder(configuration, str(exc))
+
+
+def _resolve_open_completion(
+    completion: CompletionJSON | None,
+    completion_provider: ProviderSettings | None,
+    configuration: ModelConfiguration,
+    provider_errors: dict[str, str],
+) -> CompletionJSON | None:
+    if completion is not None:
+        return completion
+    completion_settings = completion_provider or settings_from_selection(configuration.completion)
+    try:
+        return completion_from_settings(completion_settings)
+    except ProviderError as exc:
+        provider_errors["completion"] = str(exc)
+        return None
+
+
+def _resolve_open_registry(
+    extensions: Iterable[MemoryExtension],
+    extension_registry: EngineExtensionRegistry | None,
+    retrieval_routes: RouteRegistry | None,
+) -> EngineExtensionRegistry:
+    legacy_names = retrieval_routes.names if retrieval_routes else RouteRegistry().names
+    if extension_registry is None:
+        return _build_extension_registry(extensions, legacy_route_names=legacy_names)
+    if tuple(extensions):
+        raise ValueError("pass extensions or extension_registry, not both")
+    return _finalize_extension_registry(extension_registry, legacy_names)
+
+
+def _coerce_model_configuration(
+    configuration: ModelConfiguration | dict[str, Any],
+) -> ModelConfiguration:
+    if isinstance(configuration, ModelConfiguration):
+        return configuration
+    return ModelConfiguration.model_validate(configuration)
+
+
+def _model_selection_warnings(
+    store: SQLiteMemoryLogStore, requested: ModelConfiguration
+) -> list[str]:
+    warnings: list[str] = []
+    for role, selection in (
+        (ProviderRole.COMPLETION, requested.completion),
+        (ProviderRole.EMBEDDING, requested.embedding),
+    ):
+        warning = _selection_warning(store, role, selection)
+        if warning:
+            warnings.append(warning)
+    return warnings
+
+
+def _selection_warning(
+    store: SQLiteMemoryLogStore, role: ProviderRole, selection: ProviderSelection
+) -> str | None:
+    if selection.provider == "none":
+        return None
+    descriptor = store.find_cached_model(selection.provider, selection.model or "")
+    if descriptor is not None and role not in descriptor.roles:
+        raise ProviderError(
+            f"model {selection.model} is not cataloged for {role.value}"
+        )
+    if descriptor is not None:
+        return None
+    if selection.provider == "sentence-transformers" and selection.model == "all-MiniLM-L6-v2":
+        return None
+    return (
+        f"{selection.provider}/{selection.model} was accepted as an unverified custom model ID"
+    )
+
+
+def _coerce_connection_selection(
+    role: ProviderRole,
+    current: ModelConfiguration,
+    selection: ProviderSelection | dict[str, Any] | None,
+) -> ProviderSelection:
+    if selection is None:
+        if role == ProviderRole.COMPLETION:
+            return current.completion
+        return current.embedding
+    if isinstance(selection, ProviderSelection):
+        return selection
+    return ProviderSelection.model_validate(selection)
+
+
+def _probe_completion(selected: ProviderSelection) -> bool:
+    completion = completion_from_settings(settings_from_selection(selected))
+    assert completion is not None
+    completion.complete_json(
+        "Return only JSON.",
+        'Reply with exactly {"status":"ok"}.',
+    )
+    return hasattr(completion, "complete_multimodal")
+
+
+def _probe_embedding(selected: ProviderSelection) -> None:
+    embedder = embedder_from_settings(settings_from_selection(selected))
+    vectors = embedder.encode(["Trisynapse connection test"])
+    if len(vectors) != 1 or not vectors[0]:
+        raise ProviderError("embedding provider returned an empty vector")
+
+
+def _missing_provider_credentials(
+    providers: dict[str, ProviderDescriptor],
+    completion: ProviderSelection,
+    embedding: ProviderSelection,
+) -> list[str]:
+    required = [
+        item for item in (completion, embedding)
+        if item.provider not in {"none", "sentence-transformers", "openai-compatible"}
+    ]
+    return [
+        providers[item.provider].credential_env for item in required
+        if not providers[item.provider].credential_configured
+    ]
+
+
+def _source_extra_availability() -> dict[str, bool]:
+    import importlib.util
+
+    return {
+        name: importlib.util.find_spec(module) is not None
+        for name, module in {
+            "pdf": "pypdf", "office": "docx", "spreadsheets": "openpyxl",
+            "tree_sitter": "tree_sitter_language_pack", "tokens": "tiktoken",
+        }.items()
+    }
+
+
+def _port_8765_free() -> bool:
+    import socket
+
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", 8765))
+        except OSError:
+            return False
+    return True
+
+
+def _enforce_retained_source_limit(
+    inputs: Sequence[SourceInput],
+    prepared: dict[int, PreparedSource],
+    failures: dict[int, str],
+) -> None:
+    retained_bytes = 0
+    for index in range(len(inputs)):
+        if index not in prepared:
+            continue
+        candidate_bytes = retained_bytes + len(prepared[index].original)
+        if candidate_bytes <= 250 * 1024 * 1024:
+            retained_bytes = candidate_bytes
+            continue
+        failures[index] = "ingestion run exceeds the 250 MiB retained-source limit"
+        del prepared[index]
+
+
+def _ingestion_run_status(results: list[SourceIngestionResult]) -> str:
+    succeeded = sum(item.status in {"success", "skipped"} for item in results)
+    failed = sum(item.status == "failed" for item in results)
+    if failed and not succeeded:
+        return "failed"
+    if failed:
+        return "partial"
+    return "completed"
+
+
+def _prepared_source_key(prepared: PreparedSource) -> str:
+    return (
+        prepared.source.source_key
+        or prepared.uri
+        or f"upload:{prepared.filename}:{prepared.content_hash}"
+    )
+
+
+def _is_unchanged_source(
+    previous: SourceRecord | None, prepared: PreparedSource
+) -> bool:
+    return (
+        previous is not None
+        and previous.status == "active"
+        and previous.content_hash == prepared.content_hash
+    )
+
+
+def _source_identity_id(
+    namespace: MemoryNamespace, source_key: str, content_hash: str
+) -> str:
+    identity = json.dumps(
+        {
+            "namespace": namespace.model_dump(mode="json", exclude_none=True),
+            "source_key": source_key,
+            "content_hash": content_hash,
+        },
+        sort_keys=True,
+    )
+    return f"src_{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
+
+
+def _source_search_blob(item: SourceRecord) -> str:
+    return " ".join(
+        filter(None, [item.title, item.source_key, item.uri, item.filename])
+    ).lower()
+
+
+def _filter_sources(
+    values: list[SourceRecord],
+    *,
+    search: str | None,
+    kinds: Iterable[str] | None,
+    status: str | None,
+) -> list[SourceRecord]:
+    values = _filter_sources_by_search(values, search)
+    values = _filter_sources_by_kind(values, kinds)
+    return _filter_sources_by_status(values, status)
+
+
+def _filter_sources_by_search(
+    values: list[SourceRecord], search: str | None
+) -> list[SourceRecord]:
+    if not search:
+        return values
+    term = search.lower()
+    return [item for item in values if term in _source_search_blob(item)]
+
+
+def _filter_sources_by_kind(
+    values: list[SourceRecord], kinds: Iterable[str] | None
+) -> list[SourceRecord]:
+    allowed = set(kinds or [])
+    if not allowed:
+        return values
+    return [item for item in values if item.kind in allowed]
+
+
+def _filter_sources_by_status(
+    values: list[SourceRecord], status: str | None
+) -> list[SourceRecord]:
+    if not status:
+        return values
+    return [item for item in values if item.status == status]
+
+
+def _sort_sources(values: list[SourceRecord], sort: str) -> None:
+    if sort == "oldest":
+        values.sort(key=lambda item: item.created_at)
+        return
+    if sort == "title":
+        values.sort(key=lambda item: item.title.lower())
+        return
+    if sort != "newest":
+        raise ValueError("sort must be newest, oldest, or title")
+
+
+def _derived_source_filename(
+    store: SQLiteMemoryLogStore, source: SourceRecord
+) -> str | None:
+    if source.filename:
+        return None
+    derived = source.metadata.get("filename")
+    if derived:
+        return str(derived)
+    for delta_id in source.record_ids:
+        delta = store.get(delta_id)
+        if delta is None or not isinstance(delta.locator, dict):
+            continue
+        path = delta.locator.get("path")
+        if path:
+            return Path(str(path)).name
+    return str(source.title)
+
+
+def _source_ingestion_run_id(
+    store: SQLiteMemoryLogStore, source: SourceRecord
+) -> str | None:
+    if source.ingestion_run_id:
+        return None
+    for run in store.list_ingestion_runs(source.namespace, limit=10_000):
+        if any(result.source_id == source.id for result in run.results):
+            return run.id
+    return None
+
+
+def _source_size_updates(source: SourceRecord, path: Path) -> dict[str, Any]:
+    update: dict[str, Any] = {}
+    if not source.byte_size and path.is_file():
+        update["byte_size"] = path.stat().st_size
+    if not source.chunk_count:
+        update["chunk_count"] = len(source.record_ids)
+    preview = _derived_preview_type(source)
+    if preview:
+        update["preview_type"] = preview
+    skipped = _derived_skipped_count(source)
+    if skipped:
+        update["skipped_count"] = skipped
+    return update
+
+
+def _derived_preview_type(source: SourceRecord) -> str | None:
+    if source.preview_type:
+        return None
+    return str(source.metadata.get("source_type") or source.kind)
+
+
+def _derived_skipped_count(source: SourceRecord) -> int | None:
+    if source.skipped_count:
+        return None
+    skipped_paths = source.metadata.get("skipped_paths") or []
+    if not skipped_paths:
+        return None
+    return len(skipped_paths)
+
+
+def _source_hydrate_updates(
+    store: SQLiteMemoryLogStore, source: SourceRecord
+) -> dict[str, Any]:
+    update: dict[str, Any] = {}
+    filename = _derived_source_filename(store, source)
+    if filename is not None:
+        update["filename"] = filename
+    update.update(_source_size_updates(source, store.root / source.blob_path))
+    run_id = _source_ingestion_run_id(store, source)
+    if run_id:
+        update["ingestion_run_id"] = run_id
+    return update
+
+
+def _source_preview_items(
+    store: SQLiteMemoryLogStore, record_ids: list[str]
+) -> tuple[list[SourcePreviewItem], list[str]]:
+    values: list[SourcePreviewItem] = []
+    manifest: list[str] = []
+    for delta_id in record_ids:
+        item = _preview_item_from_delta(store.get(delta_id))
+        if item is None:
+            continue
+        preview, item_manifest = item
+        if item_manifest is not None:
+            manifest = item_manifest
+        values.append(preview)
+    return values, manifest
+
+
+def _preview_item_from_delta(
+    delta: MemoryRecord | None,
+) -> tuple[SourcePreviewItem, list[str] | None] | None:
+    if delta is None:
+        return None
+    locator = delta.locator
+    locator_metadata = locator.get("metadata", {}) if isinstance(locator, dict) else {}
+    kind = (
+        str(locator.get("kind") or delta.kind)
+        if isinstance(locator, dict) else delta.kind
+    )
+    manifest = None
+    if kind == "manifest":
+        manifest = [line for line in delta.text.splitlines()[1:] if line.strip()]
+    return SourcePreviewItem(
+        record_id=delta.id,
+        kind=kind,
+        text=delta.text,
+        locator=locator,
+        metadata=locator_metadata,
+    ), manifest
+
+
+def _group_summary_plan(
+    store: SQLiteMemoryLogStore,
+    namespace: MemoryNamespace,
+    deltas: list[MemoryRecord],
+    group_ids: list[str] | None,
+) -> tuple[dict[str, GroupSummaryView], list[str], list[str]]:
+    requested = list(group_ids or [])
+    existing = _existing_group_summaries(store, namespace, requested)
+    targets = requested or _group_summary_targets(deltas)
+    pending_ids = [group_id for group_id in targets if group_id not in existing]
+    return existing, targets, pending_ids
+
+
+def _group_summary_progress(
+    on_progress: Callable[[int, int], None] | None,
+    already: int,
+    total: int,
+) -> Callable[[int, int], None] | None:
+    if on_progress is None:
+        return None
+    return lambda done, count: _report_group_summary_progress(
+        on_progress, already, total, done, count
+    )
+
+
+def _merge_group_summaries(
+    targets: list[str],
+    existing: dict[str, GroupSummaryView],
+    views: list[GroupSummaryView],
+) -> list[GroupSummaryView]:
+    return [existing[group_id] for group_id in targets if group_id in existing] + views
+
+
+def _existing_group_summaries(
+    store: SQLiteMemoryLogStore,
+    namespace: MemoryNamespace,
+    requested: list[str],
+) -> dict[str, GroupSummaryView]:
+    return {
+        view.group_id: view
+        for view in store.group_summary_views(namespace=namespace, include_stale=False)
+        if not requested or view.group_id in requested
+    }
+
+
+def _group_summary_targets(deltas: list[MemoryRecord]) -> list[str]:
+    return list(dict.fromkeys(
+        item.group_id
+        for item in deltas
+        if item.group_id and item.kind in {"raw_source", "fact", "note"}
+    ))
+
+
+def _cached_group_summaries(
+    targets: list[str],
+    existing: dict[str, GroupSummaryView],
+    on_progress: Callable[[int, int], None] | None,
+) -> list[GroupSummaryView]:
+    if on_progress is not None:
+        on_progress(len(targets), len(targets))
+    return [existing[group_id] for group_id in targets if group_id in existing]
+
+
+def _persist_group_summary(
+    store: SQLiteMemoryLogStore, view: GroupSummaryView, namespace: MemoryNamespace
+) -> None:
+    view.namespace = namespace
+    view.cache_key = f"{view.cache_key}:{_namespace_key(namespace)}"
+    store.put_group_summary(view)
+
+
+def _report_group_summary_progress(
+    on_progress: Callable[[int, int], None],
+    already: int,
+    total: int,
+    done: int,
+    count: int,
+) -> None:
+    del count
+    on_progress(already + done, total)
+
+
+def _query_context_top_k(top_k: int | None, run: QueryRun) -> int:
+    if top_k is not None:
+        return top_k
+    return run.retrieval_configuration.max_context_items
+
+
+def _query_abstain_threshold(run: QueryRun, abstain_threshold: float | None) -> float:
+    if abstain_threshold is None:
+        return run.retrieval_configuration.answer_abstain_threshold
+    return abstain_threshold
+
+
+def _hits_are_relevant(hits: list[Any], threshold: float) -> bool:
+    return bool(hits) and hits[0].score >= threshold
+
+
+def _query_generation_provenance(completion: CompletionJSON | None) -> dict[str, Any]:
+    prompt = None
+    if completion is not None:
+        prompt = load_prompt("answer").provenance()
+    return {**provider_provenance(completion, kind="completion"), "prompt": prompt}
+
+
+def _query_answer_label(relevant: bool) -> str:
+    if relevant:
+        return "Generate grounded answer"
+    return "Abstain without enough evidence"
+
+
+def _query_answer(
+    completion: CompletionJSON | None,
+    question: str,
+    hits: list[Any],
+    relevant: bool,
+) -> tuple[str, bool, list[Any]]:
+    if completion is not None and relevant:
+        return _completion_query_answer(completion, question, hits)
+    if relevant:
+        answer = _extractive_answer(question, hits)
+        return answer, not answer, hits
+    return "I don't have enough grounded evidence to answer that.", True, hits
+
+
+def _completion_query_answer(
+    completion: CompletionJSON,
+    question: str,
+    hits: list[Any],
+) -> tuple[str, bool, list[Any]]:
+    payload = complete_json_parallel(
+        completion,
+        [(load_prompt("answer").text, _answer_prompt(question, hits))],
+        on_error=_skippable_answer_payload,
+    )[0]
+    answer, abstain = _answer_from_payload(payload)
+    cited_hits = _cited_hits_from_payload(payload, hits)
+    if payload.get("citation_ids") is None:
+        return answer, abstain, cited_hits
+    if not answer or abstain or cited_hits:
+        return answer, abstain, cited_hits
+    return "I don't have enough grounded evidence to answer that.", True, cited_hits
+
+
+def _skippable_answer_payload(_index: int, exc: BaseException) -> dict[str, Any] | None:
+    if not isinstance(exc, Exception) or not skippable_completion_error(exc):
+        return None
+    return {
+        "answer": "I don't have enough grounded evidence to answer that.",
+        "abstain": True,
+    }
+
+
+def _answer_from_payload(payload: dict[str, Any]) -> tuple[str, bool]:
+    raw_answer = payload.get("answer")
+    answer = str(raw_answer).strip() if raw_answer else ""
+    abstain = bool(payload.get("abstain", False)) or not answer
+    return answer, abstain
+
+
+def _cited_hits_from_payload(payload: dict[str, Any], hits: list[Any]) -> list[Any]:
+    requested = payload.get("citation_ids")
+    if requested is None:
+        return hits
+    if not isinstance(requested, list):
+        raise ValueError("answer citation_ids must be a list")
+    requested_ids = {str(value) for value in requested}
+    return [hit for hit in hits if hit.item_id in requested_ids]
+
+
+def _record_group_info(
+    group_id: str,
+    deltas: list[MemoryRecord],
+    fresh: dict[str, bool],
+) -> RecordGroupInfo:
+    observed = [item.observed_at for item in deltas if item.observed_at]
+    return RecordGroupInfo(
+        group_id=group_id,
+        record_count=len(deltas),
+        raw_source_count=sum(item.kind == "raw_source" for item in deltas),
+        fact_count=sum(item.kind == "fact" for item in deltas),
+        first_observed_at=min(observed) if observed else None,
+        last_observed_at=max(observed) if observed else None,
+        stale=not fresh.get(group_id, False),
+    )
+
+
+def _namespace_claims(
+    store: SQLiteMemoryLogStore,
+    namespace: MemoryNamespace,
+    scope: dict[str, Any],
+) -> list[Claim]:
+    deltas = store.list_records(
+        kinds=["raw_source", "fact"],
+        scope=scope,
+        namespace=namespace,
+    )
+    observations = {item.id: item for item in deltas if item.kind == "raw_source"}
+    return compile_claims([item for item in deltas if item.kind == "fact"], observations)
+
+
+def _claim_export_graph(claims: list[Claim]) -> dict[str, Any]:
+    nodes: list[dict[str, str]] = []
+    edges: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for claim in claims:
+        _append_claim_export_nodes(nodes, seen, claim)
+        if not claim.subject or not claim.object:
+            continue
+        edges.append({
+            "source": claim.subject,
+            "target": claim.object,
+            "relation": claim.relation,
+            "confidence": claim.confidence,
+            "status": claim.status,
+        })
+    return {"nodes": nodes, "edges": edges}
+
+
+def _append_claim_export_nodes(
+    nodes: list[dict[str, str]], seen: set[str], claim: Claim
+) -> None:
+    for label in (claim.subject, claim.object):
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        nodes.append({"id": label, "label": label})
+
+
+def _validate_memory_graph_args(view: str, limit: int) -> None:
+    if view not in {"knowledge", "lineage", "log", "retrieval"}:
+        raise ValueError("view must be knowledge, lineage, log, or retrieval")
+    if limit < 1 or limit > 2000:
+        raise ValueError("limit must be between 1 and 2000")
+
+
+def _filter_graph_deltas(
+    deltas: list[MemoryRecord],
+    *,
+    group_id: str | None,
+    source_id: str | None,
+) -> list[MemoryRecord]:
+    if group_id:
+        deltas = [item for item in deltas if item.group_id == group_id]
+    if source_id:
+        deltas = [item for item in deltas if item.scope.get("source_id") == source_id]
+    return deltas
+
+
+def _memory_graph_claims(deltas: list[MemoryRecord]) -> list[Claim]:
+    observations = {item.id: item for item in deltas if item.kind == "raw_source"}
+    return compile_claims([item for item in deltas if item.kind == "fact"], observations)
+
+
+def _graph_add_node(nodes: dict[str, MemoryGraphNode], node: MemoryGraphNode) -> None:
+    nodes.setdefault(node.id, node)
+
+
+def _graph_add_edge(edges: dict[str, MemoryGraphEdge], edge: MemoryGraphEdge) -> None:
+    edges.setdefault(edge.id, edge)
+
+
+def _add_source_lineage_nodes(
+    nodes: dict[str, MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    sources: list[SourceRecord],
+    source_id: str | None,
+) -> None:
+    if source_id:
+        sources = [item for item in sources if item.id == source_id]
+    for source in sources:
+        _graph_add_node(nodes, MemoryGraphNode(
+            id=source.id, type="source", label=source.title,
+            subtitle=source.kind, status=source.status,
+            data={"source_key": source.source_key, "version": source.version, "media_type": source.media_type},
+        ))
+        if not source.previous_source_id:
+            continue
+        _graph_add_edge(edges, MemoryGraphEdge(
+            id=f"source-version:{source.id}:{source.previous_source_id}",
+            source=source.id, target=source.previous_source_id,
+            type="supersedes", label="supersedes",
+        ))
+
+
+def _add_log_delta_nodes(
+    view: str,
+    nodes: dict[str, MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    deltas: list[MemoryRecord],
+    retracted_ids: set[str],
+) -> None:
+    previous_by_group: dict[str, str] = {}
+    for delta in deltas:
+        _graph_add_node(nodes, MemoryGraphNode(
+            id=delta.id, type="log", label=(delta.text or delta.kind)[:90],
+            subtitle=delta.kind, status="retracted" if delta.id in retracted_ids else "active",
+            data={
+                "kind": delta.kind, "seq": delta.seq, "group_id": delta.group_id,
+                "observed_at": delta.observed_at.isoformat() if delta.observed_at else None,
+                "source_ref": delta.source_ref, "locator": delta.locator,
+            },
+        ))
+        _link_delta_to_source(edges, delta)
+        _link_delta_to_group(view, nodes, edges, delta, previous_by_group)
+        for evidence_id in delta.evidence_refs:
+            _graph_add_edge(edges, MemoryGraphEdge(
+                id=f"evidence:{evidence_id}:{delta.id}", source=evidence_id,
+                target=delta.id, type="supports", label="supports",
+            ))
+
+
+def _link_delta_to_source(
+    edges: dict[str, MemoryGraphEdge], delta: MemoryRecord
+) -> None:
+    current_source = str(delta.scope.get("source_id") or "")
+    if not current_source:
+        return
+    _graph_add_edge(edges, MemoryGraphEdge(
+        id=f"source-trace:{current_source}:{delta.id}", source=current_source,
+        target=delta.id, type="produced", label="produced",
+    ))
+
+
+def _link_delta_to_group(
+    view: str,
+    nodes: dict[str, MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    delta: MemoryRecord,
+    previous_by_group: dict[str, str],
+) -> None:
+    if not delta.group_id:
+        return
+    group_node = f"group:{delta.group_id}"
+    _graph_add_node(nodes, MemoryGraphNode(
+        id=group_node, type="group", label=delta.group_id,
+        subtitle="record group",
+    ))
+    _graph_add_edge(edges, MemoryGraphEdge(
+        id=f"episode-trace:{group_node}:{delta.id}", source=group_node,
+        target=delta.id, type="contains", label="contains",
+    ))
+    previous = previous_by_group.get(delta.group_id)
+    if view == "log" and previous:
+        _graph_add_edge(edges, MemoryGraphEdge(
+            id=f"follows:{previous}:{delta.id}", source=previous,
+            target=delta.id, type="followed_by", label="then",
+        ))
+    previous_by_group[delta.group_id] = delta.id
+
+
+def _add_knowledge_claim_graph(
+    view: str,
+    nodes: dict[str, MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    claims: list[Claim],
+    summaries: list[GroupSummaryView],
+) -> None:
+    for claim in claims:
+        _add_claim_graph_nodes(view, nodes, edges, claim)
+    if view != "lineage":
+        return
+    for recall in summaries:
+        _graph_add_node(nodes, MemoryGraphNode(
+            id=recall.id, type="index", label=recall.concept_or_topic,
+            subtitle="Batch summary", status="stale" if recall.stale else "fresh",
+            data={"group_id": recall.group_id, "summary": recall.summary},
+        ))
+        for trace_id in recall.source_log_ids:
+            _graph_add_edge(edges, MemoryGraphEdge(
+                id=f"recall-ground:{trace_id}:{recall.id}", source=trace_id,
+                target=recall.id, type="summarizes", label="summarizes",
+            ))
+
+
+def _add_claim_graph_nodes(
+    view: str,
+    nodes: dict[str, MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    claim: Claim,
+) -> None:
+    claim_id = f"claim:{claim.id}"
+    _graph_add_node(nodes, MemoryGraphNode(
+        id=claim_id, type="claim", label=claim.text[:100],
+        subtitle=claim.relation, status=claim.status,
+        data={"confidence": claim.confidence, "source_record_ids": claim.source_record_ids},
+    ))
+    _add_claim_endpoint(nodes, edges, claim_id, "subject", claim.subject, claim)
+    _add_claim_endpoint(nodes, edges, claim_id, "object", claim.object, claim)
+    if view != "lineage":
+        return
+    for evidence_id in dict.fromkeys(claim.source_record_ids + claim.raw_source_ids):
+        _graph_add_edge(edges, MemoryGraphEdge(
+            id=f"claim-ground:{evidence_id}:{claim_id}", source=evidence_id,
+            target=claim_id, type="grounds", label="grounds",
+        ))
+
+
+def _add_claim_endpoint(
+    nodes: dict[str, MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    claim_id: str,
+    role: str,
+    label: str | None,
+    claim: Claim,
+) -> None:
+    if not label:
+        return
+    concept_id = f"concept:{hashlib.sha256(label.lower().encode()).hexdigest()[:16]}"
+    _graph_add_node(nodes, MemoryGraphNode(id=concept_id, type="concept", label=label, subtitle=role))
+    if role == "subject":
+        _graph_add_edge(edges, MemoryGraphEdge(
+            id=f"claim-subject:{concept_id}:{claim_id}", source=concept_id,
+            target=claim_id, type="subject", label=claim.relation or "claim",
+            weight=claim.confidence,
+        ))
+        return
+    _graph_add_edge(edges, MemoryGraphEdge(
+        id=f"claim-object:{claim_id}:{concept_id}", source=claim_id,
+        target=concept_id, type="object", label=claim.relation or "relates to",
+        weight=claim.confidence,
+    ))
+
+
+def _filter_graph_nodes(
+    all_nodes: list[MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    search: str | None,
+    node_types: Iterable[str] | None,
+) -> list[MemoryGraphNode]:
+    allowed = set(node_types or [])
+    if allowed:
+        all_nodes = [item for item in all_nodes if item.type in allowed]
+    matched = _graph_search_ids(all_nodes, edges, search)
+    if matched is None:
+        return all_nodes
+    return [item for item in all_nodes if item.id in matched]
+
+
+def _graph_search_ids(
+    all_nodes: list[MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    search: str | None,
+) -> set[str] | None:
+    if not search:
+        return None
+    term = search.lower()
+    matched = {
+        item.id for item in all_nodes
+        if term in f"{item.label} {item.subtitle or ''}".lower()
+    }
+    return matched | _matched_neighbor_ids(edges, matched)
+
+
+def _matched_neighbor_ids(
+    edges: dict[str, MemoryGraphEdge], matched: set[str]
+) -> set[str]:
+    neighbor_ids: set[str] = set()
+    for edge in edges.values():
+        if edge.source not in matched and edge.target not in matched:
+            continue
+        neighbor_ids.update((edge.source, edge.target))
+    return neighbor_ids
+
+
+def _paginate_memory_graph(
+    view: str,
+    nodes: dict[str, MemoryGraphNode],
+    edges: dict[str, MemoryGraphEdge],
+    search: str | None,
+    node_types: Iterable[str] | None,
+    limit: int,
+    cursor: str | None,
+) -> MemoryGraphPage:
+    all_nodes = _filter_graph_nodes(list(nodes.values()), edges, search, node_types)
+    counts: dict[str, int] = defaultdict(int)
+    for item in all_nodes:
+        counts[item.type] += 1
+    offset = int(cursor or 0)
+    page_nodes = all_nodes[offset:offset + limit]
+    page_ids = {item.id for item in page_nodes}
+    page_edges = [
+        edge for edge in edges.values()
+        if edge.source in page_ids and edge.target in page_ids
+    ]
+    truncated = offset + limit < len(all_nodes)
+    return MemoryGraphPage(
+        view=view,
+        nodes=page_nodes,
+        edges=page_edges,
+        counts=dict(counts),
+        truncated=truncated,
+        next_cursor=str(offset + limit) if truncated else None,
+    )
+
+
+def _neighbor_subgraph(
+    graph: MemoryGraphPage, node_id: str, limit: int
+) -> MemoryGraphPage:
+    edges = _incident_edges(graph.edges, node_id, limit)
+    ids = {node_id}
+    for edge in edges:
+        ids.update((edge.source, edge.target))
+    nodes = [node for node in graph.nodes if node.id in ids]
+    return MemoryGraphPage(
+        view=graph.view,
+        nodes=nodes,
+        edges=edges,
+        counts=_node_type_counts(nodes),
+        truncated=len(graph.edges) > len(edges),
+    )
+
+
+def _incident_edges(
+    edges: list[MemoryGraphEdge], node_id: str, limit: int
+) -> list[MemoryGraphEdge]:
+    return [edge for edge in edges if node_id in {edge.source, edge.target}][:limit]
+
+
+def _node_type_counts(nodes: list[MemoryGraphNode]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for node in nodes:
+        counts[node.type] += 1
+    return dict(counts)
+
+
+def _profile_from_claims(claims: list[Claim]) -> dict[str, Any]:
+    ordered = sorted(claims, key=lambda item: item.confidence, reverse=True)
+    return {
+        "static": [item.text for item in ordered if item.confidence >= 0.7][:12],
+        "dynamic": [item.text for item in ordered if item.confidence < 0.7][:12],
+    }
+
+
+def _extension_has_persistent_recall(
+    extensions: EngineExtensionRegistry, extension_id: str
+) -> bool:
+    return any(
+        channel.spec.persistent
+        and extensions.owner("index", channel.spec.id) == extension_id
+        for channel in extensions.index_channels.channels
+    )
+
+
+def _extension_state_for_sync(
+    extension_id: str,
+    spec: Any,
+    previous: ExtensionState | None,
+    revision_changed: bool,
+) -> ExtensionState:
+    status = "rebuild_required" if revision_changed else "available"
+    last_error = None
+    if previous is not None and status != "available":
+        last_error = previous.last_error
+    return ExtensionState(
+        extension_id=extension_id,
+        installed_version=spec.version,
+        engine_api=spec.engine_api,
+        storage_revision=spec.storage_revision,
+        last_projected_seq=previous.last_projected_seq if previous else 0,
+        status=status,
+        last_error=last_error,
+    )
+
+
+def _embedding_prewarm_texts(
+    store: SQLiteMemoryLogStore, deltas: list[MemoryRecord]
+) -> list[str]:
+    texts = _record_prewarm_texts(deltas)
+    texts.extend(_claim_prewarm_texts(deltas))
+    texts.extend(_summary_prewarm_texts(store))
+    return texts
+
+
+def _record_prewarm_texts(deltas: list[MemoryRecord]) -> list[str]:
+    return [
+        item.text for item in deltas
+        if item.kind in {"raw_source", "fact"} and item.text.strip()
+    ]
+
+
+def _claim_prewarm_texts(deltas: list[MemoryRecord]) -> list[str]:
+    observations = {item.id: item for item in deltas if item.kind == "raw_source"}
+    claims = compile_claims([item for item in deltas if item.kind == "fact"], observations)
+    return [item.text for item in claims if item.text.strip()]
+
+
+def _summary_prewarm_texts(store: SQLiteMemoryLogStore) -> list[str]:
+    return [
+        " ".join([view.summary, view.concept_or_topic, *view.alt_phrasings])
+        for view in store.group_summary_views()
+        if view.summary.strip()
+    ]
+
+
+def _append_proposed_ingest_record(
+    engine: MemoryEngine,
+    name: str,
+    processor: Any,
+    item: Any,
+    available: dict[str, MemoryRecord],
+    group_id: str,
+    namespace: MemoryNamespace,
+) -> None:
+    if not isinstance(item, ProposedRecord):
+        raise TypeError(f"ingest processor {name} returned a non-ProposedRecord value")
+    if item.kind not in processor.spec.output_kinds:
+        raise ValueError(f"ingest processor {name} returned disallowed kind {item.kind}")
+    if not item.evidence_refs or any(ref not in available for ref in item.evidence_refs):
+        raise ValueError(f"ingest processor {name} returned invalid evidence references")
+    primary = available[item.evidence_refs[0]]
+    engine.store.append(
+        kind=item.kind,
+        text=item.text,
+        group_id=group_id,
+        evidence_refs=item.evidence_refs,
+        confidence=item.confidence,
+        subject=item.subject,
+        relation=item.relation,
+        object=item.object,
+        temporal_anchor=item.temporal_anchor,
+        actor=Actor(type="ingest_pipeline", id=name),
+        namespace=namespace,
+        scope=primary.scope,
+        payload={**dict(item.payload), "producer": name},
+        source_ref=item.source_ref if item.source_ref is not None else primary.source_ref,
+        locator=item.locator if item.locator is not None else primary.locator,
+        external_key=item.external_key,
+    )
+
+
+def _chunk_modality(
+    chunk_kind: str,
+    source_type: str,
+    prepared: PreparedSource,
+    locator: dict[str, Any],
+) -> str:
+    if chunk_kind == "notebook_cell":
+        return "code" if locator.get("cell_type") == "code" else "document"
+    mapped = _CHUNK_KIND_MODALITY.get(chunk_kind)
+    if mapped:
+        return mapped
+    if source_type in {"csv", "xlsx", "spreadsheet"}:
+        return "table"
+    if source_type == "image" or prepared.kind == "image":
+        return "image"
+    return "document"
+
+
+_TEXT_FIELD_BY_MODALITY = {
+    "image": ("visible_text", "description"),
+    "table": ("record",),
+    "code": ("code",),
+}
+
+
+def _chunk_retrieval_fields(
+    prepared: PreparedSource,
+    chunk: PreparedChunk,
+    locator: dict[str, Any],
+    modality: str,
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "title": prepared.title,
+        "filename": prepared.filename,
+        "path": locator.get("path") or prepared.filename,
+        "section": locator.get("section"),
+        "page": locator.get("page"),
+        "slide": locator.get("slide"),
+        "sheet": locator.get("sheet"),
+        "row": locator.get("row"),
+        "symbol": locator.get("symbol"),
+        "symbol_kind": locator.get("symbol_kind"),
+        "language": _chunk_language(locator, chunk, prepared),
+        "imports": chunk.metadata.get("imports"),
+        "headers": chunk.metadata.get("headers") or prepared.metadata.get("headers"),
+    }
+    for key in _TEXT_FIELD_BY_MODALITY.get(modality, ("content",)):
+        fields[key] = chunk.text
+    return _drop_empty_fields(fields)
+
+
+def _chunk_language(
+    locator: dict[str, Any], chunk: PreparedChunk, prepared: PreparedSource
+) -> Any:
+    return (
+        locator.get("language")
+        or chunk.metadata.get("language")
+        or prepared.metadata.get("language")
+    )
+
+
+def _drop_empty_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value for key, value in fields.items() if value is not None and value != ""
+    }

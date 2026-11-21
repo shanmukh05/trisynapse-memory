@@ -126,6 +126,32 @@ def test_query_reports_durable_retrieval_steps_as_they_complete(tmp_path) -> Non
     assert phases[-2:] == ["answer", "audit"]
 
 
+def test_query_abstains_when_answer_json_is_invalid(tmp_path) -> None:
+    calls = {"n": 0}
+
+    class BrokenJsonCompletion:
+        model = "broken-json"
+
+        def complete_json(self, system: str, user: str) -> dict:
+            calls["n"] += 1
+            raise ValueError("completion returned invalid JSON: Unterminated string starting at")
+
+        __call__ = complete_json
+
+    engine = MemoryEngine.open(
+        tmp_path, embedder=DeterministicEmbedder(), completion=BrokenJsonCompletion(), auto_process=False
+    )
+    current = engine.get_retrieval_configuration()
+    engine.set_retrieval_configuration(
+        current.model_copy(update={"answer_abstain_threshold": 0.0, "revision": current.revision})
+    )
+    engine.ingest_raw_source("Maya prefers green tea.", group_id="chat:tea", schedule=False)
+    result = engine.query("What does Maya prefer?")
+    assert calls["n"] >= 1
+    assert result.abstain is True
+    assert "enough grounded evidence" in result.answer
+
+
 def test_snapshots_are_recall_windows_not_trace_mutations(tmp_path) -> None:
     engine = make_engine(tmp_path)
     first = engine.ingest_raw_source("The project uses SQLite.", group_id="project:one")

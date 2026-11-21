@@ -1,0 +1,13 @@
+{
+  "graph_hops": 0,
+  "enabled_routes": [
+    "bm25",
+    "semantic",
+    "temporal",
+    "code",
+    "table",
+    "image",
+    "document",
+    "conversation"
+  ]
+}

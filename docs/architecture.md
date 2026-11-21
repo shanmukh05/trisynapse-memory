@@ -19,7 +19,7 @@ These are the names used in code, JSON, and Studio.
 | **Note** | User correction or instruction. Kind: `note`. |
 | **Record group** | A group of records from one conversation, document, or event (`group_id`). |
 | **Group summary** | A short index card used to route a question toward a record group. |
-| **Deep summary** | A wider retrieval stage when fast routes are not confident. |
+| **Deep summary** | A wider retrieval stage (`deep_summary`) when fast routes are not confident. The terminal labels this escalation Deep Recall. |
 | **Claim** | A compiled, disposable assertion built from facts. |
 | **Embedding index** | Vector store used for semantic search. |
 
@@ -680,31 +680,34 @@ engine/
 ├── utils.py                  shared numerical and version helpers
 ├── ingest/                   source preparation and evidence creation
 ├── memory_log/               durable ordered evidence
-├── indexes/                  rebuildable views and the embedding index
+├── indexes/                  rebuildable views, inspection, embedding index
 ├── retrieval/                planning, ranking, grounding, and context
 └── providers/                completion and embedding integrations
 ```
 
 | Area | Path | Responsibility |
 |---|---|---|
-| Public engine | `src/trisynapse_memory/engine/memory.py` | Lifecycle, ingestion runs, retrieval, backups |
+| Public engine | `src/trisynapse_memory/engine/memory.py` | Lifecycle, ingestion runs, retrieval, backups. Catalog, helper pages, and the retrieval graph live in `indexes/inspect.py`; knowledge/lineage/log graphs are built here. |
 | Shared contracts | `engine/models.py` | Public models used across every architecture component |
 | Extension contracts | `engine/extensions.py` | Packs, source/ingest/index/branch registries, fusion and reranking |
 | Shared utilities | `engine/utils.py` | Runtime version lookup, NumPy cosine, shared BM25, weighted reciprocal-rank fusion |
 | Ingest pipeline | `engine/ingest/pipeline.py` | Raw-source and evidence-linked fact writes |
 | Ingest sources | `engine/ingest/sources.py` | Loaders, safety rules, retained blobs, code/image/archive handling |
 | Memory log | `engine/memory_log/store.py` | SQLite, ordered records, jobs, sources, query runs, validation, removal audit |
+| Index catalog | `engine/indexes/catalog.py` | Built-in helper ids Studio lists without a closed tab enum |
+| Index inspection | `engine/indexes/inspect.py` | Read-only catalog, helper pages, vector projection, retrieval graph. Must not write the memory log. |
 | Claims and group summaries | `engine/indexes/claims.py` | Claims and group summary |
 | Embedding index | `engine/indexes/embedding_index.py` | Rebuildable SQLite and LanceDB embedding indexes |
 | Retrieval contracts | `engine/retrieval/contracts.py` | Canonical documents, query planner, route interface, registry, profiles |
-| Retrieval execution | `engine/retrieval/engine.py` | Fusion, confidence, memory-log drill-down, context budgeting |
+| Retrieval execution | `engine/retrieval/engine.py` | Staged search, fusion, confidence, memory-log grounding, context budgeting |
 | Retrieval tokenization | `engine/retrieval/tokenization.py` | Unicode/code lexical tokens and replaceable context token counters |
 | Provider registry | `engine/providers/registry.py` | Completion, vision, discovery, and model configuration |
 | Provider embeddings | `engine/providers/embedding.py` | Local and remote embedding integrations |
 | Prompt package | `prompts/` | Versioned production prompts |
-| REST/Studio | `api.py`, `studio/` | Service and browser UI |
-| Terminal/CLI | `cli.py`, `terminal.py` | Scriptable and interactive operations |
-| Adapters | `adapters/` | Agent events, Trisynapse, benchmark formats |
+| REST/Studio | `api.py`, `studio/` | Service and browser UI. HTTP translates into MemoryEngine; it does not invent retrieval rules. |
+| Terminal/CLI | `cli.py`, `terminal.py` | Scriptable and interactive operations. Slash commands dispatch to the same engine methods as the CLI. |
+| Benchmarks | `benchmarks/` | YAML configs, production runner, scoring, and release gates. Adapters parse datasets; they do not change retrieval. |
+| Adapters | `adapters/` | Agent events, Trisynapse, and benchmark formats (LoCoMo, LongMemEval, PersonaMem-v2 text/32k, BEAM 100K/10M, HaluMem, MemoryDoc) |
 
 ## Invariants worth remembering
 

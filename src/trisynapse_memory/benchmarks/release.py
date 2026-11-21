@@ -1,4 +1,10 @@
-"""Reproducible benchmark requirements for a v0 release tag."""
+"""Reproducible benchmark requirements for a v0 release tag.
+
+Owns the gate that reads the latest production artifact per suite and compares
+it to the published recall/judge floors. Runners write artifacts; this module
+only scores them. A missing or non-production artifact fails the suite — it
+does not invent a passing score.
+"""
 
 from __future__ import annotations
 
@@ -29,57 +35,101 @@ def evaluate_release_gate(
     suites: dict[str, Any] = {}
     passed = True
     for suite, requirements in selected_requirements.items():
-        paths = sorted((root / suite / "runs").glob(f"trace_recall_{suite}_*.json"), reverse=True)
-        candidates: list[tuple[Path, dict[str, Any]]] = []
-        for path in paths:
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if payload.get("mode") == mode:
-                candidates.append((path, payload))
-        if not candidates:
-            suites[suite] = {"passed": False, "error": f"no production {mode} artifact"}
-            passed = False
-            continue
-        artifact, payload = candidates[0]
-        summary = payload.get("summary") or {}
-        production_artifact = payload.get("architecture") == "trace-and-recall-production"
-        schema_current = payload.get("artifact_schema_version") == BENCHMARK_ARTIFACT_SCHEMA_VERSION
-        provenance_present = isinstance(payload.get("providers"), dict) and isinstance(payload.get("prompts"), list)
-        providers = payload.get("providers") or {}
-        prompt_names = [item.get("name") for item in payload.get("prompts") or [] if isinstance(item, dict)]
-        workflow_provenance_valid = (
-            providers.get("completion", {}).get("provider") not in {None, "none"}
-            and prompt_names == ["facts", "group_summary", "answer", "benchmark_judge"]
-            if mode == "end-to-end"
-            else providers.get("completion", {}).get("provider") == "none" and prompt_names == []
-        )
-        engine_version = payload.get("engine_version")
-        checks = {
-            key: {
-                "actual": summary.get(key),
-                "minimum": minimum,
-                "passed": summary.get(key) is not None and float(summary[key]) >= minimum,
-            }
-            for key, minimum in requirements.items()
-        }
-        storage_ok = bool((payload.get("store_validation") or {}).get("ok"))
-        suite_passed = bool(
-            production_artifact and schema_current and provenance_present and workflow_provenance_valid and engine_version
-            and storage_ok and all(item["passed"] for item in checks.values())
-        )
-        suites[suite] = {
-            "passed": suite_passed,
-            "artifact": str(artifact),
-            "production_artifact": production_artifact,
-            "artifact_schema_current": schema_current,
-            "provenance_present": provenance_present,
-            "workflow_provenance_valid": workflow_provenance_valid,
-            "mode": mode,
-            "engine_version": engine_version,
-            "storage_ok": storage_ok,
-            "checks": checks,
-        }
+        report, suite_passed = _evaluate_suite_gate(root, suite, requirements, mode)
+        suites[suite] = report
         passed = passed and suite_passed
     return {"passed": passed, "mode": mode, "requirements": selected_requirements, "suites": suites}
+
+
+def _evaluate_suite_gate(
+    root: Path,
+    suite: str,
+    requirements: dict[str, float],
+    mode: BenchmarkMode,
+) -> tuple[dict[str, Any], bool]:
+    candidates = _mode_artifacts(root, suite, mode)
+    if not candidates:
+        return {"passed": False, "error": f"no production {mode} artifact"}, False
+    artifact, payload = candidates[0]
+    checks = _requirement_checks(payload.get("summary") or {}, requirements)
+    flags = _artifact_quality_flags(payload, mode)
+    suite_passed = _suite_gate_passed(flags, checks)
+    return {
+        "passed": suite_passed,
+        "artifact": str(artifact),
+        "production_artifact": flags["production_artifact"],
+        "artifact_schema_current": flags["artifact_schema_current"],
+        "provenance_present": flags["provenance_present"],
+        "workflow_provenance_valid": flags["workflow_provenance_valid"],
+        "mode": mode,
+        "engine_version": flags["engine_version"],
+        "storage_ok": flags["storage_ok"],
+        "checks": checks,
+    }, suite_passed
+
+
+def _mode_artifacts(root: Path, suite: str, mode: BenchmarkMode) -> list[tuple[Path, dict[str, Any]]]:
+    paths = sorted((root / suite / "runs").glob(f"trace_recall_{suite}_*.json"), reverse=True)
+    candidates: list[tuple[Path, dict[str, Any]]] = []
+    for path in paths:
+        payload = _read_artifact(path)
+        if payload is None:
+            continue
+        if payload.get("mode") == mode:
+            candidates.append((path, payload))
+    return candidates
+
+
+def _read_artifact(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _requirement_checks(summary: dict[str, Any], requirements: dict[str, float]) -> dict[str, Any]:
+    return {
+        key: {
+            "actual": summary.get(key),
+            "minimum": minimum,
+            "passed": summary.get(key) is not None and float(summary[key]) >= minimum,
+        }
+        for key, minimum in requirements.items()
+    }
+
+
+def _artifact_quality_flags(payload: dict[str, Any], mode: BenchmarkMode) -> dict[str, Any]:
+    return {
+        "production_artifact": payload.get("architecture") == "trace-and-recall-production",
+        "artifact_schema_current": payload.get("artifact_schema_version") == BENCHMARK_ARTIFACT_SCHEMA_VERSION,
+        "provenance_present": isinstance(payload.get("providers"), dict)
+        and isinstance(payload.get("prompts"), list),
+        "workflow_provenance_valid": _workflow_provenance_valid(payload, mode),
+        "engine_version": payload.get("engine_version"),
+        "storage_ok": bool((payload.get("store_validation") or {}).get("ok")),
+    }
+
+
+def _suite_gate_passed(flags: dict[str, Any], checks: dict[str, Any]) -> bool:
+    required = (
+        flags["production_artifact"],
+        flags["artifact_schema_current"],
+        flags["provenance_present"],
+        flags["workflow_provenance_valid"],
+        flags["engine_version"],
+        flags["storage_ok"],
+        all(item["passed"] for item in checks.values()),
+    )
+    return all(required)
+
+
+def _workflow_provenance_valid(payload: dict[str, Any], mode: BenchmarkMode) -> bool:
+    providers = payload.get("providers") or {}
+    prompt_names = [item.get("name") for item in payload.get("prompts") or [] if isinstance(item, dict)]
+    completion_provider = providers.get("completion", {}).get("provider")
+    if mode == "end-to-end":
+        return (
+            completion_provider not in {None, "none"}
+            and prompt_names == ["facts", "group_summary", "answer", "benchmark_judge"]
+        )
+    return completion_provider == "none" and prompt_names == []

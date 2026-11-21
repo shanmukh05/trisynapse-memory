@@ -1,0 +1,12 @@
+{
+  "raw_candidates_only": true,
+  "readout": "ranked",
+  "reranker_enabled": false,
+  "graph_hops": 0,
+  "max_refinement_rounds": 0,
+  "retrieval_profile": "balanced",
+  "enabled_routes": [
+    "bm25",
+    "semantic"
+  ]
+}

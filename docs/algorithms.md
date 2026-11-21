@@ -648,6 +648,7 @@ $$
 
 | Piece | Location |
 |---|---|
+| Catalog, helper pages, vector map | `engine/indexes/inspect.py` |
 | Grounding and diversity | `engine/retrieval/engine.py` (`_ground_trace`, `_diverse_grounded`) |
 
 ---
@@ -944,6 +945,7 @@ Extensions may add source handlers, ingest processors, index channels, retrieval
 | Soft rerank | `engine/extensions.py` (`DefaultCandidateReranker`) |
 | Planner, routes, weights | `engine/retrieval/contracts.py` |
 | Staged search, graph walk, grounding | `engine/retrieval/engine.py` |
+| Index inspection (catalog, helper pages, vector map) | `engine/indexes/inspect.py` |
 | Lexical tokens, token counters | `engine/retrieval/tokenization.py` |
 | Claims, group summaries | `engine/indexes/claims.py` |
 | Embedding index | `engine/indexes/embedding_index.py` |

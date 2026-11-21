@@ -1,4 +1,9 @@
-"""Indexes: rebuildable search helpers over the memory log."""
+"""Rebuildable search helpers over the memory log.
+
+Re-exports claim compilation and the embedding index. Inspection pages live in
+``inspect.py``; the helper catalog lives in ``catalog.py``. Indexes must remain
+disposable: they may be rebuilt, but they are not evidence.
+"""
 
 from trisynapse_memory.engine.indexes.claims import (
     build_group_summary_views,

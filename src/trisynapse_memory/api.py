@@ -1,4 +1,8 @@
-"""FastAPI surface for ingest, indexes, retrieval, and benchmark artifacts."""
+"""HTTP surface for ingest, inspection, retrieval, and benchmark artifacts.
+
+FastAPI handlers translate requests into MemoryEngine calls. They do not invent
+memory or retrieval semantics. Auth, CORS, and Studio static files live here.
+"""
 
 from __future__ import annotations
 
@@ -22,8 +26,7 @@ from trisynapse_memory.adapters.agent_events import AgentEvent, capture_agent_ev
 from trisynapse_memory.benchmarks import (
     discover_benchmark_runs,
     read_benchmark_run,
-    run_trace_recall_benchmark,
-    run_trace_recall_smoke,
+    run_benchmark,
 )
 from trisynapse_memory.engine import EmbeddingRebuildRequired, MemoryEngine, SourceInput
 from trisynapse_memory.engine.models import (
@@ -198,11 +201,13 @@ class ModelConnectionTestRequest(BaseModel):
 class BenchmarkRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    benchmark: Literal["locomo", "longmemeval", "halumem", "memorydoc"]
+    benchmark: Literal["locomo", "longmemeval", "halumem", "memorydoc", "personamem", "beam100k", "beam10m"]
     mode: Literal["retrieval", "end-to-end"] = "retrieval"
     raw_data_root: str | None = None
     limit: int | None = Field(default=None, ge=1)
     sampling: Literal["auto", "stratified", "sequential"] = "auto"
+    stage: Literal["auto", "ingest", "query"] = "auto"
+    rebuild_store: bool = False
     judge: ProviderSelection | None = None
 
 
@@ -1445,30 +1450,16 @@ def _execute_benchmark(
     with lock:
         jobs[job_id]["status"] = "running"
     try:
-        if request.benchmark in {"locomo", "longmemeval"}:
-            raw_data = request.raw_data_root or f"data/{request.benchmark}"
-            summary = run_trace_recall_benchmark(
-                request.benchmark,
-                raw_data,
-                max_questions=request.limit or 25,
-                output_root=storage_root / request.benchmark / "runs",
-                mode=request.mode,
-                model_configuration=model_configuration,
-                sampling=request.sampling,
-                judge_selection=request.judge,
-            )
-            with lock:
-                jobs[job_id].update(status="completed", summary=summary)
-            return
-        raw_data = request.raw_data_root or f"data/{request.benchmark}"
-        summary = run_trace_recall_smoke(
+        summary = run_benchmark(
             request.benchmark,
-            raw_data,
-            max_questions=request.limit or 25,
+            request.raw_data_root or f"data/{request.benchmark}",
+            max_questions=request.limit,
             output_root=storage_root / request.benchmark / "runs",
             mode=request.mode,
             model_configuration=model_configuration,
             sampling=request.sampling,
+            stage=request.stage,
+            rebuild_store=request.rebuild_store,
             judge_selection=request.judge,
         )
         with lock:

@@ -1,4 +1,8 @@
-"""Completion, embedding, model-discovery, and provider registry support."""
+"""Completion, embedding, model discovery, and provider credentials.
+
+Owns provider descriptors, catalog fetch, completion JSON helpers, and embedder
+construction. Engine configuration reads this registry; it must not log secrets.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,10 @@ import hashlib
 import json
 import os
 import re
+import threading
+import time
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -53,17 +61,256 @@ class CompletionProvider(Protocol):
     ) -> dict[str, Any]: ...
 
 
+DEFAULT_COMPLETION_PARALLEL_WORKERS = 8
+_JSON_PARSE_ATTEMPTS = 3
+
+
 def parse_json_response(text: str) -> dict[str, Any]:
-    """Parse a provider's JSON-object response, allowing a Markdown fence."""
+    """Parse a provider's JSON-object response.
+
+    Accepts a Markdown fence, leading commentary, and trailing extra tokens that
+    some OpenAI-compatible models append after a valid object.
+    """
 
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    value = json.loads(cleaned)
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, count=1)
+        fence = cleaned.find("```")
+        if fence != -1:
+            cleaned = cleaned[:fence]
+        cleaned = cleaned.strip()
+    try:
+        value = _load_json_value(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"completion returned invalid JSON: {exc.msg}") from exc
     if not isinstance(value, dict):
         raise ValueError("completion returned JSON that is not an object")
     return value
+
+
+def _load_json_value(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start < 0:
+            raise
+        return json.JSONDecoder().raw_decode(text, start)[0]
+
+
+def complete_json_parallel(
+    complete_json: Callable[[str, str], dict[str, Any]],
+    requests: Sequence[tuple[str, str]],
+    *,
+    max_workers: int = DEFAULT_COMPLETION_PARALLEL_WORKERS,
+    on_progress: Callable[[int, int], None] | None = None,
+    on_item: Callable[[int, dict[str, Any]], None] | None = None,
+    on_error: Callable[[int, BaseException], dict[str, Any] | None] | None = None,
+) -> list[dict[str, Any]]:
+    """Run independent JSON completions concurrently, preserving request order."""
+
+    if not requests:
+        return []
+    if len(requests) == 1:
+        return _complete_json_one(
+            complete_json, requests[0], on_progress=on_progress, on_item=on_item, on_error=on_error,
+        )
+    return _complete_json_pool(
+        complete_json, requests, max_workers=max_workers,
+        on_progress=on_progress, on_item=on_item, on_error=on_error,
+    )
+
+
+def _resolve_complete_error(
+    on_error: Callable[[int, BaseException], dict[str, Any] | None] | None,
+    index: int,
+    exc: BaseException,
+) -> dict[str, Any]:
+    replacement = on_error(index, exc) if on_error is not None else None
+    if replacement is None:
+        raise exc
+    return replacement
+
+
+def _complete_json_one(
+    complete_json: Callable[[str, str], dict[str, Any]],
+    request: tuple[str, str],
+    *,
+    on_progress: Callable[[int, int], None] | None,
+    on_item: Callable[[int, dict[str, Any]], None] | None,
+    on_error: Callable[[int, BaseException], dict[str, Any] | None] | None,
+) -> list[dict[str, Any]]:
+    try:
+        results = [_invoke_complete_json(complete_json, request[0], request[1])]
+    except Exception as exc:
+        results = [_resolve_complete_error(on_error, 0, exc)]
+    if on_item is not None:
+        on_item(0, results[0])
+    if on_progress is not None:
+        on_progress(1, 1)
+    return results
+
+
+def _complete_json_future_result(
+    future: Any,
+    index: int,
+    on_error: Callable[[int, BaseException], dict[str, Any] | None] | None,
+) -> tuple[dict[str, Any] | None, BaseException | None]:
+    try:
+        return future.result(), None
+    except Exception as exc:
+        try:
+            return _resolve_complete_error(on_error, index, exc), None
+        except Exception as resolved:
+            return None, resolved
+
+
+def _record_complete_json_item(
+    ordered: list[dict[str, Any] | None],
+    index: int,
+    payload: dict[str, Any],
+    completed: int,
+    total: int,
+    on_item: Callable[[int, dict[str, Any]], None] | None,
+    on_progress: Callable[[int, int], None] | None,
+) -> int:
+    ordered[index] = payload
+    if on_item is not None:
+        on_item(index, payload)
+    completed += 1
+    if on_progress is not None:
+        on_progress(completed, total)
+    return completed
+
+
+def _complete_json_pool(
+    complete_json: Callable[[str, str], dict[str, Any]],
+    requests: Sequence[tuple[str, str]],
+    *,
+    max_workers: int,
+    on_progress: Callable[[int, int], None] | None,
+    on_item: Callable[[int, dict[str, Any]], None] | None,
+    on_error: Callable[[int, BaseException], dict[str, Any] | None] | None,
+) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any] | None] = [None] * len(requests)
+    workers = max(1, min(max_workers, len(requests)))
+    errors: list[BaseException] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_invoke_complete_json, complete_json, system, user): index
+            for index, (system, user) in enumerate(requests)
+        }
+        completed = 0
+        for future in as_completed(futures):
+            index = futures[future]
+            payload, error = _complete_json_future_result(future, index, on_error)
+            if error is not None:
+                errors.append(error)
+                continue
+            assert payload is not None
+            completed = _record_complete_json_item(
+                ordered, index, payload, completed, len(requests), on_item, on_progress,
+            )
+    if errors:
+        raise errors[0]
+    return [item for item in ordered if item is not None]
+
+
+def _invoke_complete_json(
+    complete_json: Callable[[str, str], dict[str, Any]],
+    system: str,
+    user: str,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(_JSON_PARSE_ATTEMPTS):
+        try:
+            return complete_json(system, user)
+        except ValueError as exc:
+            last_error = exc
+            if not _invalid_json_error(exc) or attempt + 1 >= _JSON_PARSE_ATTEMPTS:
+                raise
+            time.sleep(min(0.05 * (2 ** attempt), 1.0))
+    raise last_error or ValueError("completion returned invalid JSON")
+
+
+def _invalid_json_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "invalid json" in text or "not an object" in text
+
+
+def invalid_json_completion_error(exc: Exception) -> bool:
+    """Return True when a completion failed because the model returned unusable JSON."""
+
+    return _invalid_json_error(exc)
+
+
+def timeout_completion_error(exc: Exception) -> bool:
+    """Return True when a completion failed because the provider timed out."""
+
+    if isinstance(exc, TimeoutError):
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "deadline exceeded" in text
+
+
+def skippable_completion_error(exc: Exception) -> bool:
+    """Return True when ingest can skip a session instead of aborting the case."""
+
+    return invalid_json_completion_error(exc) or timeout_completion_error(exc)
+
+
+def gemini_json_thinking_config(model: str, types: Any) -> Any | None:
+    """Prefer cheap thinking for structured JSON on Gemini Flash models."""
+
+    name = (model or "").lower()
+    if "flash" in name and "gemini-3" in name:
+        return types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)
+    if "gemini-2.5-flash" in name and "lite" not in name:
+        return types.ThinkingConfig(thinking_budget=0)
+    return None
+
+
+def openai_json_chat_payload(model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a Chat Completions JSON payload.
+
+    GPT-5 and o-series models only accept the default temperature. Sending 0 is a 400.
+    """
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+    }
+    if _openai_supports_temperature(model):
+        payload["temperature"] = 0
+    return payload
+
+
+def _openai_supports_temperature(model: str) -> bool:
+    name = (model or "").rsplit("/", 1)[-1].lower()
+    return not name.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _retryable_provider_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    text = str(exc).upper()
+    return any(
+        token in text
+        for token in (
+            "429",
+            "RESOURCE_EXHAUSTED",
+            "UNAVAILABLE",
+            "503",
+            "DEADLINE EXCEEDED",
+            "TIMED OUT",
+        )
+    )
+
+
+def _unsupported_thinking_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "thinking" in text and any(token in text for token in ("400", "invalid", "unsupported"))
 
 
 @dataclass(frozen=True)
@@ -250,12 +497,10 @@ class OpenAICompatibleCompletion:
         self.api_key = settings.api_key
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-        }
+        payload = openai_json_chat_payload(
+            self.model,
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
         value = _post_json(
             f"{self.base_url}/chat/completions", payload, self.api_key,
             self.settings.timeout_seconds,
@@ -270,18 +515,16 @@ class OpenAICompatibleCompletion:
 
     def complete_multimodal(self, system: str, user: str, image: bytes, media_type: str) -> dict[str, Any]:
         encoded = base64.b64encode(image).decode("ascii")
-        payload = {
-            "model": self.model,
-            "messages": [
+        payload = openai_json_chat_payload(
+            self.model,
+            [
                 {"role": "system", "content": system},
                 {"role": "user", "content": [
                     {"type": "text", "text": user},
                     {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{encoded}"}},
                 ]},
             ],
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-        }
+        )
         value = _post_json(
             f"{self.base_url}/chat/completions", payload, self.api_key,
             self.settings.timeout_seconds,
@@ -348,42 +591,72 @@ class GeminiCompletion:
     def __init__(self, settings: ProviderSettings) -> None:
         self.settings = settings
         self.model = settings.model or "gemini-2.5-flash-lite"
+        self._local = threading.local()
+
+    def _client(self) -> Any:
+        client = getattr(self._local, "client", None)
+        if client is None:
+            from google import genai
+            client = genai.Client(api_key=self.settings.api_key)
+            self._local.client = client
+        return client
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
-        try:
-            from google import genai
-            from google.genai import types
-            client = genai.Client(api_key=self.settings.api_key)
-            response = client.models.generate_content(
-                model=self.model,
-                contents=user,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0,
-                    response_mime_type="application/json",
-                ),
-            )
-            return parse_json_response(response.text or "")
-        except Exception as exc:
-            raise ProviderError(f"Gemini completion failed: {exc}") from exc
+        from google.genai import types
+        thinking = gemini_json_thinking_config(self.model, types)
+        delay = 1.0
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                return self._generate_json(system, user, types, thinking)
+            except Exception as exc:
+                last_error = exc
+                if thinking is not None and _unsupported_thinking_error(exc):
+                    thinking = None
+                    continue
+                retryable = _retryable_provider_error(exc) or _invalid_json_error(exc)
+                if attempt == 3 or not retryable:
+                    raise ProviderError(f"Gemini completion failed: {exc}") from exc
+                time.sleep(delay)
+                delay = min(delay * 2, 16)
+        raise ProviderError(f"Gemini completion failed: {last_error}") from last_error
 
     __call__ = complete_json
 
+    def _generate_json(
+        self,
+        system: str,
+        user: str,
+        types: Any,
+        thinking: Any | None,
+        *,
+        image: bytes | None = None,
+        media_type: str | None = None,
+    ) -> dict[str, Any]:
+        contents: Any = user
+        if image is not None and media_type is not None:
+            contents = [user, types.Part.from_bytes(data=image, mime_type=media_type)]
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system,
+            "temperature": 0,
+            "response_mime_type": "application/json",
+        }
+        if thinking is not None:
+            config_kwargs["thinking_config"] = thinking
+        response = self._client().models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+        return parse_json_response(response.text or "")
+
     def complete_multimodal(self, system: str, user: str, image: bytes, media_type: str) -> dict[str, Any]:
         try:
-            from google import genai
             from google.genai import types
-            client = genai.Client(api_key=self.settings.api_key)
-            response = client.models.generate_content(
-                model=self.model,
-                contents=[user, types.Part.from_bytes(data=image, mime_type=media_type)],
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0,
-                    response_mime_type="application/json",
-                ),
+            return self._generate_json(
+                system, user, types, gemini_json_thinking_config(self.model, types),
+                image=image, media_type=media_type,
             )
-            return parse_json_response(response.text or "")
         except Exception as exc:
             raise ProviderError(f"Gemini vision completion failed: {exc}") from exc
 
@@ -408,20 +681,38 @@ def completion_from_settings(settings: ProviderSettings | None) -> Any | None:
 
 def embedder_from_settings(settings: ProviderSettings | None) -> Any:
     if settings is None or settings.provider in {"local", "sentence-transformers", "sbert"}:
-        model = settings.model if settings and settings.model else "all-MiniLM-L6-v2"
-        value = SentenceTransformerEmbedder(model)
-        value.provider_name = "sentence-transformers"
-        value.cache_key = embedding_cache_key("sentence-transformers", None, value.model_name)
-        return value
+        return _local_embedder(settings)
     provider = settings.provider.strip().lower()
     selection = selection_from_settings(settings, ProviderRole.EMBEDDING)
     validate_selection(selection, ProviderRole.EMBEDDING, api_key=settings.api_key)
     key = credential_for(provider, settings.api_key)
     if provider == "gemini":
-        value = GeminiEmbedder(model_name=selection.model or "gemini-embedding-001", api_key=key)
-        value.provider_name = "gemini"
-        value.cache_key = embedding_cache_key("gemini", None, value.model_name)
-        return value
+        return _gemini_embedder(selection, key)
+    return _compatible_embedder(provider, settings, selection, key)
+
+
+def _stamp_embedder(value: Any, provider: str, base_url: str | None = None) -> Any:
+    value.provider_name = provider
+    value.cache_key = embedding_cache_key(provider, base_url, value.model_name)
+    return value
+
+
+def _local_embedder(settings: ProviderSettings | None) -> Any:
+    model = settings.model if settings and settings.model else "all-MiniLM-L6-v2"
+    return _stamp_embedder(SentenceTransformerEmbedder(model), "sentence-transformers")
+
+
+def _gemini_embedder(selection: ProviderSelection, key: str | None) -> Any:
+    value = GeminiEmbedder(model_name=selection.model or "gemini-embedding-001", api_key=key)
+    return _stamp_embedder(value, "gemini")
+
+
+def _compatible_embedder(
+    provider: str,
+    settings: ProviderSettings,
+    selection: ProviderSelection,
+    key: str | None,
+) -> Any:
     spec = _SPECS[provider]
     base_url = selection.base_url or spec.default_base_url
     if not base_url:
@@ -432,9 +723,7 @@ def embedder_from_settings(settings: ProviderSettings | None) -> Any:
         api_key=key or "",
         timeout_seconds=settings.timeout_seconds,
     )
-    value.provider_name = provider
-    value.cache_key = embedding_cache_key(provider, base_url, value.model_name)
-    return value
+    return _stamp_embedder(value, provider, base_url)
 
 
 def fetch_model_catalog(
@@ -453,39 +742,96 @@ def fetch_model_catalog(
     if provider_id == "none":
         return []
     if provider_id == "sentence-transformers":
-        return [ModelDescriptor(
-            provider=provider_id, id="all-MiniLM-L6-v2", display_name="all-MiniLM-L6-v2",
-            roles=[ProviderRole.EMBEDDING], source="curated", capability_status="verified",
-        )]
+        return _sentence_transformers_catalog()
     key = credential_for(provider_id)
+    _require_catalog_credential(descriptor, provider_id, key)
+    models = _catalog_for_provider(provider_id, role, descriptor, key, base_url, timeout_seconds)
+    return [item for item in models if role in item.roles]
+
+
+def _sentence_transformers_catalog() -> list[ModelDescriptor]:
+    return [ModelDescriptor(
+        provider="sentence-transformers", id="all-MiniLM-L6-v2", display_name="all-MiniLM-L6-v2",
+        roles=[ProviderRole.EMBEDDING], source="curated", capability_status="verified",
+    )]
+
+
+def _require_catalog_credential(
+    descriptor: ProviderDescriptor, provider_id: str, key: str | None,
+) -> None:
     if descriptor.credential_env and provider_id != "openai-compatible" and not key:
         raise ProviderError(f"{descriptor.credential_env} is required to list {provider_id} models")
-    if provider_id == "gemini":
-        return _gemini_models(role, key)
-    if provider_id == "anthropic":
-        url = f"{(base_url or descriptor.default_base_url).rstrip('/')}/v1/models?{urlencode({'limit': 1000})}"
-        payload = _request_json(url, headers={
-            "x-api-key": key or "", "anthropic-version": "2023-06-01",
-        }, timeout=timeout_seconds)
-        return [_anthropic_model(item) for item in payload.get("data", [])]
-    if provider_id == "deepinfra":
-        payload = _request_json(
-            "https://api.deepinfra.com/models/list",
-            headers={"Authorization": f"Bearer {key}"}, timeout=timeout_seconds,
-        )
-        raw_models = payload if isinstance(payload, list) else payload.get("data") or payload.get("models") or []
-    else:
-        endpoint = base_url or descriptor.default_base_url
-        if not endpoint:
-            raise ProviderError("openai-compatible model discovery requires a base URL")
-        headers = {"Authorization": f"Bearer {key}"} if key else {}
-        payload = _request_json(f"{endpoint.rstrip('/')}/models", headers=headers, timeout=timeout_seconds)
-        raw_models = payload.get("data") or payload.get("models") or []
+
+
+def _catalog_for_provider(
+    provider_id: str,
+    role: ProviderRole,
+    descriptor: ProviderDescriptor,
+    key: str | None,
+    base_url: str | None,
+    timeout_seconds: float,
+) -> list[ModelDescriptor]:
+    catalogs = {
+        "gemini": lambda: _gemini_models(role, key),
+        "anthropic": lambda: _anthropic_catalog(descriptor, key, base_url, timeout_seconds),
+        "deepinfra": lambda: _deepinfra_catalog(key, timeout_seconds),
+    }
+    fetch = catalogs.get(
+        provider_id,
+        lambda: _openai_compatible_catalog(provider_id, descriptor, key, base_url, timeout_seconds),
+    )
+    return fetch()
+
+
+def _anthropic_catalog(
+    descriptor: ProviderDescriptor,
+    key: str | None,
+    base_url: str | None,
+    timeout_seconds: float,
+) -> list[ModelDescriptor]:
+    url = f"{(base_url or descriptor.default_base_url).rstrip('/')}/v1/models?{urlencode({'limit': 1000})}"
+    payload = _request_json(url, headers={
+        "x-api-key": key or "", "anthropic-version": "2023-06-01",
+    }, timeout=timeout_seconds)
+    return [_anthropic_model(item) for item in payload.get("data", [])]
+
+
+def _deepinfra_raw_models(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    return payload.get("data") or payload.get("models") or []
+
+
+def _deepinfra_catalog(key: str | None, timeout_seconds: float) -> list[ModelDescriptor]:
+    payload = _request_json(
+        "https://api.deepinfra.com/models/list",
+        headers={"Authorization": f"Bearer {key}"}, timeout=timeout_seconds,
+    )
+    return [_compatible_model("deepinfra", item) for item in _deepinfra_raw_models(payload)]
+
+
+def _map_catalog_models(provider_id: str, raw_models: list[Any]) -> list[ModelDescriptor]:
     if provider_id == "openai":
-        models = [model for item in raw_models if (model := _openai_model(item)) is not None]
-    else:
-        models = [_compatible_model(provider_id, item) for item in raw_models]
-    return [item for item in models if role in item.roles]
+        return [model for item in raw_models if (model := _openai_model(item)) is not None]
+    return [_compatible_model(provider_id, item) for item in raw_models]
+
+
+def _openai_compatible_catalog(
+    provider_id: str,
+    descriptor: ProviderDescriptor,
+    key: str | None,
+    base_url: str | None,
+    timeout_seconds: float,
+) -> list[ModelDescriptor]:
+    endpoint = base_url or descriptor.default_base_url
+    if not endpoint:
+        raise ProviderError("openai-compatible model discovery requires a base URL")
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    payload = _request_json(
+        f"{endpoint.rstrip('/')}/models", headers=headers, timeout=timeout_seconds,
+    )
+    raw_models = payload.get("data") or payload.get("models") or []
+    return _map_catalog_models(provider_id, raw_models)
 
 
 def _openai_model(item: Any) -> ModelDescriptor | None:
@@ -509,39 +855,101 @@ def _openai_model(item: Any) -> ModelDescriptor | None:
     )
 
 
-def _compatible_model(provider: str, item: Any) -> ModelDescriptor:
-    data = item if isinstance(item, dict) else {"id": str(item)}
-    model_id = str(data.get("id") or data.get("model_name") or data.get("name") or "").strip()
-    text = json.dumps(data, default=str).lower()
+def _catalog_item_data(item: Any) -> dict[str, Any]:
+    return item if isinstance(item, dict) else {"id": str(item)}
+
+
+def _catalog_model_id(data: dict[str, Any]) -> str:
+    return str(data.get("id") or data.get("model_name") or data.get("name") or "").strip()
+
+
+def _compatible_roles(provider: str, data: dict[str, Any], text: str) -> list[ProviderRole]:
     embedding = any(token in text for token in ("embedding", "embeddings", "bge-", "e5-", "gte-"))
-    roles = [ProviderRole.EMBEDDING] if embedding else [ProviderRole.COMPLETION]
-    if provider in {"openai", "openrouter", "deepinfra", "openai-compatible"} and not embedding:
-        if data.get("type") in {"embeddings", "embedding"}:
-            roles = [ProviderRole.EMBEDDING]
+    if embedding:
+        return [ProviderRole.EMBEDDING]
+    if (
+        provider in {"openai", "openrouter", "deepinfra", "openai-compatible"}
+        and data.get("type") in {"embeddings", "embedding"}
+    ):
+        return [ProviderRole.EMBEDDING]
+    return [ProviderRole.COMPLETION]
+
+
+def _compatible_capability_fields(
+    data: dict[str, Any],
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     architecture = data.get("architecture") if isinstance(data.get("architecture"), dict) else {}
     modality = str(architecture.get("modality") or data.get("modality") or "").lower()
     capabilities = data.get("capabilities") if isinstance(data.get("capabilities"), dict) else {}
+    return architecture, modality, capabilities
+
+
+def _name_suggests_vision(modality: str, model_name: str) -> bool:
+    return any(token in modality or token in model_name for token in ("image", "vision", "vl-"))
+
+
+def _compatible_vision(
+    data: dict[str, Any],
+    architecture: dict[str, Any],
+    capabilities: dict[str, Any],
+    model_id: str,
+    modality: str,
+) -> bool | None:
+    _ = architecture
     if "supports_image_in" in data:
-        vision = bool(data["supports_image_in"])
-    elif "image_input" in capabilities:
-        vision = bool(capabilities["image_input"])
-    else:
-        model_name = model_id.lower()
-        vision = True if any(
-            token in modality or token in model_name for token in ("image", "vision", "vl-")
-        ) else None
+        return bool(data["supports_image_in"])
+    if "image_input" in capabilities:
+        return bool(capabilities["image_input"])
+    if _name_suggests_vision(modality, model_id.lower()):
+        return True
+    return None
+
+
+def _catalog_display_name(data: dict[str, Any], model_id: str) -> str:
+    return str(data.get("display_name") or data.get("name") or model_id)
+
+
+def _catalog_context_length(data: dict[str, Any]) -> int | None:
     context = data.get("context_length") or data.get("context_window")
+    if isinstance(context, (int, float)):
+        return int(context)
+    return None
+
+
+def _compatible_capability_status(
+    data: dict[str, Any], architecture: dict[str, Any], modality: str,
+) -> str:
+    if data.get("type") or architecture or modality:
+        return "verified"
+    return "unknown"
+
+
+def _completion_structured_output(roles: list[ProviderRole]) -> bool | None:
+    if ProviderRole.COMPLETION in roles:
+        return True
+    return None
+
+
+def _catalog_metadata(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in data.items() if key not in {"pricing"}}
+
+
+def _compatible_model(provider: str, item: Any) -> ModelDescriptor:
+    data = _catalog_item_data(item)
+    model_id = _catalog_model_id(data)
+    architecture, modality, capabilities = _compatible_capability_fields(data)
+    roles = _compatible_roles(provider, data, json.dumps(data, default=str).lower())
     return ModelDescriptor(
         provider=provider,
         id=model_id,
-        display_name=str(data.get("display_name") or data.get("name") or model_id),
+        display_name=_catalog_display_name(data, model_id),
         roles=roles,
-        vision=vision,
-        structured_output=True if ProviderRole.COMPLETION in roles else None,
-        context_length=int(context) if isinstance(context, (int, float)) else None,
+        vision=_compatible_vision(data, architecture, capabilities, model_id, modality),
+        structured_output=_completion_structured_output(roles),
+        context_length=_catalog_context_length(data),
         source="live",
-        capability_status="verified" if data.get("type") or architecture or modality else "unknown",
-        metadata={key: value for key, value in data.items() if key not in {"pricing"}},
+        capability_status=_compatible_capability_status(data, architecture, modality),
+        metadata=_catalog_metadata(data),
     )
 
 
@@ -558,31 +966,44 @@ def _anthropic_model(item: dict[str, Any]) -> ModelDescriptor:
     )
 
 
+def _gemini_model_roles(item: Any) -> tuple[list[ProviderRole], list[str]]:
+    actions = list(getattr(item, "supported_actions", None) or [])
+    roles: list[ProviderRole] = []
+    if "generateContent" in actions:
+        roles.append(ProviderRole.COMPLETION)
+    if "embedContent" in actions:
+        roles.append(ProviderRole.EMBEDDING)
+    return roles, actions
+
+
+def _gemini_model_descriptor(item: Any) -> ModelDescriptor | None:
+    roles, actions = _gemini_model_roles(item)
+    if not roles:
+        return None
+    model_id = str(getattr(item, "name", "")).removeprefix("models/")
+    completion = ProviderRole.COMPLETION in roles
+    return ModelDescriptor(
+        provider="gemini", id=model_id,
+        display_name=str(getattr(item, "display_name", None) or model_id),
+        roles=roles,
+        vision=True if completion else None,
+        structured_output=True if completion else None,
+        context_length=getattr(item, "input_token_limit", None),
+        source="live", capability_status="verified",
+        metadata={"supported_actions": actions},
+    )
+
+
 def _gemini_models(role: ProviderRole, api_key: str | None) -> list[ModelDescriptor]:
     try:
         from google import genai
         client = genai.Client(api_key=api_key)
         result: list[ModelDescriptor] = []
         for item in client.models.list():
-            actions = list(getattr(item, "supported_actions", None) or [])
-            roles: list[ProviderRole] = []
-            if "generateContent" in actions:
-                roles.append(ProviderRole.COMPLETION)
-            if "embedContent" in actions:
-                roles.append(ProviderRole.EMBEDDING)
-            if role not in roles:
+            descriptor = _gemini_model_descriptor(item)
+            if descriptor is None or role not in descriptor.roles:
                 continue
-            model_id = str(getattr(item, "name", "")).removeprefix("models/")
-            result.append(ModelDescriptor(
-                provider="gemini", id=model_id,
-                display_name=str(getattr(item, "display_name", None) or model_id),
-                roles=roles,
-                vision=True if ProviderRole.COMPLETION in roles else None,
-                structured_output=True if ProviderRole.COMPLETION in roles else None,
-                context_length=getattr(item, "input_token_limit", None),
-                source="live", capability_status="verified",
-                metadata={"supported_actions": actions},
-            ))
+            result.append(descriptor)
         return result
     except Exception as exc:
         raise ProviderError(f"Gemini model discovery failed: {exc}") from exc
@@ -608,17 +1029,75 @@ def _request_json(
     headers: dict[str, str] | None = None,
     timeout: float = 60,
 ) -> dict[str, Any] | list[Any]:
-    request_headers = {"Accept": "application/json", **(headers or {})}
-    data = None
-    if payload is not None:
-        request_headers["Content-Type"] = "application/json"
-        data = json.dumps(payload).encode("utf-8")
-    request = Request(url, data=data, headers=request_headers, method=method)
-    try:
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - configured provider URL.
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:1000]
-        raise ProviderError(f"provider HTTP {exc.code}: {detail}") from exc
-    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise ProviderError(f"provider request failed: {exc}") from exc
+    request_headers = _json_request_headers(headers)
+    data = _request_body(payload, request_headers)
+    return _request_json_with_retries(url, data, request_headers, method, timeout)
+
+
+def _json_request_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    return {"Accept": "application/json", **(headers or {})}
+
+
+def _should_retry_request(retryable: bool, attempt: int, limit: int) -> bool:
+    return retryable and attempt + 1 < limit
+
+
+def _request_json_with_retries(
+    url: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    method: str,
+    timeout: float,
+) -> dict[str, Any] | list[Any]:
+    delay = 2.0
+    attempts = 6
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return _read_json_url(url, data, headers, method, timeout)
+        except HTTPError as exc:
+            last_error, retryable, wait = _http_error_retry(exc, delay)
+            if not _should_retry_request(retryable, attempt, attempts):
+                raise last_error from exc
+            time.sleep(min(wait, 60.0))
+            delay = min(delay * 2, 32.0)
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error, retryable, limit = _transport_error_retry(exc, attempts)
+            if not _should_retry_request(retryable, attempt, limit):
+                raise last_error from exc
+            time.sleep(delay)
+            delay = min(delay * 2, 32.0)
+    raise last_error or ProviderError("provider request failed")
+
+
+def _request_body(payload: dict[str, Any] | None, headers: dict[str, str]) -> bytes | None:
+    if payload is None:
+        return None
+    headers["Content-Type"] = "application/json"
+    return json.dumps(payload).encode("utf-8")
+
+
+def _read_json_url(
+    url: str, data: bytes | None, headers: dict[str, str], method: str, timeout: float,
+) -> dict[str, Any] | list[Any]:
+    request = Request(url, data=data, headers=headers, method=method)
+    with urlopen(request, timeout=timeout) as response:  # noqa: S310 - configured provider URL.
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _http_error_retry(exc: HTTPError, delay: float) -> tuple[ProviderError, bool, float]:
+    detail = exc.read().decode("utf-8", errors="replace")[:1000]
+    error = ProviderError(f"provider HTTP {exc.code}: {detail}")
+    retryable = exc.code in {429, 502, 503} or _retryable_provider_error(error)
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    if retry_after and str(retry_after).isdigit():
+        return error, retryable, float(retry_after)
+    return error, retryable, delay
+
+
+def _transport_error_retry(exc: Exception, attempts: int) -> tuple[ProviderError, bool, int]:
+    error = ProviderError(f"provider request failed: {exc}")
+    is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
+    retryable = is_timeout or _retryable_provider_error(exc)
+    limit = 3 if is_timeout else attempts
+    return error, retryable, limit

@@ -1,0 +1,30 @@
+# uv run python -m trisynapse_memory.benchmarks data/longmemeval/bench.yaml --profile end-to-end
+suite: longmemeval
+data_root: .
+dataset: longmemeval_s_cleaned.json
+
+models:
+  completion:
+    provider: openrouter
+    model: google/gemma-4-26b-a4b-it
+  embedding:
+    provider: sentence-transformers
+    model: all-MiniLM-L6-v2
+
+sampling: sequential
+
+profiles:
+  ingest:
+    stage: ingest
+    mode: end-to-end
+  retrieval:
+    stage: query
+    mode: retrieval
+    # max_questions: 25
+  end-to-end:
+    stage: query
+    mode: end-to-end
+    # max_questions: 25
+    judge:
+      provider: gemini
+      model: gemini-3.7-flash

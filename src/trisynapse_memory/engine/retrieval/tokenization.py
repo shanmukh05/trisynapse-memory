@@ -30,21 +30,31 @@ def lexical_tokens(text: str) -> list[str]:
 
     result: list[str] = []
     for run in _unicode_runs(text or ""):
-        if all(_is_cjk(character) for character in run):
-            characters = list(run)
-            result.extend(characters)
-            result.extend("".join(characters[index:index + 2]) for index in range(len(characters) - 1))
+        if run and all(_is_cjk(character) for character in run):
+            result.extend(_cjk_tokens(run))
             continue
-        for underscore_part in run.replace("$", "_").split("_"):
-            for part in _CAMEL_BOUNDARY.split(underscore_part):
-                token = part.casefold().strip("'’-_")
-                if not token:
-                    continue
-                result.append(token)
-                variant = _english_suffix_variant(token)
-                if variant and variant != token:
-                    result.append(variant)
+        result.extend(_code_or_word_tokens(run))
     return result
+
+
+def _cjk_tokens(run: str) -> list[str]:
+    characters = list(run)
+    bigrams = ["".join(characters[index:index + 2]) for index in range(len(characters) - 1)]
+    return characters + bigrams
+
+
+def _code_or_word_tokens(run: str) -> list[str]:
+    tokens: list[str] = []
+    for underscore_part in run.replace("$", "_").split("_"):
+        for part in _CAMEL_BOUNDARY.split(underscore_part):
+            token = part.casefold().strip("'’-_")
+            if not token:
+                continue
+            tokens.append(token)
+            variant = _english_suffix_variant(token)
+            if variant and variant != token:
+                tokens.append(variant)
+    return tokens
 
 
 def _unicode_runs(text: str) -> list[str]:

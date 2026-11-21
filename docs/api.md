@@ -238,7 +238,9 @@ The built-in `token_counter_for()` prefers a completion provider's local `count_
 
 ### Benchmark runs
 
-`POST /api/v1/benchmarks/runs` accepts `benchmark`, `mode`, `limit`, `sampling`, and an optional non-secret `judge` provider selection. For a partial LoCoMo run, `sampling: "auto"` uses deterministic stratification across conversations and question categories. Use `sequential` only to reproduce an older prefix-based run.
+This endpoint runs local Trace & Recall diagnostics. Use [the OmniMemEval CLI](operations.md#benchmarks) for shared-harness research scores.
+
+`POST /api/v1/benchmarks/runs` accepts `benchmark` (`locomo`, `longmemeval`, `personamem`, `beam100k`, `beam10m`, `halumem`, `memorydoc`), `mode`, `limit` (defaults to the full dataset when omitted), `sampling`, `stage` (`auto`, `ingest`, or `query`), optional `rebuild_store`, and an optional non-secret `judge` provider selection. It does not accept a YAML `config_path`; dataset configs are a CLI/`python -m trisynapse_memory.benchmarks` interface. Ingest writes a durable store under `data/<benchmark>/stores/<completion-provider>/<completion-model>/<embedding-provider>/<embedding-model>/`. Query runs reuse that store for the configured models. LoCoMo, LongMemEval, PersonaMem, and BEAM use the production runner; HaluMem and MemoryDoc are smoke suites. For a partial LoCoMo run, `sampling: "auto"` uses deterministic stratification across conversations and question categories. PersonaMem, BEAM, LongMemEval, HaluMem, and MemoryDoc YAML configs use `sequential`; `auto` is sequential for those suites. PersonaMem retrieval evidence metrics match `related_conversation_snippet` against retrieved text; PersonaMem end-to-end `accuracy` is 4-way MCQ exact match on `correct_answer` vs `incorrect_answers`. BEAM evidence metrics match `source_chat_ids` to ingested message ids. Dataset files, download commands, and Gemini 3.7 Flash cost estimates are in [Operations](operations.md#benchmarks).
 
 Schema-v4 artifacts retain bounded pre-answer hits, query steps, and the final store-validation result. The important metrics are:
 
@@ -450,8 +452,8 @@ The graph and Memory Viewer inspection routes are:
 | `GET` | `/api/v1/memory/vectors/neighbors` | Nearest neighbors for one embedded Trace id |
 | `GET` | `/api/v1/memory/retrieval-graph` | `followed_by` and `about_same_entity` edges |
 | `GET` | `/api/v1/memory-graph?view=knowledge` | Concepts, claims, and their relationships |
-| `GET` | `/api/v1/memory-graph?view=lineage` | Source-to-Trace-to-Recall provenance |
-| `GET` | `/api/v1/memory-graph?view=trace` | Ordered evidence and lifecycle connections |
+| `GET` | `/api/v1/memory-graph?view=lineage` | Source-to-memory-log-to-index provenance |
+| `GET` | `/api/v1/memory-graph?view=log` | Ordered evidence and lifecycle connections |
 | `GET` | `/api/v1/memory-graph?view=retrieval` | Retrieval-graph neighborhood used by the graph route |
 | `GET` | `/api/v1/memory-graph/nodes/{id}/neighbors` | Expand one node without loading the full store |
 
@@ -508,6 +510,7 @@ trisynapse-memory models providers
 trisynapse-memory models list --role completion --provider anthropic
 trisynapse-memory models set completion anthropic claude-sonnet-4-5
 trisynapse-memory --yes models set embedding deepinfra BAAI/bge-m3
+trisynapse-memory bench run --config data/personamem/bench.yaml --profile ingest
 ```
 
 Interactive plain text runs `query()`. Slash commands are `/ingest`, `/sources`, `/search`, `/timeline`, `/history`, `/correct`, `/forget`, `/remove`, `/jobs`, `/namespace`, `/model`, `/check`, `/config`, `/help`, `/clear`, and `/exit`.
@@ -518,4 +521,4 @@ Interactive plain text runs `query()`. Slash commands are `/ingest`, `/sources`,
 
 All surfaces accept `user_id`, `agent_id`, `project_id`, and `session_id`. `project_id` defaults to `default`. A namespace-scoped API key cannot override its assigned namespace. Keep values stable across writes and reads.
 
-See [Completion and embedding providers](operations.md#completion-and-embedding-providers) for API keys, supported providers, model selection, custom endpoints, and vision behavior. The rest of [Operations](operations.md) covers installation, backups, security, and releases.
+See [Completion and embedding providers](operations.md#completion-and-embedding-providers) for API keys, supported providers, model selection, custom endpoints, and vision behavior. The rest of [Operations](operations.md) covers installation, backups, security, [benchmarks](operations.md#benchmarks), and releases.
