@@ -166,6 +166,25 @@ jobs:
           version="$(node -p "require('./packages/js-sdk/package.json').version")"
           artifacts=("$PWD"/release-artifacts/*.tgz)
           [[ "${#artifacts[@]}" == 1 && -f "${artifacts[0]}" ]]
+          metadata="$RUNNER_TEMP/npm-release-version.json"
+          status="$(curl -sS -o "$metadata" -w '%{http_code}' \
+            "https://registry.npmjs.org/@trisynapse%2Ftrisynapse-memory/$version")"
+          case "$status" in
+            200)
+              expected="sha512-$(openssl dgst -sha512 -binary "${artifacts[0]}" | openssl base64 -A)"
+              if [[ "$(jq -er .dist.integrity "$metadata")" != "$expected" ]]; then
+                echo "Published npm version $version does not match the verified tarball." >&2
+                exit 1
+              fi
+              echo "Verified that npm already serves the expected tarball for $version."
+              exit 0
+              ;;
+            404) ;;
+            *)
+              echo "npm version lookup returned HTTP $status." >&2
+              exit 1
+              ;;
+          esac
           if [[ "$version" == *-* ]]; then
             npm publish "${artifacts[0]}" --access public --tag next
           else
@@ -194,6 +213,7 @@ jobs:
 
   npm-smoke:
     needs: publish-npm
+    if: ${{ !cancelled() && needs.publish-npm.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
