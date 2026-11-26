@@ -14,6 +14,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    HF_HOME=/data/.cache/huggingface \
     TRISYNAPSE_MEMORY_PATH=/data
 
 RUN apt-get update \
@@ -25,7 +26,10 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ src/
 COPY --from=studio /app/src/trisynapse_memory/studio/dist/ src/trisynapse_memory/studio/dist/
-RUN pip install --no-cache-dir '.[all]' && mkdir -p /data && chown -R trisynapse:trisynapse /data
+RUN pip install --no-cache-dir --no-deps --index-url https://download.pytorch.org/whl/cpu 'torch==2.13.0+cpu' \
+    && pip install --no-cache-dir '.[all]' \
+    && mkdir -p /data \
+    && chown -R trisynapse:trisynapse /data
 
 USER trisynapse
 VOLUME ["/data"]
