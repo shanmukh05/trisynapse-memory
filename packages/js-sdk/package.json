@@ -1,6 +1,6 @@
 {
   "name": "@trisynapse/trisynapse-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Typed client for the Trisynapse Trace & Recall API",
   "repository": {
     "type": "git",

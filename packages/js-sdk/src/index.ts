@@ -219,7 +219,15 @@ export interface RetrievalConfiguration {
   max_refinement_rounds: number;
   graph_hops: number;
   confidence_margin: number;
+  confidence_floor?: number;
   deep_summary_enabled: boolean;
+  claims_enabled?: boolean;
+  group_summaries_enabled?: boolean;
+  reranker_enabled?: boolean;
+  raw_candidates_only?: boolean;
+  readout?: "grounded" | "raw_sources" | "ranked";
+  fusion?: "weighted_rrf" | "round_robin";
+  rrf_rank_constant?: number;
   answer_abstain_threshold: number;
   retrieval_profile: "auto" | "balanced" | "precise" | "broad" | "mixed" | "code" | "table" | "image" | "document" | "conversation";
   enabled_routes: string[];

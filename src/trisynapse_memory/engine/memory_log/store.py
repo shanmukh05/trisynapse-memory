@@ -1132,12 +1132,14 @@ class SQLiteMemoryLogStore:
             return deltas
         return deltas[:limit]
 
-    def retracted_ids(self) -> set[str]:
+    def retracted_ids(self, *, include_dependents: bool = False) -> set[str]:
         rows = self._connection.execute("SELECT payload_json FROM deltas WHERE kind='retraction'").fetchall()
         targets: set[str] = set()
         for row in rows:
             payload = json.loads(row["payload_json"])
             targets.update(payload.get("target_record_ids") or [])
+        if include_dependents and targets:
+            return set(self._dependent_record_ids_uncommitted(self._connection, targets))
         return targets
 
     def max_seq(self) -> int:
@@ -1692,7 +1694,7 @@ class SQLiteMemoryLogStore:
     def _dependent_record_ids_uncommitted(
         cursor: Any, target_ids: Iterable[str]
     ) -> list[str]:
-        """Return the transitive evidence dependency closure for Recall cleanup."""
+        """Return the targets and every record that directly or indirectly cites them."""
 
         affected = set(target_ids)
         rows = cursor.execute("SELECT id,evidence_refs_json FROM deltas").fetchall()

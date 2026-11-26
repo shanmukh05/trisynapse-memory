@@ -2,152 +2,210 @@ name: release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.11", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with: { python-version: "${{ matrix.python }}" }
       - uses: astral-sh/setup-uv@v6
-      - run: uv run python scripts/version.py check --tag "${{ github.ref_name }}"
-      - run: uv sync --extra dev --extra all
-      - run: uv run pytest
-      - uses: pnpm/action-setup@v4
-        with: { version: 10 }
-      - uses: actions/setup-node@v4
-        with: { node-version: "22", cache: "pnpm" }
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @trisynapse/trisynapse-memory check
-      - run: pnpm --filter @trisynapse/studio check
-      - run: pnpm --filter @trisynapse/studio test
-      - run: pnpm --filter @trisynapse/studio build
+      - run: python scripts/version.py check
+      - if: github.ref_type == 'tag'
+        run: python scripts/version.py check --tag "${{ github.ref_name }}"
+      - run: uv sync --locked --python "${{ matrix.python }}" --extra dev --extra all
+      - run: uv run --no-sync --python "${{ matrix.python }}" ruff check src tests scripts
+      - run: uv run --no-sync --python "${{ matrix.python }}" pytest -q
 
-  publish:
-    needs: [test, npm-smoke]
+  build:
+    needs: test
     runs-on: ubuntu-latest
-    environment: pypi
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v6
       - uses: pnpm/action-setup@v4
         with: { version: 10 }
-      - uses: actions/setup-node@v4
-        with: { node-version: "22", cache: "pnpm" }
-      - run: uv run python scripts/version.py check --tag "${{ github.ref_name }}"
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @trisynapse/studio build
-      - run: uv build
-      - run: uv publish --trusted-publishing always
-      - name: Prepare release assets
-        run: |
-          cp install.sh install.ps1 dist/
-          cd dist
-          printf '{"version":"%s","package":"trisynapse-memory","extras":"all"}\n' "${GITHUB_REF_NAME#v}" > release.json
-          sha256sum * > SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+      - run: pnpm --filter @trisynapse/trisynapse-memory build
+      - run: uv lock --check
+      - run: uv build --out-dir release-artifacts
+      - run: npm pack ./packages/js-sdk --pack-destination release-artifacts
+      - uses: actions/upload-artifact@v6
         with:
-          files: |
-            dist/*.whl
-            dist/*.tar.gz
-            dist/install.sh
-            dist/install.ps1
-            dist/release.json
-            dist/SHA256SUMS
+          name: release-packages
+          path: release-artifacts/
+          if-no-files-found: error
+
+  package-smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-node@v6
+        with: { node-version: "22" }
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-packages
+          path: release-artifacts
+      - run: uv sync --locked --extra all --no-install-project
+      - name: Install and exercise the packed artifacts
+        shell: bash
+        run: |
+          uv pip install --no-deps release-artifacts/*.whl
+          sdk_dir="$RUNNER_TEMP/trisynapse-sdk"
+          npm install --prefix "$sdk_dir" --ignore-scripts --no-audit --no-fund "$PWD"/release-artifacts/*.tgz
+          version="$(uv run --no-sync python scripts/version.py current)"
+          uv run --no-sync python scripts/smoke_release.py "$version" "$sdk_dir"
+
+  publish-pypi:
+    if: github.ref_type == 'tag'
+    needs: [package-smoke, container-smoke]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-packages
+          path: release-artifacts
+      - run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ release-artifacts/*.whl release-artifacts/*.tar.gz
 
   publish-npm:
-    needs: test
+    if: github.ref_type == 'tag'
+    needs: [package-smoke, container-smoke]
     runs-on: ubuntu-latest
     environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with: { version: 10 }
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @trisynapse/trisynapse-memory build
-      - name: Publish SDK to npm
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-packages
+          path: release-artifacts
+      - name: Publish the verified SDK tarball
         shell: bash
         run: |
           version="$(node -p "require('./packages/js-sdk/package.json').version")"
           if [[ "$version" == *-* ]]; then
-            npm publish ./packages/js-sdk --access public --tag next
+            npm publish release-artifacts/*.tgz --access public --tag next
           else
-            npm publish ./packages/js-sdk --access public
+            npm publish release-artifacts/*.tgz --access public
           fi
+
+  container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Build and start the source image
+        shell: bash
+        run: |
+          docker build -t trisynapse-release-smoke .
+          container="$(docker run -d -p 127.0.0.1:18765:8765 trisynapse-release-smoke)"
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          curl -fsS --retry 25 --retry-delay 1 --retry-connrefused http://127.0.0.1:18765/api/v1/health >/dev/null
+          curl -fsS http://127.0.0.1:18765/studio/ > "$RUNNER_TEMP/trisynapse-studio.html"
+          grep -q '/studio-assets/assets/' "$RUNNER_TEMP/trisynapse-studio.html"
+          test "$(docker exec "$container" trisynapse-memory --version)" = "$(python scripts/version.py current)"
 
   npm-smoke:
     needs: publish-npm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-          package-manager-cache: false
+        with: { node-version: "22" }
       - name: Install the published SDK
         shell: bash
         run: |
           version="$(node -p "require('./packages/js-sdk/package.json').version")"
           package="@trisynapse/trisynapse-memory@${version}"
-          for attempt in 1 2 3 4 5; do
+          for attempt in {1..10}; do
             if npm view "$package" version >/dev/null 2>&1; then
               break
             fi
-            if [ "$attempt" -eq 5 ]; then
+            if [ "$attempt" -eq 10 ]; then
               echo "npm package did not become available: $package" >&2
               exit 1
             fi
             sleep 6
           done
-          mkdir -p "${RUNNER_TEMP}/trisynapse-npm-smoke"
-          cd "${RUNNER_TEMP}/trisynapse-npm-smoke"
-          npm init --yes
-          npm install "$package"
+          mkdir -p "$RUNNER_TEMP/trisynapse-npm-smoke"
+          cd "$RUNNER_TEMP/trisynapse-npm-smoke"
+          npm install --ignore-scripts --no-audit --no-fund "$package"
           node --input-type=module -e 'import { TrisynapseMemory } from "@trisynapse/trisynapse-memory"; if (typeof TrisynapseMemory !== "function") process.exit(1)'
 
   installer-smoke:
-    needs: publish
+    needs: publish-pypi
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Wait for the published Python package
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          package_url="https://pypi.org/pypi/trisynapse-memory/${version}/json"
-          for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            if curl --fail --silent --show-error "$package_url" >/dev/null; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 10 ]; then
-              echo "PyPI package did not become available: trisynapse-memory==${version}" >&2
-              exit 1
-            fi
-            sleep 6
-          done
+      - uses: actions/checkout@v6
       - if: runner.os != 'Windows'
         run: sh install.sh
       - if: runner.os == 'Windows'
         shell: pwsh
         run: ./install.ps1
-      - run: trisynapse-memory --version
-      - run: trisynapse-memory --json check
+
+  github-release:
+    needs: [npm-smoke, installer-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-packages
+          path: release-artifacts
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          cp install.sh install.ps1 release-artifacts/
+          cd release-artifacts
+          printf '{"version":"%s","package":"trisynapse-memory","extras":"all"}\n' "${GITHUB_REF_NAME#v}" > release.json
+          sha256sum *.whl *.tar.gz *.tgz install.sh install.ps1 release.json > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: docs/releases/${{ github.ref_name }}.md
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'a') || contains(github.ref_name, 'b') }}
+          files: |
+            release-artifacts/*.whl
+            release-artifacts/*.tar.gz
+            release-artifacts/*.tgz
+            release-artifacts/install.sh
+            release-artifacts/install.ps1
+            release-artifacts/release.json
+            release-artifacts/SHA256SUMS

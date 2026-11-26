@@ -9,6 +9,7 @@ store or retrieval semantics here.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import time
 from collections.abc import Callable
@@ -131,6 +132,8 @@ def _expects_memory_id(value: str, command: str) -> bool:
 
 
 def _path_lookup(fragment: str) -> tuple[Path, str, str]:
+    if os.name == "nt":
+        fragment = fragment.replace("\\", "/")
     if "/" not in fragment:
         return Path("."), fragment, ""
     raw_directory, prefix = fragment.rsplit("/", 1)
@@ -960,7 +963,12 @@ class MemoryTerminal(App[None]):
         return [item.id for item in reversed(page.items) if not item.text.startswith("[REMOVED]")]
 
     def _slash(self, value: str) -> None:
-        parts = shlex.split(value)
+        lexer = shlex.shlex(value, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        if os.name == "nt":
+            lexer.escape = ""
+        parts = list(lexer)
         command = parts[0].lower()
         args = parts[1:]
         self.query_one("#activity", RichLog)

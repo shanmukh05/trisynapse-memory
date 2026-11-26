@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import signal
@@ -12,6 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from time import sleep
+
+if os.name != "nt":
+    import fcntl
 
 
 @dataclass(frozen=True)

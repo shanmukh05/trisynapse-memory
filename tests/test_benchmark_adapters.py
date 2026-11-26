@@ -119,7 +119,7 @@ def _write_dataset(tmp_path, suite: str):
 
 
 def test_adapter_registry_is_explicit() -> None:
-    assert adapter_names() == ("halumem", "locomo", "longmemeval", "memorydoc", "personamem")
+    assert adapter_names() == ("beam100k", "beam10m", "halumem", "locomo", "longmemeval", "memorydoc", "personamem")
     with pytest.raises(ValueError, match="unsupported benchmark suite"):
         get_adapter("mystery-benchmark")
 

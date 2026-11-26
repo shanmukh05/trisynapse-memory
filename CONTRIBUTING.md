@@ -22,13 +22,14 @@ Preserve these invariants:
 - Benchmark inputs must never add gold answers to retrievable memory.
 - Keep functions small: extract a named helper instead of deepening nested branches. Public APIs stay stable.
 
-Behavior changes require tests and an update to the relevant file in `docs/`.
+Verify behavior changes with the existing checks and an end-to-end smoke run. Update the relevant public documentation when commands or behavior change.
 
 For a release, never edit version surfaces individually. Run:
 
 ```bash
-uv run python scripts/version.py set 0.2.0
-uv run python scripts/version.py check --tag v0.2.0
+python scripts/version.py set 0.3.0
+python scripts/version.py check --tag v0.3.0
 ```
 
 `pyproject.toml` is the canonical version; the release utility synchronizes package manifests, installers, and `uv.lock`.
+Add the matching release notes under `docs/releases/`. Push the release commit to `main` and wait for the test and package preflight workflows to pass on that commit. Then push the matching tag. The tag run checks the built distributions before it publishes.

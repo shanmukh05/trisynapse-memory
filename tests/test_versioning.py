@@ -100,7 +100,12 @@ esac
     fake_uv.chmod(0o755)
     fake_command = bin_dir / "trisynapse-memory"
     fake_command.write_text(
-        "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ready\"}'\n",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --version ]; then\n"
+        "  printf '%s\\n' \"$TRISYNAPSE_MEMORY_VERSION\"\n"
+        "else\n"
+        "  printf '%s\\n' '{\"status\":\"ready\"}'\n"
+        "fi\n",
         encoding="ascii",
     )
     fake_command.chmod(0o755)

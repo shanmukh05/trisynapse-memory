@@ -16,7 +16,7 @@ Windows PowerShell:
 irm https://github.com/shanmukh05/trisynapse-memory/releases/latest/download/install.ps1 | iex
 ```
 
-The scripts install or reuse `uv`, run `uv tool install --upgrade 'trisynapse-memory[all]'`, write local install metadata, identify the tool bin directory, and run `trisynapse-memory --json check`. Re-running upgrades the tool.
+The scripts install or reuse `uv` and install the version pinned in the downloaded script. They run the new executable from uv's tool bin directory and verify its version and store health. Re-run the latest installer to upgrade.
 
 ```bash
 uv tool uninstall trisynapse-memory
@@ -374,14 +374,13 @@ Removal redacts the selected content in one transaction, clears affected index d
 
 The release flow below covers the automated work that starts after a tag is pushed.
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`:
+A push to `main` runs the release preflight without publishing. Wait for both that run and the regular CI workflow to pass on the release commit. Pushing the matching `v*` tag repeats preflight and enables publishing.
 
-1. test Python 3.11/3.12 and TypeScript on Linux, macOS, and Windows;
-2. build wheel and source distribution;
-3. publish `@trisynapse/trisynapse-memory` to npm and smoke-test an exact-version install;
-4. publish to PyPI with trusted publishing;
-5. attach installers, distributions, `SHA256SUMS`, and `release.json` to GitHub Releases;
-6. smoke-test the installer and command on all three operating systems.
+1. Verify Python 3.11 and 3.12 on Linux, macOS, and Windows.
+2. Build the wheel, source distribution, and npm tarball.
+3. Install the same wheel and tarball on all three systems and check the CLI, terminal, Studio, and SDK against a local store. Build and start the Docker image on Linux.
+4. Publish the verified artifacts through trusted publishing. Install the exact version from npm and exercise the public installer on all three systems.
+5. Publish the GitHub release with the verified packages, installers, `SHA256SUMS`, and `release.json`.
 
 ### npm organization publishing
 
@@ -420,8 +419,8 @@ while prereleases receive `next`.
 Before tagging:
 
 ```bash
-uv run python scripts/version.py set 0.2.0
-uv run python scripts/version.py check --tag v0.2.0
+python scripts/version.py set 0.3.0
+python scripts/version.py check --tag v0.3.0
 pytest -q
 ruff check src tests scripts
 pnpm --filter @trisynapse/trisynapse-memory check
@@ -432,11 +431,11 @@ trisynapse-memory bench gate --mode retrieval --data-root data
 `pyproject.toml` is the canonical version source. The version script updates the
 JavaScript packages, installers, and `uv.lock` together; the tag check prevents a
 release when any surface disagrees. Use the version you are actually releasing in
-place of `0.2.0`.
+place of `0.3.0`.
 
 ## Benchmarks
 
-Run `bench omni` from the repository root with its virtual environment active. The wrapper prepares a pinned upstream checkout under `var/omnimemeval` and uses upstream ingestion orchestration, answer prompts, judging, metrics, and reports. Trisynapse supplies only the memory backend.
+Use `bench omni` on macOS, Linux, or WSL with Bash, Git, and a dedicated Python environment. The wrapper prepares a pinned upstream checkout under `var/omnimemeval`. OmniMemEval handles the dataset, answer prompts, judging, metrics, and reporting. Trisynapse supplies the memory backend. `setup --install` installs the upstream requirements into the active environment using pip or uv.
 
 ```bash
 trisynapse-memory bench omni setup --install
@@ -451,6 +450,8 @@ Run controls include `--backend`, `--top-k`, `--workers`, `--llm-workers`, and `
 
 Each named run under `data/omnimemeval/runs/` includes the upstream per-question search results, answer inputs and outputs, applicable judge outputs, metrics and reports, as well as `manifest.json`, `run.log`, and a source snapshot. Trisynapse stores per-user Trace records, query traces, returned hits and locators, and ingestion model requests, responses, and usage under the run. The manifest records dataset hashes, model IDs, provider endpoint fingerprints, prompt hashes, package versions, and attempts. Runtime credentials are passed through the environment.
 
+Resume an unfinished benchmark with the same Trisynapse build and dependency versions it started with. An upgrade changes the recorded source hash. Use the original environment to resume that run or start a new named run with the upgraded version.
+
 The local runner remains available for product diagnostics. Example:
 
 ```bash
@@ -458,7 +459,7 @@ trisynapse-memory bench run locomo --data-root data/locomo --mode retrieval --ma
 trisynapse-memory bench gate --mode retrieval --data-root data
 ```
 
-Local YAML profiles live at `data/<suite>/bench.yaml`. The submitted experiment artifacts and earlier runs are under `data/archive/2026-11-20/`.
+Local YAML profiles live at `data/<suite>/bench.yaml`. The built-in suite defaults also ship with the Python package. The repository includes optional presets for `bench omni plan` and `queue`. Inspect a queue without starting calls by adding `--dry-run`.
 
 ## Troubleshooting
 

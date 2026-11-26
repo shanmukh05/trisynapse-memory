@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Version = if ($env:TRISYNAPSE_MEMORY_VERSION) { $env:TRISYNAPSE_MEMORY_VERSION } else { "0.2.0" }
+$Version = if ($env:TRISYNAPSE_MEMORY_VERSION) { $env:TRISYNAPSE_MEMORY_VERSION } else { "0.3.0" }
 $Package = "trisynapse-memory[all]==$Version"
 $StateRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME ".local\state" }
 $MetadataDir = Join-Path $StateRoot "trisynapse-memory"
@@ -42,12 +42,19 @@ New-Item -ItemType Directory -Force -Path $MetadataDir | Out-Null
     "uv=$Uv"
 ) | Set-Content -Encoding UTF8 (Join-Path $MetadataDir "install.env")
 
-$Command = Get-Command trisynapse-memory -ErrorAction SilentlyContinue
-if (-not $Command) {
-    $BinDir = (& $Uv tool dir --bin).Trim()
-    $env:Path = "$BinDir;$env:Path"
-    $Command = Get-Command trisynapse-memory -ErrorAction Stop
+$BinDir = (& $Uv tool dir --bin).Trim()
+if ($LASTEXITCODE -ne 0) { throw "Could not determine the uv tool bin directory." }
+$Command = Join-Path $BinDir "trisynapse-memory.exe"
+if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) {
+    throw "Installed command was not found at $Command"
+}
+if ($BinDir -notin ($env:Path -split ";")) {
     Write-Host "Add $BinDir to your user PATH, then open a new terminal."
 }
-& $Command.Source --json check
+$InstalledVersion = (& $Command --version).Trim()
+if ($LASTEXITCODE -ne 0 -or $InstalledVersion -ne $Version) {
+    throw "Expected version $Version, got $InstalledVersion"
+}
+& $Command --json check
+if ($LASTEXITCODE -ne 0) { throw "The installed command failed its health check." }
 Write-Host "Installed. Run: trisynapse-memory"

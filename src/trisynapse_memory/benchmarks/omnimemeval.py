@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
+from importlib.util import find_spec
 import json
 import os
 import re
@@ -19,6 +19,9 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile
+
+if os.name != "nt":
+    import fcntl
 
 from trisynapse_memory.benchmarks.omni_backend import DEFAULT_EMBEDDING_MODEL, DEFAULT_MEMORY_MODEL
 from trisynapse_memory.benchmarks.omni_queue import QueuedRun, run_queue
@@ -164,11 +167,18 @@ def _setup(checkout: Path, *, install: bool) -> None:
         _git(checkout, "checkout", "--detach", "FETCH_HEAD")
     _install_backend(checkout)
     if install:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", str(checkout / "requirements_user_memory.txt")],
-            check=True,
-        )
+        _install_requirements(checkout / "requirements_user_memory.txt")
     print(f"OmniMemEval {UPSTREAM_REVISION} ready at {checkout}")
+
+
+def _install_requirements(requirements: Path) -> None:
+    if find_spec("pip") is not None:
+        install = [sys.executable, "-m", "pip", "install"]
+    elif uv := shutil.which("uv"):
+        install = [uv, "pip", "install", "--python", sys.executable]
+    else:
+        raise RuntimeError("OmniMemEval setup requires pip or uv in the active environment.")
+    subprocess.run([*install, "-r", str(requirements)], check=True)
 
 
 def _link_input(source: Path, target: Path) -> None:
@@ -737,6 +747,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     checkout, data = args.checkout.resolve(), args.data_root.resolve()
     try:
+        if os.name == "nt" and args.action not in {"inspect", "plan"} and not getattr(args, "dry_run", False):
+            raise RuntimeError("OmniMemEval execution requires macOS, Linux, or WSL. Use the Linux environment in WSL.")
         if args.action == "setup":
             _setup(checkout, install=args.install)
         elif args.action == "plan":

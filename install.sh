@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="${TRISYNAPSE_MEMORY_VERSION:-0.2.0}"
+VERSION="${TRISYNAPSE_MEMORY_VERSION:-0.3.0}"
 PACKAGE="trisynapse-memory[all]==$VERSION"
 METADATA_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/trisynapse-memory"
 
@@ -57,12 +57,10 @@ case ":$PATH:" in
   *) say "Add ${UV_BIN_DIR} to PATH, then open a new terminal." ;;
 esac
 
-if command -v trisynapse-memory >/dev/null 2>&1; then
-  trisynapse-memory --json check
-elif [ -x "$UV_BIN_DIR/trisynapse-memory" ]; then
-  "$UV_BIN_DIR/trisynapse-memory" --json check
-else
-  fail "installation completed but trisynapse-memory was not found"
-fi
+TRISYNAPSE_CLI="$UV_BIN_DIR/trisynapse-memory"
+[ -x "$TRISYNAPSE_CLI" ] || fail "installed command was not found at $TRISYNAPSE_CLI"
+INSTALLED_VERSION="$("$TRISYNAPSE_CLI" --version)" || fail "installed command could not report its version"
+[ "$INSTALLED_VERSION" = "$VERSION" ] || fail "expected version $VERSION, got $INSTALLED_VERSION"
+"$TRISYNAPSE_CLI" --json check
 
 say "Installed. Run: trisynapse-memory"

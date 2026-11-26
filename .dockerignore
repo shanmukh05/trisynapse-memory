@@ -1,4 +1,13 @@
 .venv
+.git
+.pnpm-store
+**/node_modules
+**/*.tsbuildinfo
+.DS_Store
+.cache
+var
+aamas_2027_template
+docs/local
 .env
 .env.*
 !.env.example
@@ -11,5 +20,4 @@ design_docs/archive
 *.egg-info
 dist
 build
-packages/js-sdk/node_modules
-packages/js-sdk/dist
+**/dist

@@ -356,6 +356,9 @@ class HybridRetriever:
             scope=scope, seq_cutoff=cutoff,
             namespace=namespace,
         )
+        if not self.config.raw_candidates_only:
+            retracted = self.store.retracted_ids(include_dependents=True)
+            deltas = [item for item in deltas if item.id not in retracted]
         claims = []
         if self.config.claims_enabled and not self.config.raw_candidates_only:
             observations = {item.id: item for item in deltas if item.kind == "raw_source"}

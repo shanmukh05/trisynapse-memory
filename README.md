@@ -217,7 +217,7 @@ flowchart LR
 4. **Retrieval** searches several routes, fuses candidates, and drills back to the memory log.
 5. **Grounding** creates an answer with citations or abstains.
 
-The memory log is an application data store, not a cryptographic ledger. `validate` checks SQLite consistency, sequence continuity, evidence references, and retained source blobs. index data can be rebuilt; cited evidence always comes from the memory log.
+The memory log preserves source text and locations. `validate` checks SQLite consistency, sequence continuity, evidence references, and retained source blobs. The default readout returns stored observations and extracted facts with source links. Source links let you inspect the evidence for a fact. They do not establish entailment.
 
 [Read the architecture guide →](docs/architecture.md) · [Read the deep-dive blog post →](https://www.tensorwrites.com/posts/trisynapse-memory)
 
@@ -315,6 +315,7 @@ Published installers and packages are on [GitHub Releases](https://github.com/sh
 
 | Version | Notes |
 |---|---|
+| [v0.3.0](docs/releases/v0.3.0.md) | OmniMemEval integration, retrieval controls, and verified Python, terminal, Studio, and npm builds. |
 | [v0.2.0](docs/releases/v0.2.0.md) | Memory Log and Indexes architecture refactoring, formal algorithmic specifications, group summaries, evidence-grounded facts, and multi-item ingestion APIs. |
 | [v0.1.3](docs/releases/v0.1.3.md) | Memory Viewer catalog, trusted Python extension packs, non-persistent search, and a starter notebook. |
 | [v0.1.2](docs/releases/v0.1.2.md) | Retrieval profiles, token-aware grounding, store validation, and the `@trisynapse/trisynapse-memory` npm package. Includes breaking CLI, REST, and SDK renames. |
@@ -342,7 +343,7 @@ trisynapse-memory bench omni run locomo --name locomo-full
 trisynapse-memory bench omni inspect locomo --name locomo-full
 ```
 
-The runtime reads OpenAI credentials from your shell or `.env.local`. Use `--backend memos` with the required MemOS credentials for a comparison in the same harness. The local `bench run` and `bench gate` commands serve Trace & Recall diagnostics and release checks. See the [benchmark operations guide](docs/operations.md#benchmarks) for stage and artifact details.
+OmniMemEval runs on macOS, Linux, and WSL. Use a dedicated benchmark environment for upstream dependencies. The runner reads credentials from your shell or `.env.local`. For a check that skips provider calls, use `--memory-model none --to-step 2` with the local embedding model. See the [benchmark operations guide](docs/operations.md#benchmarks) for setup, resume, and output locations.
 
 ## License
 

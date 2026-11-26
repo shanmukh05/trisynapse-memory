@@ -1,12 +1,30 @@
+FROM node:22-bookworm-slim AS studio
+
+WORKDIR /app
+COPY pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/js-sdk/package.json packages/js-sdk/
+COPY packages/studio/package.json packages/studio/
+RUN npm install --global pnpm@10.24.0 \
+    && pnpm install --filter @trisynapse/studio --frozen-lockfile
+COPY packages/studio/ packages/studio/
+COPY public/assets/logo.png public/assets/
+RUN pnpm --filter @trisynapse/studio build
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TRISYNAPSE_MEMORY_PATH=/data
 
-RUN addgroup --system trisynapse && adduser --system --ingroup trisynapse trisynapse
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && addgroup --system trisynapse \
+    && adduser --system --ingroup trisynapse trisynapse
 WORKDIR /app
-COPY . /app
+COPY pyproject.toml README.md LICENSE ./
+COPY src/ src/
+COPY --from=studio /app/src/trisynapse_memory/studio/dist/ src/trisynapse_memory/studio/dist/
 RUN pip install --no-cache-dir '.[all]' && mkdir -p /data && chown -R trisynapse:trisynapse /data
 
 USER trisynapse
