@@ -4,12 +4,19 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: Completed tagged run whose npm step failed after Python publication
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   test:
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -77,7 +84,7 @@ jobs:
           uv run --no-sync python scripts/smoke_release.py "$version" "$sdk_dir"
 
   publish-pypi:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [package-smoke, container-smoke]
     runs-on: ubuntu-latest
     environment: pypi
@@ -92,15 +99,56 @@ jobs:
       - run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ release-artifacts/*.whl release-artifacts/*.tar.gz
 
   publish-npm:
-    if: github.ref_type == 'tag'
     needs: [package-smoke, container-smoke]
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'workflow_dispatch' ||
+      (github.ref_type == 'tag' && needs.package-smoke.result == 'success' &&
+      needs.container-smoke.result == 'success')) }}
     runs-on: ubuntu-latest
     environment: npm
     permissions:
+      actions: read
       contents: read
       id-token: write
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      run_id: ${{ steps.source.outputs.run_id }}
     steps:
+      - name: Resolve the verified release artifacts
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          run_id="$GITHUB_RUN_ID"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+            run_id="$SOURCE_RUN"
+            run="$(gh run view --repo "$GITHUB_REPOSITORY" "$run_id" \
+              --json workflowName,event,headBranch,headSha,status,jobs)"
+            jq -e '
+              .workflowName == "release" and .event == "push" and .status == "completed"
+              and any(.jobs[]; .name == "publish-npm" and .conclusion == "failure")
+              and ([.jobs[] | select(
+                .name == "build" or .name == "container-smoke" or .name == "publish-pypi"
+                or (.name | test("^(package-smoke|installer-smoke) \\("))
+              )] | length == 9 and all(.[]; .conclusion == "success"))
+            ' <<< "$run" >/dev/null
+            tag="$(jq -r '.headBranch' <<< "$run")"
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]
+            ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")"
+            tag_sha="$(jq -r '.object.sha' <<< "$ref")"
+            if [[ "$(jq -r '.object.type' <<< "$ref")" == tag ]]; then
+              tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+            fi
+            [[ "$tag_sha" == "$(jq -r '.headSha' <<< "$run")" ]]
+          fi
+          printf 'tag=%s\nrun_id=%s\n' "$tag" "$run_id" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ steps.source.outputs.tag }}
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -110,17 +158,22 @@ jobs:
         with:
           name: release-packages
           path: release-artifacts
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
       - name: Publish the verified SDK tarball
         shell: bash
         run: |
           version="$(node -p "require('./packages/js-sdk/package.json').version")"
+          artifacts=("$PWD"/release-artifacts/*.tgz)
+          [[ "${#artifacts[@]}" == 1 && -f "${artifacts[0]}" ]]
           if [[ "$version" == *-* ]]; then
-            npm publish release-artifacts/*.tgz --access public --tag next
+            npm publish "${artifacts[0]}" --access public --tag next
           else
-            npm publish release-artifacts/*.tgz --access public
+            npm publish "${artifacts[0]}" --access public
           fi
 
   container-smoke:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -144,6 +197,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ needs.publish-npm.outputs.tag }}
       - uses: actions/setup-node@v6
         with: { node-version: "22" }
       - name: Install the published SDK
@@ -182,27 +237,38 @@ jobs:
         run: ./install.ps1
 
   github-release:
-    needs: [npm-smoke, installer-smoke]
+    needs: [publish-npm, npm-smoke, installer-smoke]
+    if: >-
+      ${{ !cancelled() && needs.npm-smoke.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || needs.installer-smoke.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ needs.publish-npm.outputs.tag }}
       - uses: actions/download-artifact@v7
         with:
           name: release-packages
           path: release-artifacts
+          run-id: ${{ needs.publish-npm.outputs.run_id }}
+          github-token: ${{ github.token }}
       - name: Prepare release assets
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.publish-npm.outputs.tag }}
         run: |
           cp install.sh install.ps1 release-artifacts/
           cd release-artifacts
-          printf '{"version":"%s","package":"trisynapse-memory","extras":"all"}\n' "${GITHUB_REF_NAME#v}" > release.json
+          printf '{"version":"%s","package":"trisynapse-memory","extras":"all"}\n' "${RELEASE_TAG#v}" > release.json
           sha256sum *.whl *.tar.gz *.tgz install.sh install.ps1 release.json > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          body_path: docs/releases/${{ github.ref_name }}.md
-          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'a') || contains(github.ref_name, 'b') }}
+          body_path: docs/releases/${{ needs.publish-npm.outputs.tag }}.md
+          tag_name: ${{ needs.publish-npm.outputs.tag }}
+          prerelease: ${{ contains(needs.publish-npm.outputs.tag, 'rc') || contains(needs.publish-npm.outputs.tag, 'a') || contains(needs.publish-npm.outputs.tag, 'b') }}
           files: |
             release-artifacts/*.whl
             release-artifacts/*.tar.gz

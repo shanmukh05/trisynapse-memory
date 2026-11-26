@@ -416,6 +416,11 @@ publisher is saved, subsequent tagged releases use short-lived OIDC credentials;
 no npm publishing token is required. Stable versions receive npm's `latest` tag,
 while prereleases receive `next`.
 
+If npm publishing fails after the Python installers pass, dispatch `release.yml` on `main`
+with the failed release run ID in `source_run`. The workflow verifies the original tag
+and successful package checks, then uses the original tarball to finish npm and the
+GitHub release.
+
 Before tagging:
 
 ```bash
